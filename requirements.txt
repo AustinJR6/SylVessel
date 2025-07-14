@@ -1,0 +1,7 @@
+torch>=1.10.0
+transformers>=4.0.0
+sentence-transformers>=2.0.0
+faiss-cpu>=1.7.0
+numpy>=1.18.0
+Pillow>=8.0.0
+SpeechRecognition>=3.8.1

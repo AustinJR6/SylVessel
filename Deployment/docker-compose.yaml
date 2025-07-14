@@ -1,0 +1,10 @@
+version: "3.8"
+services:
+  sylana:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./Sylana_Vessel:/app
+    environment:
+      - ENV=production
