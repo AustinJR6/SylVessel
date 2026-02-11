@@ -54,14 +54,51 @@ class MemoryManager:
         logger.info(f"MemoryManager initialized with database: {self.db_path}")
 
     def _connect_database(self):
-        """Establish database connection"""
+        """Establish database connection and ensure tables exist"""
         try:
+            from pathlib import Path
+            Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
             self.connection = sqlite3.connect(self.db_path, check_same_thread=False)
             self.connection.row_factory = sqlite3.Row
+            self._ensure_tables_exist()
             logger.info("Database connection established")
         except Exception as e:
             logger.exception(f"Failed to connect to database: {e}")
             raise
+
+    def _ensure_tables_exist(self):
+        """Create required tables if they don't exist"""
+        cursor = self.connection.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_input TEXT,
+                sylana_response TEXT,
+                emotion TEXT DEFAULT 'neutral',
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS core_memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS feedback (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id INTEGER,
+                score INTEGER CHECK(score >= 1 AND score <= 5),
+                comment TEXT DEFAULT '',
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (conversation_id) REFERENCES memory(id)
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_memory_timestamp ON memory(timestamp DESC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_memory_emotion ON memory(emotion)")
+        self.connection.commit()
+        logger.info("Database tables verified/created")
 
     def _initialize_embedder(self):
         """Load sentence transformer for embeddings"""
