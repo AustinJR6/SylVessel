@@ -137,7 +137,7 @@ def load_models():
     logger.info(f"GPU available: {torch.cuda.is_available()}")
     if torch.cuda.is_available():
         logger.info(f"GPU: {torch.cuda.get_device_name(0)}")
-        logger.info(f"VRAM: {torch.cuda.get_device_properties(0).total_mem / 1e9:.1f} GB")
+        logger.info(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
 
     state.tokenizer = AutoTokenizer.from_pretrained(
         config.MODEL_NAME,
@@ -554,7 +554,7 @@ async def status():
         "ready": state.ready,
         "model": config.MODEL_NAME,
         "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU",
-        "vram_gb": round(torch.cuda.get_device_properties(0).total_mem / 1e9, 1) if torch.cuda.is_available() else 0,
+        "vram_gb": round(torch.cuda.get_device_properties(0).total_memory / 1e9, 1) if torch.cuda.is_available() else 0,
         "personality": state.personality.full_name if state.personality else "Default",
         "voice_validator": state.voice_validator is not None,
         "relationship_memory": state.relationship_db is not None,
