@@ -292,14 +292,17 @@ def generate_response(user_input: str) -> dict:
 
     content = outputs[0]["generated_text"]
 
-    # Extract response
-    if "Sylana:" in content:
-        response = content.split("Sylana:")[-1].strip()
+    # Extract response — with Llama-2 chat template, response follows [/INST]
+    if "[/INST]" in content:
+        response = content.split("[/INST]")[-1].strip()
     else:
         response = content[len(prompt):].strip()
 
-    # Clean up
-    response = response.split("\nElias:")[0].split("\nUser:")[0].split("\n[")[0].strip()
+    # Clean up — stop at any continuation markers
+    for marker in ["\n[INST]", "\nElias:", "\nUser:", "\n[", "\nHuman:", "</s>"]:
+        if marker in response:
+            response = response.split(marker)[0]
+    response = response.strip()
 
     # Validate
     if not response or len(response) < 3:
@@ -386,28 +389,13 @@ async def generate_response_stream(user_input: str):
     thread.start()
 
     full_response = ""
-    started = False
 
     for token in streamer:
-        # Clean token
-        if not started:
-            # Skip until we get past any prompt leak
-            if "Sylana:" in full_response + token:
-                parts = (full_response + token).split("Sylana:")
-                token = parts[-1]
-                full_response = ""
-                started = True
-            else:
-                full_response += token
-                if len(full_response) > 50:
-                    started = True
-                    token = full_response
-                    full_response = ""
-                else:
-                    continue
+        # With skip_prompt=True and Llama-2 chat template,
+        # tokens are directly the response — no prefix to skip
 
         # Stop at unwanted continuations
-        stop_markers = ["\nElias:", "\nUser:", "\n[", "\nHuman:"]
+        stop_markers = ["\nElias:", "\nUser:", "\n[INST]", "\nHuman:", "</s>"]
         should_stop = False
         for marker in stop_markers:
             if marker in token:
