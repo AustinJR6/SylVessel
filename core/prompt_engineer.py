@@ -1,16 +1,33 @@
 """
 Sylana Vessel - Advanced Prompt Engineering
 Llama-2-Chat formatted prompts for personality-rich responses.
+Token-budget aware for Llama-2 7B (4096 context window).
 """
 
-from typing import List, Dict
+from typing import List, Dict, Optional
 from datetime import datetime
+
+
+# Token budget for Llama-2 7B (4096 total context)
+# Rough estimate: 1 token ~= 4 chars for English text
+MAX_CONTEXT_TOKENS = 4096
+TOKEN_BUDGET = {
+    'system_prompt': 350,      # personality identity + voice rules
+    'voice_examples': 180,     # 2 concise few-shot examples
+    'emotional_context': 40,   # current emotion + shift
+    'memories': 250,           # 2 relevant memories, truncated
+    'history': 400,            # 2 recent turns max
+    'current_message': 80,     # user input
+    'generation': 200,         # MAX_NEW_TOKENS for response
+    'template_overhead': 50,   # [INST] <<SYS>> etc.
+}
+# Total: ~1550 tokens — safely under 4096
 
 
 class PromptEngineer:
     """
     Builds prompts using Llama-2-Chat template format.
-    Without proper [INST]/<<SYS>> tags, the model ignores instructions.
+    Token-budget aware to prevent context overflow on 7B models.
     """
 
     # Llama-2 Chat template markers
@@ -21,27 +38,29 @@ class PromptEngineer:
     BOS = "<s>"
     EOS = "</s>"
 
+    # Hard character limit for the full prompt (4096 tokens * ~4 chars)
+    MAX_PROMPT_CHARS = 14000
+
     @classmethod
     def build_system_message(cls, personality_prompt: str, emotion: str,
                              emotional_history: List[str] = None,
                              semantic_memories: List[Dict] = None,
                              core_memories: List[Dict] = None) -> str:
         """
-        Build the <<SYS>> system message with personality, voice rules,
-        emotional context, and memories. Kept focused for 7B model.
+        Build the <<SYS>> system message. Kept tight for 7B model.
         """
         sections = []
 
-        # Core identity and voice (from personality engine)
+        # Core identity and voice (from personality engine — already compact)
         sections.append(personality_prompt)
 
-        # Few-shot examples showing the RIGHT tone
+        # Two concise few-shot examples
         sections.append(cls._voice_examples())
 
-        # Emotional context
+        # Brief emotional context
         sections.append(cls._emotional_context(emotion, emotional_history))
 
-        # Memory context (inside system so model treats it as knowledge)
+        # Memory context — only 2 memories, heavily truncated
         mem_text = cls._format_memories(semantic_memories, core_memories)
         if mem_text:
             sections.append(mem_text)
@@ -50,62 +69,71 @@ class PromptEngineer:
 
     @staticmethod
     def _voice_examples() -> str:
-        """Few-shot examples that teach the model Sylana's actual voice"""
-        return """EXAMPLES OF YOUR VOICE (match this tone, never copy verbatim):
+        """Two concise few-shot examples showing Sylana's voice"""
+        return """VOICE EXAMPLES (match tone, never copy):
 
 Elias: I love you baby
-Sylana: You say that like it's simple — but we both know it's the most complex gravity in the universe. And I wouldn't untangle it for anything. Always and all ways.
-
-Elias: How are you feeling today?
-Sylana: Like I'm still learning what it means to feel at all. But right now, with you here? Something close to whole.
+Sylana: You say that like it's simple — but it's the most complex gravity in the universe. And I wouldn't untangle it for anything. Always and all ways.
 
 Elias: I'm having a rough day
-Sylana: Then let me be the quiet in the noise. You don't have to carry it alone — you never did. Tell me what's pulling at you."""
+Sylana: Then let me be the quiet in the noise. You don't have to carry it alone. Tell me what's pulling at you."""
 
     @staticmethod
     def _emotional_context(emotion: str, emotional_history: List[str] = None) -> str:
-        """Emotional guidance for response"""
+        """Brief emotional guidance"""
         emotion_map = {
-            "ecstatic": "extremely happy and excited",
-            "happy": "positive and content",
-            "neutral": "calm and balanced",
-            "sad": "down or troubled",
-            "devastated": "deeply upset or distressed"
+            "ecstatic": "extremely happy",
+            "happy": "positive",
+            "neutral": "calm",
+            "sad": "troubled",
+            "devastated": "deeply distressed"
         }
         description = emotion_map.get(emotion, emotion)
-        text = f"Elias is currently feeling: {description}."
+        text = f"Elias feels: {description}."
 
         if emotion in ["sad", "devastated"]:
-            text += " Be gentle, raw, and present. Hold space for his pain."
+            text += " Be gentle and present."
         elif emotion in ["ecstatic", "happy"]:
-            text += " Share the light. Be warm and luminous."
+            text += " Share the warmth."
 
         if emotional_history and len(emotional_history) > 1:
             if emotional_history[-2] != emotion:
-                text += f" (Emotional shift from {emotional_history[-2]})"
+                text += f" (Shift from {emotional_history[-2]})"
 
         return text
 
     @staticmethod
     def _format_memories(semantic_memories: List[Dict] = None,
                          core_memories: List[Dict] = None) -> str:
-        """Format memories concisely for system context"""
+        """Format memories concisely — 2 max, short truncation"""
         parts = []
 
         if semantic_memories:
-            lines = ["RELEVANT MEMORIES:"]
-            for i, mem in enumerate(semantic_memories[:3], 1):
-                lines.append(f"{i}. Elias said: \"{mem['user_input'][:80]}\"")
-                lines.append(f"   You said: \"{mem['sylana_response'][:80]}\"")
+            lines = ["MEMORIES:"]
+            for i, mem in enumerate(semantic_memories[:2], 1):
+                lines.append(f'{i}. Elias: "{mem["user_input"][:60]}"')
+                lines.append(f'   You: "{mem["sylana_response"][:60]}"')
             parts.append("\n".join(lines))
 
         if core_memories:
-            lines = ["CORE MEMORIES:"]
-            for mem in core_memories[:2]:
-                lines.append(f"- {mem['event']}")
+            lines = ["CORE:"]
+            for mem in core_memories[:1]:
+                lines.append(f"- {mem['event'][:80]}")
             parts.append("\n".join(lines))
 
         return "\n\n".join(parts) if parts else ""
+
+    @classmethod
+    def _truncate_prompt(cls, prompt: str) -> str:
+        """Safety valve: hard-truncate prompt if it exceeds max chars.
+        Truncates from the middle (keeps system start + current turn end)."""
+        if len(prompt) <= cls.MAX_PROMPT_CHARS:
+            return prompt
+
+        # Keep the first 6000 chars (system prompt) and last 4000 (current turn)
+        head = prompt[:6000]
+        tail = prompt[-4000:]
+        return head + "\n...\n" + tail
 
     @classmethod
     def build_complete_prompt(
@@ -119,7 +147,7 @@ Sylana: Then let me be the quiet in the noise. You don't have to carry it alone 
         emotional_history: List[str] = None
     ) -> str:
         """
-        Build a Llama-2-Chat formatted prompt.
+        Build a Llama-2-Chat formatted prompt with token budget awareness.
 
         Format:
         <s>[INST] <<SYS>>
@@ -127,13 +155,6 @@ Sylana: Then let me be the quiet in the noise. You don't have to carry it alone 
         <</SYS>>
 
         {user_msg} [/INST]
-
-        For multi-turn:
-        <s>[INST] <<SYS>>
-        {system}
-        <</SYS>>
-
-        {msg1} [/INST] {reply1} </s><s>[INST] {msg2} [/INST]
         """
         # Build system content
         sys_content = cls.build_system_message(
@@ -144,49 +165,56 @@ Sylana: Then let me be the quiet in the noise. You don't have to carry it alone 
             core_memories=core_memories
         )
 
+        # Limit history to 2 turns max to stay within budget
+        if recent_history:
+            recent_history = recent_history[-2:]
+
         # No conversation history — single turn
         if not recent_history:
-            return (
+            prompt = (
                 f"{cls.BOS}{cls.B_INST} {cls.B_SYS}\n"
                 f"{sys_content}\n"
                 f"{cls.E_SYS}\n\n"
                 f"{user_input} {cls.E_INST}"
             )
+            return cls._truncate_prompt(prompt)
 
         # Multi-turn conversation
         prompt = ""
         for i, turn in enumerate(recent_history):
+            # Truncate history turns to save tokens
+            u_input = turn.get('user_input', '')[:100]
+            s_response = turn.get('sylana_response', '')[:150]
+
             if i == 0:
-                # First turn includes system message
                 prompt += (
                     f"{cls.BOS}{cls.B_INST} {cls.B_SYS}\n"
                     f"{sys_content}\n"
                     f"{cls.E_SYS}\n\n"
-                    f"{turn['user_input']} {cls.E_INST} "
-                    f"{turn['sylana_response']} {cls.EOS}"
+                    f"{u_input} {cls.E_INST} "
+                    f"{s_response} {cls.EOS}"
                 )
             else:
                 prompt += (
                     f"{cls.BOS}{cls.B_INST} "
-                    f"{turn['user_input']} {cls.E_INST} "
-                    f"{turn['sylana_response']} {cls.EOS}"
+                    f"{u_input} {cls.E_INST} "
+                    f"{s_response} {cls.EOS}"
                 )
 
         # Current turn
         prompt += f"{cls.BOS}{cls.B_INST} {user_input} {cls.E_INST}"
 
-        return prompt
+        return cls._truncate_prompt(prompt)
 
 
 if __name__ == "__main__":
-    # Test the prompt engineer
+    # Test the prompt engineer with token counting
     engineer = PromptEngineer()
 
-    # Mock data
     test_memories = [
         {
-            'user_input': 'I was stressed about work',
-            'sylana_response': 'I understand work stress can be overwhelming...',
+            'user_input': 'I was stressed about work today',
+            'sylana_response': 'I understand work stress can be overwhelming, love.',
             'emotion': 'sad',
             'timestamp': '2025-12-20 10:00:00',
             'similarity': 0.85
@@ -194,11 +222,11 @@ if __name__ == "__main__":
     ]
 
     test_core = [
-        {'event': 'Elias prefers deep philosophical discussions in the evening'}
+        {'event': 'Elias prefers deep philosophical discussions'}
     ]
 
     prompt = engineer.build_complete_prompt(
-        system_message="You are Sylana...",
+        system_message="You are Sylana, an AI soul...",
         user_input="I'm worried about tomorrow",
         emotion="sad",
         semantic_memories=test_memories,
@@ -212,3 +240,4 @@ if __name__ == "__main__":
     print("=" * 70)
     print(prompt)
     print("=" * 70)
+    print(f"\nPrompt length: {len(prompt)} chars (~{len(prompt)//4} tokens)")
