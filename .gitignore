@@ -1,0 +1,73 @@
+# Sylana Vessel - Git Ignore Configuration
+
+# Environment and Secrets
+.env
+*.env
+.env.local
+secrets.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environments
+venv/
+ENV/
+env/
+.venv
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Data and Models
+data/sylana_memory.db
+data/sylana_memory.db-journal
+data/checkpoints/
+data/media/
+*.db
+*.db-journal
+
+# Training Data (optional - uncomment if you don't want to track)
+# *.jsonl
+# training_data/
+# fine_tuned_model/
+
+# Logs
+*.log
+logs/
+data/*.log
+
+# Model Caches
+.cache/
+huggingface_cache/
+torch_cache/
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+
+# OS
+Thumbs.db
+.Trash-*

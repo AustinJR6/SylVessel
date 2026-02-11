@@ -1,9 +1,9 @@
 import sqlite3
 import json
 import os
-from config import DB_PATH
+from core.config_loader import config
 
-conn = sqlite3.connect(DB_PATH)
+conn = sqlite3.connect(config.DB_PATH)
 cursor = conn.cursor()
 
 def record_feedback(conversation_id, feedback_score, comment=""):

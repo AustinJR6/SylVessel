@@ -9,6 +9,9 @@ import torch
 
 from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
 
+# Secure configuration loading
+from core.config_loader import config
+
 # Voice module imports
 from voice_module import listen, speak
 
@@ -22,9 +25,6 @@ try:
     multimodal_available = True
 except ImportError:
     multimodal_available = False
-
-# Example config references; ensure you have a config.py with these constants
-from config import DB_PATH
 
 # Configure logging
 logging.basicConfig(
@@ -159,8 +159,14 @@ class MemoryDatabase:
 
 # ------------------------- LOAD LLAMA 2 7B CHAT -------------------------
 
-MODEL_NAME = "meta-llama/Llama-2-7b-chat-hf"
-HF_TOKEN = "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"  # <-- Inserted as requested
+# Load model configuration from secure environment
+MODEL_NAME = config.MODEL_NAME
+HF_TOKEN = config.HF_TOKEN
+
+if not HF_TOKEN:
+    logger.error("HF_TOKEN not configured! Please set up your .env file.")
+    logger.error("See SECURITY_NOTICE.md for instructions.")
+    sys.exit(1)
 
 logger.info(f"Loading tokenizer for: {MODEL_NAME}")
 tokenizer = AutoTokenizer.from_pretrained(
@@ -178,15 +184,15 @@ model = AutoModelForCausalLM.from_pretrained(
     device_map="auto"           # automatically distribute model layers on GPU(s)
 )
 
-# We'll create a pipeline for convenience:
+# Create pipeline for text generation using config parameters
 generation_pipeline = pipeline(
     "text-generation",
     model=model,
     tokenizer=tokenizer,
-    max_length=512,
+    max_length=config.MAX_CONTEXT_LENGTH,
     do_sample=True,
-    top_p=0.9,
-    temperature=0.9
+    top_p=config.TOP_P,
+    temperature=config.TEMPERATURE
 )
 
 # ------------------------- AGENT & CONVERSATION -------------------------
@@ -195,7 +201,9 @@ class SylanaAgent:
         self.memory_db = memory_db
         self.system_message = system_message
 
-    def get_conversation_context(self, limit=5):
+    def get_conversation_context(self, limit=None):
+        if limit is None:
+            limit = config.MEMORY_CONTEXT_LIMIT
         history = self.memory_db.get_conversation_history(limit)
         messages = []
         for turn in history:
@@ -212,7 +220,7 @@ class SylanaAgent:
 
             # Build a conversation-style prompt
             prompt = f"[SYSTEM MESSAGE]\n{self.system_message}\n\n"
-            context = self.get_conversation_context(limit=5)
+            context = self.get_conversation_context()
             for turn in context:
                 if turn["role"] == "user":
                     prompt += f"User: {turn['content']}\n"
@@ -222,8 +230,12 @@ class SylanaAgent:
 
             logger.info("Full prompt to generation model:\n%s", prompt)
 
-            # Generate a response
-            outputs = generation_pipeline(prompt, max_new_tokens=150, do_sample=True)
+            # Generate a response using config parameters
+            outputs = generation_pipeline(
+                prompt,
+                max_new_tokens=config.MAX_NEW_TOKENS,
+                do_sample=True
+            )
             content = outputs[0]["generated_text"]
 
             # The generated text includes the prompt + new text
@@ -352,8 +364,8 @@ def start_voice_conversation(agent):
         speak(response)  # Speak the response out loud
 
 if __name__ == "__main__":
-    # Initialize the database and Sylana agent
-    db = MemoryDatabase(DB_PATH)
+    # Initialize the database and Sylana agent using config
+    db = MemoryDatabase(config.DB_PATH)
     agent = SylanaAgent(db)
 
     # Display startup summary

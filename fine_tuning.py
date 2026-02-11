@@ -6,7 +6,7 @@ from transformers import Trainer, TrainingArguments, AutoModelForCausalLM, AutoT
 
 # Local imports
 from long_term_memory import build_index, recall_memory
-from config import DB_PATH
+from core.config_loader import config
 
 ################################################################################
 #                             DATA EXTRACTION                                  #
@@ -14,11 +14,11 @@ from config import DB_PATH
 
 def load_conversation_data(context_length=5):
     """
-    Extract conversation logs from the database, returning samples with 
+    Extract conversation logs from the database, returning samples with
     up to `context_length` turns of prior context.
     Each call opens its own DB connection, so we can call from any thread safely.
     """
-    local_conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    local_conn = sqlite3.connect(config.DB_PATH, check_same_thread=False)
     local_cursor = local_conn.cursor()
 
     local_cursor.execute("SELECT user_input, sylana_response FROM memory ORDER BY timestamp ASC")
@@ -83,8 +83,14 @@ if __name__ == "__main__":
 #                              MODEL SELECTION                                 #
 ################################################################################
 
-MODEL_NAME = "meta-llama/Llama-2-7b-chat-hf"
-HF_TOKEN = "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"  # <-- Inserted token
+# Load model configuration from secure environment
+MODEL_NAME = config.MODEL_NAME
+HF_TOKEN = config.HF_TOKEN
+
+if not HF_TOKEN:
+    print("❌ ERROR: HF_TOKEN not configured! Please set up your .env file.")
+    print("   See SECURITY_NOTICE.md for instructions.")
+    exit(1)
 
 print(f"Loading tokenizer for: {MODEL_NAME}")
 tokenizer = AutoTokenizer.from_pretrained(
@@ -132,7 +138,7 @@ print("Loading dataset from training_data.jsonl...")
 train_dataset = ConversationDataset("training_data.jsonl", tokenizer)
 
 training_args = TrainingArguments(
-    output_dir="./fine_tuned_model",
+    output_dir=config.CHECKPOINT_DIR,
     overwrite_output_dir=True,
     num_train_epochs=3,
     per_device_train_batch_size=2,

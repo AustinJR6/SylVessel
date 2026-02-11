@@ -1,7 +1,38 @@
+# Sylana Vessel Dependencies
+
+# Core AI and ML
 torch>=1.10.0
 transformers>=4.0.0
 sentence-transformers>=2.0.0
 faiss-cpu>=1.7.0
 numpy>=1.18.0
+tqdm>=4.60.0
+
+# Quantized Model Support (CTransformers - has pre-built wheels!)
+ctransformers>=0.2.0
+
+# Multimodal Processing
 Pillow>=8.0.0
 SpeechRecognition>=3.8.1
+pyttsx3>=2.90
+
+# Web Server (for cloud deployment)
+fastapi>=0.100.0
+uvicorn[standard]>=0.20.0
+sse-starlette>=1.6.0
+python-multipart>=0.0.5
+
+# Configuration Management
+python-dotenv>=0.19.0
+
+# Database
+# sqlite3 is built into Python
+
+# Optional: For better audio quality (uncomment if needed)
+# pyaudio>=0.2.11
+# whisper>=1.0.0
+
+# Development Tools (optional)
+# pytest>=7.0.0
+# black>=22.0.0
+# flake8>=4.0.0

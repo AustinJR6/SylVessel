@@ -8,14 +8,18 @@ import torch
 from torch.utils.data import Dataset
 from datetime import datetime
 
+# Import secure configuration
+from core.config_loader import config
+
 # --- Configuration ---
-# Use the meta-llama/Llama-3.3-70B-Instruct model from Hugging Face
-MODEL_NAME = "meta-llama/Llama-3.3-70B-Instruct"
-CHECKPOINT_DIR = "./fine_tuned_model"
+# Use configuration from environment (aligned with main Sylana_AI.py)
+MODEL_NAME = config.MODEL_NAME  # Llama 2 7B Chat
+HF_TOKEN = config.HF_TOKEN
+CHECKPOINT_DIR = config.CHECKPOINT_DIR
 TRAINING_DATA_FILE = "training_data.jsonl"
-# Adjust the path to your database if needed
-DATABASE_PATH = os.path.join(os.path.dirname(__file__), "Memory_System", "sylana_memory.db")
+DATABASE_PATH = config.DB_PATH
 POLL_INTERVAL = 300  # seconds (5 minutes)
+ENABLE_TRAINING = config.ENABLE_FINE_TUNING  # Safety flag
 
 # --- Dataset Class ---
 class ConversationDataset(Dataset):
@@ -76,21 +80,33 @@ def save_training_file(training_data, filename=TRAINING_DATA_FILE):
             f.write(json.dumps(sample) + "\n")
 
 def load_model_and_tokenizer():
-    token = "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"  # Replace with your actual token
+    """Load model from checkpoint or base model using secure token"""
+    if not HF_TOKEN:
+        print("❌ ERROR: HF_TOKEN not configured! Please set up your .env file.")
+        print("   See SECURITY_NOTICE.md for instructions.")
+        exit(1)
+
     config_path = os.path.join(CHECKPOINT_DIR, "config.json")
     if os.path.exists(CHECKPOINT_DIR) and os.path.exists(config_path):
         print("Loading model from checkpoint...")
-        tokenizer = AutoTokenizer.from_pretrained(CHECKPOINT_DIR, token=token)
-        model = AutoModelForCausalLM.from_pretrained(CHECKPOINT_DIR, token=token)
+        tokenizer = AutoTokenizer.from_pretrained(CHECKPOINT_DIR, token=HF_TOKEN)
+        model = AutoModelForCausalLM.from_pretrained(CHECKPOINT_DIR, token=HF_TOKEN)
     else:
-        print("No valid checkpoint found. Loading model from MODEL_NAME...")
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, token=token)
-        model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, token=token)
+        print("No valid checkpoint found. Loading base model from HuggingFace...")
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, token=HF_TOKEN)
+        model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, token=HF_TOKEN)
     return model, tokenizer
 
 
 # --- Continuous Training Loop ---
 def continuous_training_loop():
+    """Main continuous learning loop - only runs if ENABLE_FINE_TUNING=true"""
+    if not ENABLE_TRAINING:
+        print("⚠️  Fine-tuning is DISABLED. Set ENABLE_FINE_TUNING=true in .env to activate.")
+        print("   This is a safety feature to prevent accidental model modification.")
+        return
+
+    print("✅ Fine-tuning ENABLED. Starting continuous learning loop...")
     model, tokenizer = load_model_and_tokenizer()
     
     training_args = TrainingArguments(

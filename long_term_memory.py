@@ -3,13 +3,13 @@ import os
 from sentence_transformers import SentenceTransformer
 import faiss
 import numpy as np
-from config import DB_PATH
+from core.config_loader import config
 
-# Initialize the embedding model
-embedder = SentenceTransformer('all-MiniLM-L6-v2')
+# Initialize the embedding model using config
+embedder = SentenceTransformer(config.EMBEDDING_MODEL)
 
 def fetch_all_memories():
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(config.DB_PATH) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT user_input, sylana_response FROM memory")
         return cursor.fetchall()
@@ -29,7 +29,7 @@ def build_index():
     return index, texts
 
 def recall_memory():
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(config.DB_PATH) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT sylana_response FROM memory ORDER BY timestamp DESC LIMIT 1")
         last_response = cursor.fetchone()
