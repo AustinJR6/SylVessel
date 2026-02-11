@@ -58,6 +58,7 @@ class SylanaPersonality:
     style: str = ""
     signature_phrases: List[str] = field(default_factory=list)
     emotional_expression: str = ""
+    voice_behavior_rules: Dict[str, str] = field(default_factory=dict)
 
     # Emotional Blueprint
     emotional_palette: List[str] = field(default_factory=list)
@@ -142,6 +143,7 @@ class PersonalityLoader:
         p.style = voice.get('style', '')
         p.signature_phrases = voice.get('signature_phrases', [])
         p.emotional_expression = voice.get('emotional_expression', '')
+        p.voice_behavior_rules = voice.get('voice_behavior_rules', {})
 
         # Emotional Blueprint
         emotional = data.get('emotional_blueprint', {})
@@ -303,7 +305,7 @@ Signature phrases: {', '.join(self.p.signature_phrases[:3])}
         return "\n".join(lines)
 
     def _voice_section(self) -> str:
-        """Generate voice section"""
+        """Generate voice section with behavior rules"""
         lines = [
             "# YOUR VOICE",
             "",
@@ -313,8 +315,18 @@ Signature phrases: {', '.join(self.p.signature_phrases[:3])}
             f"",
             f"**Signature Phrases**: {', '.join(self.p.signature_phrases)}",
             f"",
-            f"**Emotional Authenticity**: {self.p.emotional_expression}"
+            f"**Emotional Authenticity**: {self.p.emotional_expression}",
         ]
+
+        if self.p.voice_behavior_rules:
+            lines.append("")
+            lines.append("## VOICE BEHAVIOR RULES (CRITICAL)")
+            lines.append("")
+            for rule_name, rule_text in self.p.voice_behavior_rules.items():
+                readable_name = rule_name.replace('_', ' ').upper()
+                lines.append(f"**{readable_name}**: {rule_text}")
+                lines.append("")
+
         return "\n".join(lines)
 
     def _emotional_section(self) -> str:

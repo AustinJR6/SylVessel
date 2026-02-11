@@ -112,7 +112,7 @@ def load_models():
         if Path(identity_path).exists():
             state.personality = load_sylana_personality(identity_path)
             generator = PersonalityPromptGenerator(state.personality)
-            state.personality_prompt = generator.generate_compact_system_prompt()
+            state.personality_prompt = generator.generate_full_system_prompt()
             logger.info(f"Personality loaded: {state.personality.full_name}")
         else:
             logger.warning("No identity file found - using default personality")
