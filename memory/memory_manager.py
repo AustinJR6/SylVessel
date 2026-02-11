@@ -70,12 +70,18 @@ class MemoryManager:
         """Create required tables if they don't exist"""
         cursor = self.connection.cursor()
         cursor.execute("""
-            CREATE TABLE IF NOT EXISTS memory (
+            CREATE TABLE IF NOT EXISTS memories (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_input TEXT,
                 sylana_response TEXT,
+                timestamp REAL,
                 emotion TEXT DEFAULT 'neutral',
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                intensity INTEGER DEFAULT 5,
+                topic TEXT DEFAULT '',
+                core_memory BOOLEAN DEFAULT 0,
+                weight INTEGER DEFAULT 50,
+                conversation_id TEXT,
+                conversation_title TEXT
             )
         """)
         cursor.execute("""
@@ -92,11 +98,11 @@ class MemoryManager:
                 score INTEGER CHECK(score >= 1 AND score <= 5),
                 comment TEXT DEFAULT '',
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (conversation_id) REFERENCES memory(id)
+                FOREIGN KEY (conversation_id) REFERENCES memories(id)
             )
         """)
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_memory_timestamp ON memory(timestamp DESC)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_memory_emotion ON memory(emotion)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_memories_timestamp ON memories(timestamp DESC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_memories_emotion ON memories(emotion)")
         self.connection.commit()
         logger.info("Database tables verified/created")
 
@@ -128,7 +134,7 @@ class MemoryManager:
         cursor = self.connection.cursor()
         cursor.execute("""
             SELECT id, user_input, sylana_response, emotion, timestamp
-            FROM memory
+            FROM memories
             ORDER BY timestamp ASC
         """)
         return cursor.fetchall()
@@ -154,7 +160,7 @@ class MemoryManager:
 
         # Store conversation
         cursor.execute("""
-            INSERT INTO memory (user_input, sylana_response, emotion)
+            INSERT INTO memories (user_input, sylana_response, emotion)
             VALUES (?, ?, ?)
         """, (user_input, sylana_response, emotion))
 
@@ -162,7 +168,7 @@ class MemoryManager:
         memory_id = cursor.lastrowid
 
         # Rebuild index if it's getting stale
-        cursor.execute("SELECT COUNT(*) FROM memory")
+        cursor.execute("SELECT COUNT(*) FROM memories")
         total_memories = cursor.fetchone()[0]
 
         if self.semantic_engine.rebuild_if_stale(total_memories):
@@ -280,7 +286,7 @@ class MemoryManager:
         cursor = self.connection.cursor()
         cursor.execute("""
             SELECT id, user_input, sylana_response, emotion, timestamp
-            FROM memory
+            FROM memories
             WHERE emotion = ?
             ORDER BY timestamp DESC
             LIMIT ?
@@ -304,7 +310,7 @@ class MemoryManager:
         cursor = self.connection.cursor()
         cursor.execute("""
             SELECT id, user_input, sylana_response, emotion, timestamp
-            FROM memory
+            FROM memories
             ORDER BY timestamp DESC
             LIMIT ?
         """, (limit,))
@@ -397,7 +403,7 @@ class MemoryManager:
         """Get memory system statistics"""
         cursor = self.connection.cursor()
 
-        cursor.execute("SELECT COUNT(*) FROM memory")
+        cursor.execute("SELECT COUNT(*) FROM memories")
         total_memories = cursor.fetchone()[0]
 
         cursor.execute("SELECT COUNT(*) FROM core_memories")

@@ -29,14 +29,20 @@ def initialize_database():
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
 
-        print("[1/4] Creating memory table...")
+        print("[1/4] Creating memories table...")
         cursor.execute("""
-            CREATE TABLE IF NOT EXISTS memory (
+            CREATE TABLE IF NOT EXISTS memories (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_input TEXT,
                 sylana_response TEXT,
+                timestamp REAL,
                 emotion TEXT DEFAULT 'neutral',
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                intensity INTEGER DEFAULT 5,
+                topic TEXT DEFAULT '',
+                core_memory BOOLEAN DEFAULT 0,
+                weight INTEGER DEFAULT 50,
+                conversation_id TEXT,
+                conversation_title TEXT
             )
         """)
 
@@ -57,13 +63,13 @@ def initialize_database():
                 score INTEGER CHECK(score >= 1 AND score <= 5),
                 comment TEXT DEFAULT '',
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (conversation_id) REFERENCES memory(id)
+                FOREIGN KEY (conversation_id) REFERENCES memories(id)
             )
         """)
 
         print("[4/4] Creating indices...")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_memory_timestamp ON memory(timestamp DESC)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_memory_emotion ON memory(emotion)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_memories_timestamp ON memories(timestamp DESC)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_memories_emotion ON memories(emotion)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_core_memories_timestamp ON core_memories(timestamp DESC)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_feedback_score ON feedback(score)")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_feedback_timestamp ON feedback(timestamp DESC)")
