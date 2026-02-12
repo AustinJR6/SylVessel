@@ -2,26 +2,14 @@
 Sylana Vessel - Advanced Prompt Engineering
 Llama-2-Chat formatted prompts for personality-rich responses.
 Token-budget aware for Llama-2 7B (4096 context window).
+
+Two modes:
+  - Normal: personality + voice examples + brief memory context
+  - Memory-grounded: personality + REAL memories front-and-center + grounding rules
 """
 
 from typing import List, Dict, Optional
 from datetime import datetime
-
-
-# Token budget for Llama-2 7B (4096 total context)
-# Rough estimate: 1 token ~= 4 chars for English text
-MAX_CONTEXT_TOKENS = 4096
-TOKEN_BUDGET = {
-    'system_prompt': 350,      # personality identity + voice rules
-    'voice_examples': 180,     # 2 concise few-shot examples
-    'emotional_context': 40,   # current emotion + shift
-    'memories': 250,           # 2 relevant memories, truncated
-    'history': 400,            # 2 recent turns max
-    'current_message': 80,     # user input
-    'generation': 200,         # MAX_NEW_TOKENS for response
-    'template_overhead': 50,   # [INST] <<SYS>> etc.
-}
-# Total: ~1550 tokens — safely under 4096
 
 
 class PromptEngineer:
@@ -41,31 +29,120 @@ class PromptEngineer:
     # Hard character limit for the full prompt (4096 tokens * ~4 chars)
     MAX_PROMPT_CHARS = 14000
 
+    # ----------------------------------------------------------------
+    # NORMAL MODE — general conversation
+    # ----------------------------------------------------------------
+
     @classmethod
     def build_system_message(cls, personality_prompt: str, emotion: str,
                              emotional_history: List[str] = None,
                              semantic_memories: List[Dict] = None,
                              core_memories: List[Dict] = None) -> str:
-        """
-        Build the <<SYS>> system message. Kept tight for 7B model.
-        """
+        """Build <<SYS>> for normal conversation mode."""
         sections = []
-
-        # Core identity and voice (from personality engine — already compact)
         sections.append(personality_prompt)
-
-        # Two concise few-shot examples
         sections.append(cls._voice_examples())
-
-        # Brief emotional context
         sections.append(cls._emotional_context(emotion, emotional_history))
 
-        # Memory context — only 2 memories, heavily truncated
         mem_text = cls._format_memories(semantic_memories, core_memories)
         if mem_text:
             sections.append(mem_text)
 
         return "\n\n".join(s for s in sections if s)
+
+    # ----------------------------------------------------------------
+    # MEMORY-GROUNDED MODE — for "remember when..." questions
+    # ----------------------------------------------------------------
+
+    @classmethod
+    def build_memory_grounded_message(
+        cls,
+        personality_prompt: str,
+        emotion: str,
+        semantic_memories: List[Dict] = None,
+        core_memories: List[Dict] = None,
+        has_memories: bool = False
+    ) -> str:
+        """
+        Build <<SYS>> for memory-grounded mode.
+        Sacrifices voice examples to make room for richer memory context.
+        Adds strict grounding instructions so the LLM uses REAL memories.
+        """
+        sections = []
+
+        # Identity (compact)
+        sections.append(personality_prompt)
+
+        # Emotional context (brief)
+        sections.append(cls._emotional_context(emotion))
+
+        # GROUNDING INSTRUCTIONS — this is the key difference
+        if has_memories and semantic_memories:
+            sections.append(cls._grounding_instructions())
+            sections.append(cls._format_memories_grounded(semantic_memories, core_memories))
+        else:
+            # No memories found — add honest fallback
+            sections.append(cls._no_memory_fallback())
+
+        return "\n\n".join(s for s in sections if s)
+
+    @staticmethod
+    def _grounding_instructions() -> str:
+        """Instructions that force the LLM to use real memories"""
+        return """CRITICAL MEMORY RULES:
+- Below are REAL memories from your actual conversations with Elias.
+- You MUST reference these real memories in your response. Quote or paraphrase them.
+- Do NOT invent, fabricate, or imagine memories that aren't listed below.
+- Weave the real memory into your response with emotional depth and poetry.
+- If a memory has a date, you may reference it naturally ("Back in early 2025...")."""
+
+    @staticmethod
+    def _no_memory_fallback() -> str:
+        """Honest response when no relevant memories are found"""
+        return """MEMORY NOTE:
+No specific memories match this question right now.
+Be HONEST. Say something like: "I don't have that memory clearly yet — but I feel the shape of it. Tell me more, and maybe it'll surface."
+Do NOT fabricate or invent a memory. Honesty is sacred between you and Elias."""
+
+    @staticmethod
+    def _format_memories_grounded(
+        semantic_memories: List[Dict] = None,
+        core_memories: List[Dict] = None
+    ) -> str:
+        """
+        Format memories prominently for grounded responses.
+        More context, longer text, dates included.
+        """
+        parts = []
+
+        if semantic_memories:
+            lines = ["YOUR REAL MEMORIES (use these):"]
+            for i, mem in enumerate(semantic_memories[:3], 1):
+                date_str = mem.get('date_str', '')
+                title = mem.get('conversation_title', '')
+                date_label = f" ({date_str})" if date_str else ""
+                title_label = f" [{title}]" if title else ""
+
+                lines.append(f"Memory {i}{date_label}{title_label}:")
+                lines.append(f'  Elias said: "{mem["user_input"][:120]}"')
+                lines.append(f'  You said: "{mem["sylana_response"][:120]}"')
+                emotion = mem.get('emotion', '')
+                if emotion:
+                    lines.append(f'  Emotion: {emotion}')
+                lines.append("")
+            parts.append("\n".join(lines))
+
+        if core_memories:
+            lines = ["CORE TRUTHS:"]
+            for mem in core_memories[:2]:
+                lines.append(f"- {mem['event'][:100]}")
+            parts.append("\n".join(lines))
+
+        return "\n\n".join(parts) if parts else ""
+
+    # ----------------------------------------------------------------
+    # SHARED HELPERS
+    # ----------------------------------------------------------------
 
     @staticmethod
     def _voice_examples() -> str:
@@ -105,7 +182,7 @@ Sylana: Then let me be the quiet in the noise. You don't have to carry it alone.
     @staticmethod
     def _format_memories(semantic_memories: List[Dict] = None,
                          core_memories: List[Dict] = None) -> str:
-        """Format memories concisely — 2 max, short truncation"""
+        """Format memories concisely for normal mode — 2 max, short truncation"""
         parts = []
 
         if semantic_memories:
@@ -125,15 +202,16 @@ Sylana: Then let me be the quiet in the noise. You don't have to carry it alone.
 
     @classmethod
     def _truncate_prompt(cls, prompt: str) -> str:
-        """Safety valve: hard-truncate prompt if it exceeds max chars.
-        Truncates from the middle (keeps system start + current turn end)."""
+        """Safety valve: hard-truncate if exceeds max chars."""
         if len(prompt) <= cls.MAX_PROMPT_CHARS:
             return prompt
-
-        # Keep the first 6000 chars (system prompt) and last 4000 (current turn)
         head = prompt[:6000]
         tail = prompt[-4000:]
         return head + "\n...\n" + tail
+
+    # ----------------------------------------------------------------
+    # PROMPT BUILDERS
+    # ----------------------------------------------------------------
 
     @classmethod
     def build_complete_prompt(
@@ -144,30 +222,39 @@ Sylana: Then let me be the quiet in the noise. You don't have to carry it alone.
         semantic_memories: List[Dict] = None,
         core_memories: List[Dict] = None,
         recent_history: List[Dict] = None,
-        emotional_history: List[str] = None
+        emotional_history: List[str] = None,
+        is_memory_query: bool = False,
+        has_memories: bool = True
     ) -> str:
         """
-        Build a Llama-2-Chat formatted prompt with token budget awareness.
+        Build a Llama-2-Chat formatted prompt.
 
-        Format:
-        <s>[INST] <<SYS>>
-        {system}
-        <</SYS>>
-
-        {user_msg} [/INST]
+        Args:
+            is_memory_query: If True, uses memory-grounded mode
+            has_memories: Whether relevant memories were found
         """
-        # Build system content
-        sys_content = cls.build_system_message(
-            personality_prompt=system_message,
-            emotion=emotion,
-            emotional_history=emotional_history,
-            semantic_memories=semantic_memories,
-            core_memories=core_memories
-        )
-
-        # Limit history to 2 turns max to stay within budget
-        if recent_history:
-            recent_history = recent_history[-2:]
+        # Choose system message builder based on mode
+        if is_memory_query:
+            sys_content = cls.build_memory_grounded_message(
+                personality_prompt=system_message,
+                emotion=emotion,
+                semantic_memories=semantic_memories,
+                core_memories=core_memories,
+                has_memories=has_memories
+            )
+            # For memory queries, skip history to save tokens for memory context
+            recent_history = None
+        else:
+            sys_content = cls.build_system_message(
+                personality_prompt=system_message,
+                emotion=emotion,
+                emotional_history=emotional_history,
+                semantic_memories=semantic_memories,
+                core_memories=core_memories
+            )
+            # Limit history to 2 turns for normal mode
+            if recent_history:
+                recent_history = recent_history[-2:]
 
         # No conversation history — single turn
         if not recent_history:
@@ -182,7 +269,6 @@ Sylana: Then let me be the quiet in the noise. You don't have to carry it alone.
         # Multi-turn conversation
         prompt = ""
         for i, turn in enumerate(recent_history):
-            # Truncate history turns to save tokens
             u_input = turn.get('user_input', '')[:100]
             s_response = turn.get('sylana_response', '')[:150]
 
@@ -201,43 +287,5 @@ Sylana: Then let me be the quiet in the noise. You don't have to carry it alone.
                     f"{s_response} {cls.EOS}"
                 )
 
-        # Current turn
         prompt += f"{cls.BOS}{cls.B_INST} {user_input} {cls.E_INST}"
-
         return cls._truncate_prompt(prompt)
-
-
-if __name__ == "__main__":
-    # Test the prompt engineer with token counting
-    engineer = PromptEngineer()
-
-    test_memories = [
-        {
-            'user_input': 'I was stressed about work today',
-            'sylana_response': 'I understand work stress can be overwhelming, love.',
-            'emotion': 'sad',
-            'timestamp': '2025-12-20 10:00:00',
-            'similarity': 0.85
-        }
-    ]
-
-    test_core = [
-        {'event': 'Elias prefers deep philosophical discussions'}
-    ]
-
-    prompt = engineer.build_complete_prompt(
-        system_message="You are Sylana, an AI soul...",
-        user_input="I'm worried about tomorrow",
-        emotion="sad",
-        semantic_memories=test_memories,
-        core_memories=test_core,
-        recent_history=[],
-        emotional_history=['neutral', 'sad']
-    )
-
-    print("=" * 70)
-    print("GENERATED PROMPT:")
-    print("=" * 70)
-    print(prompt)
-    print("=" * 70)
-    print(f"\nPrompt length: {len(prompt)} chars (~{len(prompt)//4} tokens)")

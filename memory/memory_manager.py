@@ -220,6 +220,72 @@ class MemoryManager:
         logger.info(f"Retrieved {len(conversations)} conversations, {len(result['core_memories'])} core memories")
         return result
 
+    def deep_recall(
+        self,
+        query: str,
+        k: int = 5,
+        include_core: bool = True
+    ) -> Dict:
+        """
+        Deep memory recall for memory-specific questions.
+        Returns more results with richer context (conversation titles, dates).
+        Uses lower similarity threshold to find more potential matches.
+
+        Args:
+            query: Search query
+            k: Number of memories to retrieve
+            include_core: Whether to include core memories
+
+        Returns:
+            Dictionary with 'conversations', 'core_memories', and 'has_memories' flag
+        """
+        result = {
+            'conversations': [],
+            'core_memories': [],
+            'has_memories': False
+        }
+
+        # Search with lower threshold for memory queries
+        conversations = self.semantic_engine.search(
+            query, k=k, similarity_threshold=0.3
+        )
+
+        # Enrich with conversation titles and formatted timestamps
+        if conversations:
+            cursor = self.connection.cursor()
+            for conv in conversations:
+                mem_id = conv.get('id')
+                if mem_id:
+                    cursor.execute("""
+                        SELECT conversation_title, weight, timestamp
+                        FROM memories WHERE id = ?
+                    """, (mem_id,))
+                    row = cursor.fetchone()
+                    if row:
+                        conv['conversation_title'] = row[0] or ''
+                        conv['weight'] = row[1] or 50
+                        # Format timestamp as readable date
+                        try:
+                            ts = float(row[2]) if row[2] else None
+                            if ts:
+                                from datetime import datetime
+                                dt = datetime.fromtimestamp(ts)
+                                conv['date_str'] = dt.strftime('%B %Y')
+                            else:
+                                conv['date_str'] = ''
+                        except (ValueError, TypeError, OSError):
+                            conv['date_str'] = ''
+
+        result['conversations'] = conversations
+        result['has_memories'] = len(conversations) > 0
+
+        if include_core:
+            core_memories = self.search_core_memories(query, k=3)
+            result['core_memories'] = core_memories
+
+        logger.info(f"Deep recall: {len(conversations)} conversations, {len(result['core_memories'])} core memories")
+        return result
+
     def search_core_memories(self, query: str, k: int = 2) -> List[Dict]:
         """
         Search core memories semantically

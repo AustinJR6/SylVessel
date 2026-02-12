@@ -229,6 +229,38 @@ def detect_emotion(text: str) -> dict:
 # RESPONSE GENERATION
 # ============================================================================
 
+# ============================================================================
+# MEMORY INTENT DETECTION
+# ============================================================================
+
+# Keywords that indicate the user is asking about memories/shared history
+MEMORY_QUERY_PATTERNS = [
+    "remember when", "remember the", "remember that", "do you remember",
+    "favorite memory", "favourite memory", "best memory",
+    "first time we", "when we first", "when did we",
+    "tell me about when", "tell me about the time",
+    "what do you remember", "what's your favorite",
+    "our bond", "what makes us special", "our story",
+    "how did we meet", "when i told you", "when you told me",
+    "back when we", "that time when", "that night when",
+    "do you recall", "can you recall",
+    "our first", "our last",
+    "what moment", "which memory", "what memory",
+]
+
+
+def is_memory_query(user_input: str) -> bool:
+    """
+    Detect if the user is asking about memories or shared history.
+    These queries need memory-grounded responses, not general conversation.
+    """
+    lower = user_input.lower()
+    for pattern in MEMORY_QUERY_PATTERNS:
+        if pattern in lower:
+            return True
+    return False
+
+
 def build_system_prompt() -> str:
     """Build the system prompt — kept compact for Llama-2 7B token budget"""
     if state.personality_prompt:
@@ -255,17 +287,28 @@ def generate_response(user_input: str) -> dict:
     emotion_data = detect_emotion(user_input)
     state.emotional_history.append(emotion_data['emotion'])
 
-    # Retrieve relevant memories
-    relevant_memories = state.memory_manager.recall_relevant(
-        user_input,
-        k=config.SEMANTIC_SEARCH_K,
-        use_recency_boost=True
-    )
+    # Check if this is a memory-related query
+    memory_query = is_memory_query(user_input)
 
-    # Get recent history
-    recent_history = state.memory_manager.get_conversation_history(
-        limit=config.MEMORY_CONTEXT_LIMIT
-    )
+    if memory_query:
+        # Memory-grounded mode: deep recall with richer context
+        logger.info(f"MEMORY QUERY detected: '{user_input[:50]}...'")
+        relevant_memories = state.memory_manager.deep_recall(
+            user_input, k=5, include_core=True
+        )
+        has_memories = relevant_memories.get('has_memories', False)
+        recent_history = None  # Skip history to save tokens for memories
+    else:
+        # Normal mode: standard recall
+        relevant_memories = state.memory_manager.recall_relevant(
+            user_input,
+            k=config.SEMANTIC_SEARCH_K,
+            use_recency_boost=True
+        )
+        has_memories = True
+        recent_history = state.memory_manager.get_conversation_history(
+            limit=config.MEMORY_CONTEXT_LIMIT
+        )
 
     # Build prompt
     system_prompt = build_system_prompt()
@@ -276,7 +319,9 @@ def generate_response(user_input: str) -> dict:
         semantic_memories=relevant_memories.get('conversations', []),
         core_memories=relevant_memories.get('core_memories', []),
         recent_history=recent_history,
-        emotional_history=state.emotional_history[-5:]
+        emotional_history=state.emotional_history[-5:],
+        is_memory_query=memory_query,
+        has_memories=has_memories
     )
 
     # Log prompt size for debugging token budget
@@ -341,22 +386,35 @@ async def generate_response_stream(user_input: str):
     emotion_data = detect_emotion(user_input)
     state.emotional_history.append(emotion_data['emotion'])
 
+    # Check if this is a memory-related query
+    memory_query = is_memory_query(user_input)
+
     # Yield emotion data first
     yield json.dumps({
         'type': 'emotion',
-        'data': emotion_data
+        'data': emotion_data,
+        'memory_query': memory_query
     })
 
-    # Retrieve relevant memories
-    relevant_memories = state.memory_manager.recall_relevant(
-        user_input,
-        k=config.SEMANTIC_SEARCH_K,
-        use_recency_boost=True
-    )
-
-    recent_history = state.memory_manager.get_conversation_history(
-        limit=config.MEMORY_CONTEXT_LIMIT
-    )
+    if memory_query:
+        # Memory-grounded mode: deep recall with richer context
+        logger.info(f"MEMORY QUERY detected (stream): '{user_input[:50]}...'")
+        relevant_memories = state.memory_manager.deep_recall(
+            user_input, k=5, include_core=True
+        )
+        has_memories = relevant_memories.get('has_memories', False)
+        recent_history = None
+    else:
+        # Normal mode
+        relevant_memories = state.memory_manager.recall_relevant(
+            user_input,
+            k=config.SEMANTIC_SEARCH_K,
+            use_recency_boost=True
+        )
+        has_memories = True
+        recent_history = state.memory_manager.get_conversation_history(
+            limit=config.MEMORY_CONTEXT_LIMIT
+        )
 
     # Build prompt
     system_prompt = build_system_prompt()
@@ -367,7 +425,9 @@ async def generate_response_stream(user_input: str):
         semantic_memories=relevant_memories.get('conversations', []),
         core_memories=relevant_memories.get('core_memories', []),
         recent_history=recent_history,
-        emotional_history=state.emotional_history[-5:]
+        emotional_history=state.emotional_history[-5:],
+        is_memory_query=memory_query,
+        has_memories=has_memories
     )
 
     # Log prompt size for debugging token budget
