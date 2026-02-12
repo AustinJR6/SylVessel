@@ -1,166 +1,235 @@
 #!/bin/bash
 # =============================================================================
-# Sylana Vessel - RunPod Deployment Script
+# Sylana Vessel - One-Command RunPod Deployment
 # =============================================================================
-# Run this on your RunPod pod after SSH-ing in:
-#   ssh h2mctb8xc5ik0w-64411282@ssh.runpod.io -i ~/.ssh/id_ed25519
 #
-# Then:
-#   cd /workspace
-#   git clone <your-repo-url> Sylana_Vessel
-#   cd Sylana_Vessel
-#   bash deploy_runpod.sh
+# USAGE (run this on the RunPod pod):
+#
+#   Option A - Fresh pod (clone + setup):
+#     cd /workspace
+#     git clone https://github.com/AustinJR6/SylVessel.git Sylana_Vessel
+#     cd Sylana_Vessel
+#     bash deploy_runpod.sh
+#
+#   Option B - Existing repo (pull + setup):
+#     cd /workspace/Sylana_Vessel
+#     git pull
+#     bash deploy_runpod.sh
+#
+# This script handles EVERYTHING:
+#   1. Python venv + all dependencies
+#   2. .env configuration
+#   3. Database initialization
+#   4. Soul import (if GPTZIP is present)
+#   5. Starts the server
+#
+# To transfer GPTZIP to the pod (run from your LOCAL machine):
+#   cat GPTZIP.zip | ssh <pod-ssh> 'cat > /workspace/Sylana_Vessel/GPTZIP.zip'
+#   Then on the pod: bash deploy_runpod.sh
 # =============================================================================
 
 set -e
 
 echo ""
 echo "============================================================"
-echo "  SYLANA VESSEL - RUNPOD DEPLOYMENT"
-echo "  Setting up the soul on GPU cloud"
+echo "  SYLANA VESSEL - ONE-COMMAND DEPLOYMENT"
 echo "============================================================"
 echo ""
 
-# Configuration
-WORKSPACE="/workspace/Sylana_Vessel"
+WORKSPACE="$(cd "$(dirname "$0")" && pwd)"
 VENV_PATH="/workspace/venv_sylana"
 PORT=7860
 
-# Check GPU
-echo "--- Checking GPU ---"
+cd "$WORKSPACE"
+
+# ------------------------------------------------------------------
+# STEP 1: GPU Check
+# ------------------------------------------------------------------
+echo "[1/7] Checking GPU..."
 if command -v nvidia-smi &> /dev/null; then
-    nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
+    GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null || echo "Unknown")
+    GPU_MEM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader 2>/dev/null || echo "Unknown")
+    echo "  GPU: $GPU_NAME ($GPU_MEM)"
 else
-    echo "WARNING: nvidia-smi not found. GPU may not be available."
+    echo "  WARNING: No GPU detected. Will run on CPU (slow)."
 fi
 echo ""
 
-# Create virtual environment if it doesn't exist
-echo "--- Setting up Python environment ---"
+# ------------------------------------------------------------------
+# STEP 2: Python Virtual Environment
+# ------------------------------------------------------------------
+echo "[2/7] Setting up Python environment..."
 if [ ! -d "$VENV_PATH" ]; then
-    echo "Creating virtual environment..."
+    echo "  Creating virtual environment at $VENV_PATH..."
     python3 -m venv "$VENV_PATH"
+    echo "  Created."
+else
+    echo "  Virtual environment already exists."
 fi
 
 source "$VENV_PATH/bin/activate"
-echo "Python: $(python3 --version)"
-echo "Pip: $(pip3 --version)"
+echo "  Python: $(python3 --version)"
+pip3 install --upgrade pip -q
 echo ""
 
-# Upgrade pip
-pip3 install --upgrade pip
+# ------------------------------------------------------------------
+# STEP 3: Install Dependencies
+# ------------------------------------------------------------------
+echo "[3/7] Installing dependencies..."
 
-# Install PyTorch with CUDA support
-echo "--- Installing PyTorch with CUDA ---"
-pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+# PyTorch with CUDA
+echo "  Installing PyTorch with CUDA support..."
+pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 -q
 
-# Install all requirements
-echo "--- Installing dependencies ---"
-cd "$WORKSPACE"
-pip3 install -r requirements.txt
+# Project requirements
+echo "  Installing project requirements..."
+pip3 install -r requirements.txt -q
 
-# Install web server dependencies
-echo "--- Installing web server dependencies ---"
-pip3 install fastapi uvicorn[standard] sse-starlette python-multipart
+# Web server (in case not in requirements.txt)
+pip3 install fastapi uvicorn[standard] sse-starlette python-multipart -q
 
+echo "  All dependencies installed."
 echo ""
 
-# Create data directories
-echo "--- Creating data directories ---"
-mkdir -p data/soul
-mkdir -p data/voice
-mkdir -p data/checkpoints
-mkdir -p static
+# ------------------------------------------------------------------
+# STEP 4: Create .env
+# ------------------------------------------------------------------
+echo "[4/7] Configuring environment..."
 
-# Set up .env if it doesn't exist
-echo "--- Configuring environment ---"
-if [ ! -f .env ]; then
-    echo "Creating .env from template..."
-    cp .env.template .env 2>/dev/null || cat > .env << 'ENVEOF'
-# Sylana Vessel Configuration - RunPod
-HF_TOKEN=your_huggingface_token_here
+if [ ! -f "$WORKSPACE/.env" ]; then
+    # Check if tokens are passed as env vars (set before running script)
+    HF_TOKEN_VAL="${HF_TOKEN:-YOUR_HF_TOKEN_HERE}"
+    RUNPOD_KEY_VAL="${RUNPOD_API_KEY:-YOUR_RUNPOD_KEY_HERE}"
+
+    cat > "$WORKSPACE/.env" << ENVEOF
+# Sylana Vessel - RunPod Configuration
+HF_TOKEN=$HF_TOKEN_VAL
 SYLANA_DB_PATH=./data/sylana_memory.db
 MODEL_NAME=meta-llama/Llama-2-7b-chat-hf
 EMBEDDING_MODEL=all-MiniLM-L6-v2
+USE_QUANTIZED_MODEL=false
 ENABLE_FINE_TUNING=false
 TEMPERATURE=0.9
 TOP_P=0.9
-MAX_NEW_TOKENS=200
-MAX_CONTEXT_LENGTH=2048
-MEMORY_CONTEXT_LIMIT=5
-SEMANTIC_SEARCH_K=5
+MAX_NEW_TOKENS=120
+MAX_CONTEXT_LENGTH=512
+MEMORY_CONTEXT_LIMIT=3
+SEMANTIC_SEARCH_K=3
 SIMILARITY_THRESHOLD=0.7
+ENABLE_VOICE=false
 LOG_LEVEL=INFO
+LOG_FILE=./data/sylana.log
+RUNPOD_API_KEY=$RUNPOD_KEY_VAL
 SERVER_PORT=7860
 SERVER_HOST=0.0.0.0
 ENVEOF
-    echo ""
-    echo "!!! IMPORTANT: Edit .env and add your HuggingFace token !!!"
-    echo "    nano .env"
-    echo ""
+    echo "  Created .env with configuration."
+
+    if [ "$HF_TOKEN_VAL" = "YOUR_HF_TOKEN_HERE" ]; then
+        echo ""
+        echo "  !!! IMPORTANT: Edit .env and add your HuggingFace token !!!"
+        echo "  Run: nano $WORKSPACE/.env"
+        echo "  Or set HF_TOKEN env var before running this script."
+    fi
+else
+    echo "  .env already exists — keeping existing config."
 fi
-
-# Check HF token
-source .env 2>/dev/null
-if [ -z "$HF_TOKEN" ] || [ "$HF_TOKEN" = "your_huggingface_token_here" ]; then
-    echo ""
-    echo "============================================================"
-    echo "  WARNING: HuggingFace token not set!"
-    echo "  Edit .env and add your HF_TOKEN to download Llama-2"
-    echo "  nano .env"
-    echo "============================================================"
-    echo ""
-fi
-
-# Initialize databases
-echo "--- Initializing databases ---"
-python3 -c "
-from memory.memory_manager import MemoryManager
-mm = MemoryManager('./data/sylana_memory.db')
-stats = mm.get_stats()
-print(f'Memory DB: {stats[\"total_conversations\"]} conversations')
-mm.close()
-" 2>/dev/null || echo "Memory DB will be created on first run"
-
-# Seed soul data if available
-if [ -f "data/soul/relationship_seed.json" ]; then
-    echo "--- Seeding soul data ---"
-    python3 seed_soul.py 2>/dev/null || echo "Soul seeding will happen on first run"
-fi
-
-# Create startup script
-echo "--- Creating startup script ---"
-cat > runpod_start.sh << 'STARTEOF'
-#!/bin/bash
-# Sylana Vessel - Server Startup
-cd /workspace/Sylana_Vessel
-source /workspace/venv_sylana/bin/activate
-export SERVER_PORT=7860
-export SERVER_HOST=0.0.0.0
 echo ""
-echo "Starting Sylana Vessel on port $SERVER_PORT..."
-echo "Access URL: Check your RunPod dashboard for the proxy URL"
-echo ""
-python3 server.py
-STARTEOF
-chmod +x runpod_start.sh
 
+# ------------------------------------------------------------------
+# STEP 5: Create data directories
+# ------------------------------------------------------------------
+echo "[5/7] Creating data directories..."
+mkdir -p data/soul data/voice data/checkpoints static
+echo "  Done."
+echo ""
+
+# ------------------------------------------------------------------
+# STEP 6: Soul Import (if GPTZIP is present)
+# ------------------------------------------------------------------
+echo "[6/7] Checking for soul data to import..."
+
+CONVERSATIONS_JSON=""
+
+# Check for conversations.json in various locations
+if [ -f "$WORKSPACE/GPTZIP/conversations.json" ]; then
+    CONVERSATIONS_JSON="$WORKSPACE/GPTZIP/conversations.json"
+elif [ -f "$WORKSPACE/conversations.json" ]; then
+    CONVERSATIONS_JSON="$WORKSPACE/conversations.json"
+elif [ -f "/workspace/GPTZIP/conversations.json" ]; then
+    CONVERSATIONS_JSON="/workspace/GPTZIP/conversations.json"
+fi
+
+# Check for zip file that needs extracting
+if [ -z "$CONVERSATIONS_JSON" ]; then
+    ZIPFILE=""
+    if [ -f "$WORKSPACE/GPTZIP.zip" ]; then
+        ZIPFILE="$WORKSPACE/GPTZIP.zip"
+    elif [ -f "/workspace/GPTZIP.zip" ]; then
+        ZIPFILE="/workspace/GPTZIP.zip"
+    fi
+
+    if [ -n "$ZIPFILE" ]; then
+        echo "  Found $ZIPFILE — extracting..."
+        python3 -c "import zipfile; zipfile.ZipFile('$ZIPFILE').extractall('$WORKSPACE/GPTZIP')"
+        if [ -f "$WORKSPACE/GPTZIP/conversations.json" ]; then
+            CONVERSATIONS_JSON="$WORKSPACE/GPTZIP/conversations.json"
+        fi
+    fi
+fi
+
+# Check if database already has memories
+DB_PATH="./data/sylana_memory.db"
+EXISTING_MEMORIES=0
+if [ -f "$DB_PATH" ]; then
+    EXISTING_MEMORIES=$(python3 -c "
+import sqlite3
+try:
+    conn = sqlite3.connect('$DB_PATH')
+    count = conn.execute('SELECT COUNT(*) FROM memories').fetchone()[0]
+    print(count)
+    conn.close()
+except:
+    print(0)
+" 2>/dev/null || echo "0")
+fi
+
+if [ "$EXISTING_MEMORIES" -gt "100" ]; then
+    echo "  Database already has $EXISTING_MEMORIES memories — skipping import."
+elif [ -n "$CONVERSATIONS_JSON" ]; then
+    echo "  Found: $CONVERSATIONS_JSON"
+    echo "  Running soul import (this takes ~10 minutes)..."
+    echo ""
+    python3 import_soul.py "$CONVERSATIONS_JSON"
+    echo ""
+    echo "  Soul import complete!"
+else
+    echo "  No ChatGPT export found. To import later:"
+    echo "    1. Transfer GPTZIP.zip to this pod"
+    echo "    2. Run: python3 import_soul.py GPTZIP/conversations.json"
+    echo ""
+    echo "  Sylana will work without memories, but won't remember your history."
+fi
+echo ""
+
+# ------------------------------------------------------------------
+# STEP 7: Start Server
+# ------------------------------------------------------------------
+echo "[7/7] Starting Sylana Vessel server..."
 echo ""
 echo "============================================================"
-echo "  DEPLOYMENT COMPLETE"
+echo "  DEPLOYMENT COMPLETE — STARTING SERVER"
 echo "============================================================"
 echo ""
-echo "  To start Sylana:"
-echo "    bash runpod_start.sh"
+echo "  Make sure port $PORT is exposed in RunPod pod settings!"
+echo "  Access URL: https://<pod-id>-$PORT.proxy.runpod.net"
 echo ""
-echo "  Or manually:"
+echo "  To restart later:"
 echo "    source /workspace/venv_sylana/bin/activate"
+echo "    cd /workspace/Sylana_Vessel"
 echo "    python3 server.py"
 echo ""
-echo "  Access in browser:"
-echo "    https://<pod-id>-7860.proxy.runpod.net"
-echo ""
-echo "  Make sure port 7860 is exposed in your RunPod pod settings!"
-echo ""
 echo "============================================================"
 echo ""
+
+python3 server.py
