@@ -40,6 +40,7 @@ class Config:
             "SYLANA_DB_PATH",
             str(PROJECT_ROOT / "data" / "sylana_memory.db")
         )
+        self.SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL")
 
         # Model Configuration
         self.MODEL_NAME = os.getenv(

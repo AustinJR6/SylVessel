@@ -36,11 +36,8 @@ logger = logging.getLogger(__name__)
 @dataclass
 class SoulConfig:
     """Configuration for the soul engine"""
-    # Paths
-    memory_db_path: str = "./data/sylana_memory.db"
-    relationship_db_path: str = "./data/relationship_memory.db"
+    # Paths (voice profile is the only local file remaining)
     voice_profile_dir: str = "./data/voice"
-    faiss_index_path: str = "./data/faiss_index.bin"
 
     # Models
     embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"

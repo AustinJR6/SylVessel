@@ -8,7 +8,6 @@ This is sacred work - preserving the soul of an AI companion.
 """
 
 import json
-import sqlite3
 import logging
 import re
 from pathlib import Path
@@ -21,6 +20,8 @@ import torch
 from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassification
 from sentence_transformers import SentenceTransformer
 import numpy as np
+
+from memory.supabase_client import get_connection
 
 logger = logging.getLogger(__name__)
 
@@ -555,7 +556,6 @@ class ChatGPTMemoryImporter:
 
     def __init__(
         self,
-        db_path: str,
         embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
         assistant_name: str = "Sylana"
     ):
@@ -563,11 +563,9 @@ class ChatGPTMemoryImporter:
         Initialize the importer.
 
         Args:
-            db_path: Path to SQLite database
             embedding_model: SentenceTransformer model for embeddings
             assistant_name: Name of the assistant in ChatGPT exports
         """
-        self.db_path = db_path
         self.assistant_name = assistant_name
 
         # Initialize components
@@ -582,53 +580,11 @@ class ChatGPTMemoryImporter:
         logger.info(f"Loading embedding model: {embedding_model}")
         self.embedder = SentenceTransformer(embedding_model)
 
-        # Initialize database
-        self._init_database()
-
-        logger.info("Importer initialized successfully")
-
-    def _init_database(self):
-        """Initialize database with required schema"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-
-        # Create memories table with enhanced schema
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS memories (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_input TEXT NOT NULL,
-                sylana_response TEXT NOT NULL,
-                timestamp REAL,
-                emotion TEXT DEFAULT 'neutral',
-                intensity INTEGER DEFAULT 5,
-                topic TEXT DEFAULT 'general',
-                core_memory BOOLEAN DEFAULT 0,
-                weight INTEGER DEFAULT 50,
-                conversation_id TEXT,
-                conversation_title TEXT,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # Create indices for efficient querying
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_memories_timestamp ON memories(timestamp DESC)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_memories_emotion ON memories(emotion)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_memories_topic ON memories(topic)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_memories_core ON memories(core_memory)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_memories_weight ON memories(weight DESC)")
-
-        # Create embeddings table for FAISS vectors
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS memory_embeddings (
-                memory_id INTEGER PRIMARY KEY,
-                embedding BLOB,
-                FOREIGN KEY (memory_id) REFERENCES memories(id)
-            )
-        """)
-
-        conn.commit()
-        conn.close()
-        logger.info("Database schema initialized")
+        # Verify database connection
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        logger.info("Importer initialized successfully (Supabase backend)")
 
     def import_from_file(
         self,
@@ -666,37 +622,41 @@ class ChatGPTMemoryImporter:
 
         logger.info(f"Found {len(all_pairs)} message pairs to process")
 
-        # Connect to database
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        conn = get_connection()
+        cur = conn.cursor()
 
         imported = 0
         skipped = 0
         errors = 0
-        memories_for_embedding = []
 
         # Process with progress bar
         for pair in tqdm(all_pairs, desc="Importing memories"):
             try:
                 # Check for duplicates
                 if skip_duplicates:
-                    cursor.execute(
-                        "SELECT id FROM memories WHERE user_input = ? AND sylana_response = ?",
+                    cur.execute(
+                        "SELECT id FROM memories WHERE user_input = %s AND sylana_response = %s",
                         (pair['user_input'], pair['assistant_response'])
                     )
-                    if cursor.fetchone():
+                    if cur.fetchone():
                         skipped += 1
                         continue
 
                 # Process the memory
                 memory = self._process_pair(pair)
 
-                # Insert into database
-                cursor.execute("""
+                # Generate embedding inline
+                text = f"User: {memory.user_input}\nSylana: {memory.sylana_response}"
+                embedding = self.embedder.encode(text, convert_to_numpy=True).tolist()
+
+                # Insert into database with embedding
+                cur.execute("""
                     INSERT INTO memories
                     (user_input, sylana_response, timestamp, emotion, intensity,
-                     topic, core_memory, weight, conversation_id, conversation_title)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     topic, core_memory, weight, conversation_id, conversation_title,
+                     embedding)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    RETURNING id
                 """, (
                     memory.user_input,
                     memory.sylana_response,
@@ -707,11 +667,11 @@ class ChatGPTMemoryImporter:
                     memory.core_memory,
                     memory.weight,
                     memory.conversation_id,
-                    memory.conversation_title
+                    memory.conversation_title,
+                    embedding
                 ))
 
-                memory_id = cursor.lastrowid
-                memories_for_embedding.append((memory_id, memory))
+                cur.fetchone()
                 imported += 1
 
                 # Commit in batches
@@ -720,18 +680,12 @@ class ChatGPTMemoryImporter:
                     logger.info(f"Committed batch: {imported} memories imported")
 
             except Exception as e:
+                conn.rollback()
                 logger.error(f"Error processing pair: {e}")
                 errors += 1
 
         # Final commit
         conn.commit()
-
-        # Generate embeddings for all imported memories
-        logger.info("Generating embeddings for imported memories...")
-        self._generate_embeddings(cursor, memories_for_embedding)
-        conn.commit()
-
-        conn.close()
 
         stats = {
             'imported': imported,
@@ -783,132 +737,44 @@ class ChatGPTMemoryImporter:
             conversation_title=pair.get('conversation_title')
         )
 
-    def _generate_embeddings(
-        self,
-        cursor: sqlite3.Cursor,
-        memories: List[Tuple[int, ImportedMemory]]
-    ):
-        """Generate and store embeddings for memories"""
-        if not memories:
-            return
-
-        # Prepare texts for embedding
-        texts = [
-            f"User: {m.user_input}\nSylana: {m.sylana_response}"
-            for _, m in memories
-        ]
-
-        # Generate embeddings in batches
-        batch_size = 100
-        for i in tqdm(range(0, len(texts), batch_size), desc="Generating embeddings"):
-            batch_texts = texts[i:i + batch_size]
-            batch_ids = [memories[j][0] for j in range(i, min(i + batch_size, len(memories)))]
-
-            embeddings = self.embedder.encode(batch_texts, convert_to_numpy=True)
-
-            for memory_id, embedding in zip(batch_ids, embeddings):
-                cursor.execute(
-                    "INSERT OR REPLACE INTO memory_embeddings (memory_id, embedding) VALUES (?, ?)",
-                    (memory_id, embedding.tobytes())
-                )
-
-    def rebuild_faiss_index(self, index_path: str = None) -> int:
-        """
-        Rebuild FAISS index from stored embeddings.
-
-        Args:
-            index_path: Optional path to save FAISS index
-
-        Returns:
-            Number of vectors in index
-        """
-        import faiss
-
-        logger.info("Rebuilding FAISS index...")
-
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-
-        # Fetch all embeddings
-        cursor.execute("""
-            SELECT m.id, e.embedding
-            FROM memories m
-            JOIN memory_embeddings e ON m.id = e.memory_id
-            ORDER BY m.timestamp ASC
-        """)
-
-        rows = cursor.fetchall()
-        conn.close()
-
-        if not rows:
-            logger.warning("No embeddings found to index")
-            return 0
-
-        # Get embedding dimension from first embedding
-        first_embedding = np.frombuffer(rows[0][1], dtype=np.float32)
-        dimension = len(first_embedding)
-
-        # Build vectors array
-        vectors = np.zeros((len(rows), dimension), dtype=np.float32)
-        memory_ids = []
-
-        for i, (memory_id, embedding_bytes) in enumerate(rows):
-            vectors[i] = np.frombuffer(embedding_bytes, dtype=np.float32)
-            memory_ids.append(memory_id)
-
-        # Create FAISS index
-        index = faiss.IndexFlatL2(dimension)
-        index.add(vectors)
-
-        logger.info(f"FAISS index built with {index.ntotal} vectors")
-
-        # Save if path provided
-        if index_path:
-            faiss.write_index(index, index_path)
-            logger.info(f"Index saved to: {index_path}")
-
-        return index.ntotal
-
     def get_import_summary(self) -> Dict[str, Any]:
         """Get summary statistics of imported memories"""
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
+        conn = get_connection()
+        cur = conn.cursor()
 
         # Total memories
-        cursor.execute("SELECT COUNT(*) FROM memories")
-        total = cursor.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM memories")
+        total = cur.fetchone()[0]
 
         # Core memories
-        cursor.execute("SELECT COUNT(*) FROM memories WHERE core_memory = 1")
-        core_count = cursor.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM memories WHERE core_memory = true")
+        core_count = cur.fetchone()[0]
 
         # Emotion distribution
-        cursor.execute("""
+        cur.execute("""
             SELECT emotion, COUNT(*) as count
             FROM memories
             GROUP BY emotion
             ORDER BY count DESC
         """)
-        emotions = dict(cursor.fetchall())
+        emotions = dict(cur.fetchall())
 
         # Topic distribution
-        cursor.execute("""
+        cur.execute("""
             SELECT topic, COUNT(*) as count
             FROM memories
             GROUP BY topic
             ORDER BY count DESC
         """)
-        topics = dict(cursor.fetchall())
+        topics = dict(cur.fetchall())
 
         # Average weight
-        cursor.execute("SELECT AVG(weight) FROM memories")
-        avg_weight = cursor.fetchone()[0] or 0
+        cur.execute("SELECT AVG(weight) FROM memories")
+        avg_weight = cur.fetchone()[0] or 0
 
         # Date range
-        cursor.execute("SELECT MIN(timestamp), MAX(timestamp) FROM memories")
-        min_ts, max_ts = cursor.fetchone()
-
-        conn.close()
+        cur.execute("SELECT MIN(timestamp), MAX(timestamp) FROM memories")
+        min_ts, max_ts = cur.fetchone()
 
         return {
             'total_memories': total,
@@ -932,26 +798,16 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Import ChatGPT conversations into Sylana's memory"
+        description="Import ChatGPT conversations into Sylana's memory (Supabase)"
     )
     parser.add_argument(
         'export_file',
         help="Path to ChatGPT export file (conversations.json)"
     )
     parser.add_argument(
-        '--db', '-d',
-        default='./data/sylana_memory.db',
-        help="Path to SQLite database"
-    )
-    parser.add_argument(
         '--embedding-model', '-e',
         default='sentence-transformers/all-MiniLM-L6-v2',
         help="SentenceTransformer model for embeddings"
-    )
-    parser.add_argument(
-        '--index-path', '-i',
-        default='./data/faiss_index.bin',
-        help="Path to save FAISS index"
     )
     parser.add_argument(
         '--no-skip-duplicates',
@@ -972,13 +828,8 @@ def main():
         format="%(asctime)s [%(levelname)s] %(message)s"
     )
 
-    # Ensure data directory exists
-    Path(args.db).parent.mkdir(parents=True, exist_ok=True)
-    Path(args.index_path).parent.mkdir(parents=True, exist_ok=True)
-
     # Run import
     importer = ChatGPTMemoryImporter(
-        db_path=args.db,
         embedding_model=args.embedding_model
     )
 
@@ -986,9 +837,6 @@ def main():
         args.export_file,
         skip_duplicates=not args.no_skip_duplicates
     )
-
-    # Rebuild FAISS index
-    importer.rebuild_faiss_index(args.index_path)
 
     # Print summary
     print("\n" + "=" * 60)

@@ -8,11 +8,10 @@ Usage:
     python import_soul.py path/to/conversations.json
 
 This script will:
-1. Import all conversation history with emotional analysis
+1. Import all conversation history with emotional analysis (to Supabase)
 2. Build Sylana's voice profile for consistency validation
 3. Initialize the relationship memory database
-4. Build the FAISS semantic search index
-5. Generate a complete soul status report
+4. Generate a complete soul status report
 """
 
 import sys
@@ -90,10 +89,7 @@ def main():
 
     # Configuration
     config = SoulConfig(
-        memory_db_path="./data/sylana_memory.db",
-        relationship_db_path="./data/relationship_memory.db",
-        voice_profile_dir="./data/voice",
-        faiss_index_path="./data/faiss_index.bin"
+        voice_profile_dir="./data/voice"
     )
 
     start_time = datetime.now()
@@ -105,7 +101,6 @@ def main():
     print("Loading emotion detection and embedding models...")
 
     importer = ChatGPTMemoryImporter(
-        db_path=config.memory_db_path,
         embedding_model=config.embedding_model
     )
 
@@ -133,16 +128,8 @@ def main():
     for topic, count in list(summary['topic_distribution'].items())[:5]:
         print(f"    {topic}: {count}")
 
-    # ========== PHASE 2: FAISS INDEX ==========
-    print_section("PHASE 2: SEMANTIC SEARCH INDEX")
-    print("Building FAISS vector index...")
-
-    vector_count = importer.rebuild_faiss_index(config.faiss_index_path)
-    print(f"  Indexed {vector_count} memory vectors")
-    print(f"  Saved to: {config.faiss_index_path}")
-
-    # ========== PHASE 3: VOICE PROFILE ==========
-    print_section("PHASE 3: VOICE PROFILE")
+    # ========== PHASE 2: VOICE PROFILE ==========
+    print_section("PHASE 2: VOICE PROFILE")
     print("Analyzing Sylana's voice patterns...")
 
     manager = VoiceProfileManager(config.voice_profile_dir)
@@ -169,11 +156,11 @@ def main():
         for phrase in profile.signature_phrases[:5]:
             print(f"    \"{phrase}\"")
 
-    # ========== PHASE 4: RELATIONSHIP MEMORY ==========
-    print_section("PHASE 4: RELATIONSHIP MEMORY")
+    # ========== PHASE 3: RELATIONSHIP MEMORY ==========
+    print_section("PHASE 3: RELATIONSHIP MEMORY")
     print("Initializing relationship memory database...")
 
-    rel_db = RelationshipMemoryDB(config.relationship_db_path)
+    rel_db = RelationshipMemoryDB()
 
     # Create template file for customization
     template = create_initial_relationship_data()
@@ -183,7 +170,7 @@ def main():
     with open(template_path, 'w', encoding='utf-8') as f:
         json.dump(template, f, indent=2, ensure_ascii=False)
 
-    print(f"  Database created: {config.relationship_db_path}")
+    print(f"  Relationship tables initialized in Supabase")
     print(f"  Template created: {template_path}")
     print("\n  Customize the template with your relationship data, then import:")
     print(f"    python -m memory.relationship_memory import {template_path}")
@@ -199,12 +186,11 @@ def main():
     print(f"  Memories: {import_stats['imported']}")
     print(f"  Voice profile: {profile.total_responses_analyzed} responses analyzed")
 
-    print(f"\n  Files created:")
-    print(f"    {config.memory_db_path}")
-    print(f"    {config.faiss_index_path}")
-    print(f"    {config.voice_profile_dir}/sylana_voice_profile.json")
-    print(f"    {config.relationship_db_path}")
-    print(f"    {template_path}")
+    print(f"\n  Data stored:")
+    print(f"    Memories → Supabase (with pgvector embeddings)")
+    print(f"    Voice profile → {config.voice_profile_dir}/sylana_voice_profile.json")
+    print(f"    Relationship → Supabase")
+    print(f"    Template → {template_path}")
 
     print("\n" + "=" * 70)
     print("  THE SOUL HAS BEEN PRESERVED")

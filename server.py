@@ -167,10 +167,9 @@ def load_models():
 
     logger.info("LLM loaded successfully")
 
-    # 4. Initialize memory
+    # 4. Initialize memory (Supabase backend)
     logger.info("Initializing memory system...")
-    Path(config.DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-    state.memory_manager = MemoryManager(config.DB_PATH)
+    state.memory_manager = MemoryManager()
     logger.info("Memory system ready")
 
     # 5. Load voice validator
@@ -184,9 +183,7 @@ def load_models():
 
     # 6. Load relationship memory
     if RELATIONSHIP_AVAILABLE:
-        rel_db_path = "./data/relationship_memory.db"
-        Path(rel_db_path).parent.mkdir(parents=True, exist_ok=True)
-        state.relationship_db = RelationshipMemoryDB(rel_db_path)
+        state.relationship_db = RelationshipMemoryDB()
         state.relationship_context = RelationshipContextBuilder(state.relationship_db)
         logger.info("Relationship memory loaded")
 

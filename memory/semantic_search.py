@@ -1,13 +1,12 @@
 """
 Sylana Vessel - Semantic Memory Search Engine
-FAISS-based semantic search over conversation history
+pgvector-based semantic search over conversation history in Supabase
 """
 
 import numpy as np
-import faiss
-from typing import List, Tuple, Optional
+from typing import List, Optional
 from sentence_transformers import SentenceTransformer
-from datetime import datetime, timedelta
+from datetime import datetime
 import logging
 
 from core.config_loader import config
@@ -17,77 +16,36 @@ logger = logging.getLogger(__name__)
 
 class SemanticMemoryEngine:
     """
-    Manages FAISS index for semantic similarity search over memories.
-    Enables contextual retrieval of relevant past conversations.
+    Semantic similarity search over memories using pgvector.
+    Queries Supabase PostgreSQL directly — no local index needed.
     """
 
     def __init__(self, embedder: Optional[SentenceTransformer] = None):
-        """
-        Initialize semantic search engine
-
-        Args:
-            embedder: Pre-loaded SentenceTransformer model, or None to create new
-        """
         if embedder is None:
             logger.info(f"Loading embedding model: {config.EMBEDDING_MODEL}")
             self.embedder = SentenceTransformer(config.EMBEDDING_MODEL)
         else:
             self.embedder = embedder
 
-        self.index = None
-        self.memory_texts = []
-        self.memory_metadata = []  # Store (id, timestamp, emotion) for each memory
-        self.dimension = None
-        self.is_built = False
+        logger.info("SemanticMemoryEngine initialized (pgvector backend)")
 
-        logger.info("SemanticMemoryEngine initialized")
+    def build_index(self, memories=None):
+        """No-op: pgvector index is always live in Postgres."""
+        pass
 
-    def build_index(self, memories: List[Tuple[int, str, str, str, str]]):
-        """
-        Build FAISS index from conversation memories
+    def rebuild_if_stale(self, current_memory_count: int):
+        """No-op: pgvector handles indexing automatically."""
+        return False
 
-        Args:
-            memories: List of (id, user_input, sylana_response, emotion, timestamp)
-        """
-        if not memories:
-            logger.warning("No memories provided to build index")
-            self.index = None
-            self.is_built = False
-            return
+    def encode_query(self, query: str) -> list:
+        """Encode a query string into a vector."""
+        embedding = self.embedder.encode([query], convert_to_numpy=True)[0]
+        return embedding.tolist()
 
-        logger.info(f"Building FAISS index from {len(memories)} memories...")
-
-        # Create conversation text representations
-        self.memory_texts = []
-        self.memory_metadata = []
-
-        for mem_id, user_input, sylana_response, emotion, timestamp in memories:
-            # Combine user input and response for semantic representation
-            text = f"User: {user_input}\nSylana: {sylana_response}"
-            self.memory_texts.append(text)
-            self.memory_metadata.append({
-                'id': mem_id,
-                'user_input': user_input,
-                'sylana_response': sylana_response,
-                'emotion': emotion,
-                'timestamp': timestamp
-            })
-
-        # Generate embeddings
-        logger.info("Generating embeddings...")
-        embeddings = self.embedder.encode(
-            self.memory_texts,
-            convert_to_numpy=True,
-            show_progress_bar=False
-        )
-
-        # Build FAISS index
-        self.dimension = embeddings.shape[1]
-        self.index = faiss.IndexFlatL2(self.dimension)
-        self.index.add(embeddings.astype('float32'))
-
-        self.is_built = True
-        logger.info(f"FAISS index built successfully with {len(self.memory_texts)} entries")
+    def encode_text(self, text: str) -> list:
+        """Encode any text into a vector for storage."""
+        embedding = self.embedder.encode([text], convert_to_numpy=True)[0]
+        return embedding.tolist()
 
     def search(
         self,
@@ -96,49 +54,51 @@ class SemanticMemoryEngine:
         similarity_threshold: float = None
     ) -> List[dict]:
         """
-        Search for semantically similar memories
-
-        Args:
-            query: Search query (user input)
-            k: Number of results to return (default from config)
-            similarity_threshold: Minimum similarity score (default from config)
+        Search for semantically similar memories via pgvector cosine distance.
 
         Returns:
-            List of memory dictionaries with similarity scores
+            List of memory dicts with 'similarity' scores (0-1, higher=better)
         """
-        if not self.is_built or self.index is None:
-            logger.warning("Index not built. Returning empty results.")
-            return []
+        from memory.supabase_client import get_connection
 
         if k is None:
             k = config.SEMANTIC_SEARCH_K
         if similarity_threshold is None:
             similarity_threshold = config.SIMILARITY_THRESHOLD
 
-        # Generate query embedding
-        query_embedding = self.embedder.encode(
-            [query],
-            convert_to_numpy=True,
-            show_progress_bar=False
-        )
+        query_vec = self.encode_query(query)
 
-        # Search FAISS index
-        k_actual = min(k, len(self.memory_texts))
-        distances, indices = self.index.search(query_embedding.astype('float32'), k_actual)
+        conn = get_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute("""
+                SELECT id, user_input, sylana_response, emotion, timestamp,
+                       1 - (embedding <=> %s::vector) AS similarity
+                FROM memories
+                WHERE embedding IS NOT NULL
+                ORDER BY embedding <=> %s::vector
+                LIMIT %s
+            """, (query_vec, query_vec, k))
 
-        # Convert L2 distances to similarity scores (0-1 range)
-        # Lower distance = higher similarity
-        # Use exponential decay: similarity = exp(-distance)
-        similarities = np.exp(-distances[0])
+            rows = cur.fetchall()
+        except Exception as e:
+            logger.error(f"pgvector search failed: {e}")
+            conn.rollback()
+            return []
 
-        # Filter by threshold and format results
         results = []
-        for idx, similarity in zip(indices[0], similarities):
+        for row in rows:
+            mem_id, user_input, sylana_response, emotion, timestamp, similarity = row
             if similarity >= similarity_threshold:
-                memory = self.memory_metadata[idx].copy()
-                memory['similarity'] = float(similarity)
-                memory['text'] = self.memory_texts[idx]
-                results.append(memory)
+                results.append({
+                    'id': mem_id,
+                    'user_input': user_input,
+                    'sylana_response': sylana_response,
+                    'emotion': emotion,
+                    'timestamp': timestamp,
+                    'similarity': float(similarity),
+                    'text': f"User: {user_input}\nSylana: {sylana_response}"
+                })
 
         logger.info(f"Found {len(results)} relevant memories (threshold: {similarity_threshold})")
         return results
@@ -150,47 +110,38 @@ class SemanticMemoryEngine:
         recency_weight: float = 0.3
     ) -> List[dict]:
         """
-        Search with recency bias - recent memories get boosted
-
-        Args:
-            query: Search query
-            k: Number of results
-            recency_weight: Weight for recency (0-1, default 0.3)
-
-        Returns:
-            List of memories sorted by combined similarity + recency score
+        Search with recency bias — recent memories get boosted.
+        Fetches 2*k candidates from pgvector, then applies recency formula.
         """
-        results = self.search(query, k=k * 2, similarity_threshold=0.0)  # Get more candidates
+        if k is None:
+            k = config.SEMANTIC_SEARCH_K
+
+        # Get more candidates for re-ranking
+        results = self.search(query, k=k * 2, similarity_threshold=0.0)
 
         if not results:
             return []
 
-        # Calculate recency scores (last 7 days get full weight)
         now = datetime.now()
         for memory in results:
             try:
-                timestamp = datetime.fromisoformat(memory['timestamp'])
-                hours_ago = (now - timestamp).total_seconds() / 3600
-                days_ago = hours_ago / 24
-
-                # Recency score: 1.0 for today, decays over 7 days
-                recency_score = max(0.0, 1.0 - (days_ago / 7))
-            except:
+                ts = memory.get('timestamp')
+                if ts:
+                    dt = datetime.fromtimestamp(float(ts))
+                    days_ago = (now - dt).total_seconds() / 86400
+                    recency_score = max(0.0, 1.0 - (days_ago / 7))
+                else:
+                    recency_score = 0.0
+            except (ValueError, TypeError, OSError):
                 recency_score = 0.0
 
-            # Combined score
             memory['recency_score'] = recency_score
             memory['combined_score'] = (
                 (1 - recency_weight) * memory['similarity'] +
                 recency_weight * recency_score
             )
 
-        # Sort by combined score
         results.sort(key=lambda x: x['combined_score'], reverse=True)
-
-        # Return top k
-        if k is None:
-            k = config.SEMANTIC_SEARCH_K
         return results[:k]
 
     def search_by_emotion(
@@ -199,114 +150,110 @@ class SemanticMemoryEngine:
         emotion: str,
         k: int = None
     ) -> List[dict]:
-        """
-        Search for memories matching both query and emotion
-
-        Args:
-            query: Search query
-            emotion: Target emotion (happy, sad, ecstatic, devastated, neutral)
-            k: Number of results
-
-        Returns:
-            List of memories filtered by emotion
-        """
-        results = self.search(query, k=k * 3)  # Get more candidates
-
-        # Filter by emotion
-        emotion_matches = [r for r in results if r['emotion'] == emotion]
+        """Search for memories matching both query and emotion."""
+        from memory.supabase_client import get_connection
 
         if k is None:
             k = config.SEMANTIC_SEARCH_K
 
-        return emotion_matches[:k]
+        query_vec = self.encode_query(query)
 
-    def get_similar_to_memory(self, memory_id: int, k: int = 5) -> List[dict]:
-        """
-        Find memories similar to a specific memory ID
+        conn = get_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute("""
+                SELECT id, user_input, sylana_response, emotion, timestamp,
+                       1 - (embedding <=> %s::vector) AS similarity
+                FROM memories
+                WHERE embedding IS NOT NULL AND emotion = %s
+                ORDER BY embedding <=> %s::vector
+                LIMIT %s
+            """, (query_vec, emotion, query_vec, k))
 
-        Args:
-            memory_id: ID of the reference memory
-            k: Number of similar memories to return
-
-        Returns:
-            List of similar memories (excluding the reference itself)
-        """
-        # Find the memory by ID
-        ref_memory = None
-        for idx, meta in enumerate(self.memory_metadata):
-            if meta['id'] == memory_id:
-                ref_memory = self.memory_texts[idx]
-                break
-
-        if ref_memory is None:
-            logger.warning(f"Memory ID {memory_id} not found in index")
+            rows = cur.fetchall()
+        except Exception as e:
+            logger.error(f"pgvector emotion search failed: {e}")
+            conn.rollback()
             return []
 
-        # Search using the memory text as query
-        results = self.search(ref_memory, k=k + 1)
+        results = []
+        for row in rows:
+            mem_id, user_input, sylana_response, emo, timestamp, similarity = row
+            results.append({
+                'id': mem_id,
+                'user_input': user_input,
+                'sylana_response': sylana_response,
+                'emotion': emo,
+                'timestamp': timestamp,
+                'similarity': float(similarity),
+                'text': f"User: {user_input}\nSylana: {sylana_response}"
+            })
 
-        # Remove the reference memory itself
-        results = [r for r in results if r['id'] != memory_id]
+        return results
 
-        return results[:k]
+    def get_similar_to_memory(self, memory_id: int, k: int = 5) -> List[dict]:
+        """Find memories similar to a specific memory ID."""
+        from memory.supabase_client import get_connection
 
-    def rebuild_if_stale(self, current_memory_count: int):
-        """
-        Rebuild index if memory count has changed significantly
+        conn = get_connection()
+        cur = conn.cursor()
+        try:
+            # Get the embedding for the reference memory
+            cur.execute("SELECT embedding FROM memories WHERE id = %s", (memory_id,))
+            row = cur.fetchone()
+            if not row or row[0] is None:
+                logger.warning(f"Memory ID {memory_id} not found or has no embedding")
+                return []
 
-        Args:
-            current_memory_count: Current number of memories in database
-        """
-        if not self.is_built:
-            return True  # Needs building
+            ref_embedding = row[0]
 
-        indexed_count = len(self.memory_texts)
-        difference = abs(current_memory_count - indexed_count)
+            # Search for similar (excluding self)
+            cur.execute("""
+                SELECT id, user_input, sylana_response, emotion, timestamp,
+                       1 - (embedding <=> %s) AS similarity
+                FROM memories
+                WHERE embedding IS NOT NULL AND id != %s
+                ORDER BY embedding <=> %s
+                LIMIT %s
+            """, (ref_embedding, memory_id, ref_embedding, k))
 
-        # Rebuild if difference > 10 memories or > 20%
-        if difference > 10 or (indexed_count > 0 and difference / indexed_count > 0.2):
-            logger.info(f"Index stale: {indexed_count} indexed vs {current_memory_count} in DB")
-            return True
+            rows = cur.fetchall()
+        except Exception as e:
+            logger.error(f"pgvector similar-to search failed: {e}")
+            conn.rollback()
+            return []
 
-        return False
+        results = []
+        for row in rows:
+            mem_id, user_input, sylana_response, emotion, timestamp, similarity = row
+            results.append({
+                'id': mem_id,
+                'user_input': user_input,
+                'sylana_response': sylana_response,
+                'emotion': emotion,
+                'timestamp': timestamp,
+                'similarity': float(similarity),
+                'text': f"User: {user_input}\nSylana: {sylana_response}"
+            })
+
+        return results
 
     def get_stats(self) -> dict:
-        """Get statistics about the search engine"""
+        """Get statistics about the search engine."""
+        from memory.supabase_client import get_connection
+
+        try:
+            conn = get_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM memories WHERE embedding IS NOT NULL")
+            total = cur.fetchone()[0]
+        except Exception:
+            total = 0
+
         return {
-            'is_built': self.is_built,
-            'dimension': self.dimension,
-            'total_memories': len(self.memory_texts),
-            'model': config.EMBEDDING_MODEL
+            'is_built': True,
+            'dimension': 384,
+            'total_memories': total,
+            'model': config.EMBEDDING_MODEL,
+            'backend': 'pgvector'
         }
-
-
-if __name__ == "__main__":
-    # Test the semantic search engine
-    logging.basicConfig(level=logging.INFO)
-
-    # Example usage
-    engine = SemanticMemoryEngine()
-
-    # Mock data for testing
-    test_memories = [
-        (1, "How are you?", "I'm doing well, thank you!", "happy", "2025-12-20 10:00:00"),
-        (2, "What's the weather?", "I don't have access to weather data", "neutral", "2025-12-20 11:00:00"),
-        (3, "I'm feeling sad", "I'm here for you. What's troubling you?", "sad", "2025-12-21 14:00:00"),
-        (4, "Tell me a joke", "Why did the AI go to therapy? Too many issues!", "happy", "2025-12-22 09:00:00"),
-    ]
-
-    engine.build_index(test_memories)
-
-    # Test search
-    results = engine.search("I'm not feeling great", k=2)
-    print("\nSearch results for 'I'm not feeling great':")
-    for r in results:
-        print(f"  Similarity: {r['similarity']:.3f} - {r['user_input']}")
-
-    # Test emotion-based search
-    happy_results = engine.search_by_emotion("feeling", "happy", k=2)
-    print("\nHappy memories about 'feeling':")
-    for r in happy_results:
-        print(f"  {r['user_input']}")
-
-    print("\n" + str(engine.get_stats()))
