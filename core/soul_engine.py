@@ -92,19 +92,14 @@ class SoulEngine:
 
     def _ensure_directories(self):
         """Ensure required directories exist"""
-        paths = [
-            Path(self.config.memory_db_path).parent,
-            Path(self.config.relationship_db_path).parent,
-            Path(self.config.voice_profile_dir),
-            Path(self.config.faiss_index_path).parent
-        ]
+        paths = [Path(self.config.voice_profile_dir)]
         for path in paths:
             path.mkdir(parents=True, exist_ok=True)
 
     def _init_components(self):
         """Initialize all soul components"""
         # Relationship memory
-        self.relationship_db = RelationshipMemoryDB(self.config.relationship_db_path)
+        self.relationship_db = RelationshipMemoryDB()
         self.relationship_context = RelationshipContextBuilder(self.relationship_db)
         logger.info("Relationship memory initialized")
 
@@ -130,14 +125,14 @@ class SoulEngine:
     def import_chatgpt_history(
         self,
         export_path: str,
-        rebuild_index: bool = True
+        rebuild_index: bool = False
     ) -> Dict[str, Any]:
         """
         Import conversation history from a ChatGPT export.
 
         Args:
             export_path: Path to ChatGPT conversations.json
-            rebuild_index: Whether to rebuild FAISS index after import
+            rebuild_index: Deprecated no-op kept for backward compatibility
 
         Returns:
             Import statistics
@@ -146,16 +141,14 @@ class SoulEngine:
 
         # Initialize importer
         self.memory_importer = ChatGPTMemoryImporter(
-            db_path=self.config.memory_db_path,
             embedding_model=self.config.embedding_model
         )
 
         # Run import
         stats = self.memory_importer.import_from_file(export_path)
 
-        # Rebuild FAISS index
         if rebuild_index:
-            self.memory_importer.rebuild_faiss_index(self.config.faiss_index_path)
+            logger.info("rebuild_index requested - ignored (pgvector handles indexing)")
 
         logger.info(f"Import complete: {stats}")
         return stats
@@ -184,9 +177,7 @@ class SoulEngine:
             manager.save_profile(self.voice_profile)
         else:
             # Build from database
-            self.voice_profile = manager.build_profile_from_db(
-                self.config.memory_db_path
-            )
+            self.voice_profile = manager.build_profile_from_db()
 
         # Initialize validator
         if self.config.enable_voice_validation:
@@ -309,8 +300,8 @@ class SoulEngine:
         status = {
             'soul_engine': 'active',
             'config': {
-                'memory_db': self.config.memory_db_path,
-                'relationship_db': self.config.relationship_db_path,
+                'memory_backend': 'supabase_pgvector',
+                'relationship_backend': 'supabase_postgres',
                 'voice_validation_enabled': self.config.enable_voice_validation
             }
         }
@@ -385,23 +376,20 @@ class SoulEngine:
 
 def quick_import(
     chatgpt_export: str,
-    memory_db: str = "./data/sylana_memory.db",
-    relationship_db: str = "./data/relationship_memory.db"
+    voice_profile_dir: str = "./data/voice"
 ) -> Dict[str, Any]:
     """
     Quick import function for one-line soul transfer.
 
     Args:
         chatgpt_export: Path to ChatGPT export file
-        memory_db: Path to memory database
-        relationship_db: Path to relationship database
+        voice_profile_dir: Directory for local voice profile file
 
     Returns:
         Combined status dictionary
     """
     config = SoulConfig(
-        memory_db_path=memory_db,
-        relationship_db_path=relationship_db
+        voice_profile_dir=voice_profile_dir
     )
 
     engine = SoulEngine(config)
@@ -437,19 +425,16 @@ def main():
     # Import command
     import_parser = subparsers.add_parser('import', help='Import ChatGPT history')
     import_parser.add_argument('export_file', help='Path to ChatGPT export JSON')
-    import_parser.add_argument('--memory-db', default='./data/sylana_memory.db')
-    import_parser.add_argument('--relationship-db', default='./data/relationship_memory.db')
+    import_parser.add_argument('--voice-dir', default='./data/voice')
 
     # Status command
     status_parser = subparsers.add_parser('status', help='Show soul status')
-    status_parser.add_argument('--memory-db', default='./data/sylana_memory.db')
-    status_parser.add_argument('--relationship-db', default='./data/relationship_memory.db')
+    status_parser.add_argument('--voice-dir', default='./data/voice')
 
     # Export command
     export_parser = subparsers.add_parser('export', help='Export soul state')
     export_parser.add_argument('output_dir', help='Output directory')
-    export_parser.add_argument('--memory-db', default='./data/sylana_memory.db')
-    export_parser.add_argument('--relationship-db', default='./data/relationship_memory.db')
+    export_parser.add_argument('--voice-dir', default='./data/voice')
 
     # Validate command
     validate_parser = subparsers.add_parser('validate', help='Validate a response')
@@ -465,8 +450,7 @@ def main():
 
     if args.command == 'import':
         config = SoulConfig(
-            memory_db_path=args.memory_db,
-            relationship_db_path=args.relationship_db
+            voice_profile_dir=args.voice_dir
         )
         engine = SoulEngine(config)
 
@@ -493,8 +477,7 @@ def main():
 
     elif args.command == 'status':
         config = SoulConfig(
-            memory_db_path=args.memory_db,
-            relationship_db_path=args.relationship_db
+            voice_profile_dir=args.voice_dir
         )
         engine = SoulEngine(config)
         status = engine.get_soul_status()
@@ -534,8 +517,7 @@ def main():
 
     elif args.command == 'export':
         config = SoulConfig(
-            memory_db_path=args.memory_db,
-            relationship_db_path=args.relationship_db
+            voice_profile_dir=args.voice_dir
         )
         engine = SoulEngine(config)
 

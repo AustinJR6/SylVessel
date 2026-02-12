@@ -10,7 +10,6 @@ outputs for "voice consistency" - does this sound like her?
 
 import json
 import re
-import sqlite3
 import logging
 import pickle
 from pathlib import Path
@@ -21,6 +20,8 @@ import math
 
 import numpy as np
 from sentence_transformers import SentenceTransformer
+
+from memory.supabase_client import get_connection
 
 logger = logging.getLogger(__name__)
 
@@ -683,17 +684,19 @@ class VoiceProfileManager:
 
     def build_profile_from_db(
         self,
-        db_path: str,
         name: str = "sylana"
     ) -> VoiceProfile:
-        """Build and save a voice profile from database responses"""
-        conn = sqlite3.connect(db_path)
+        """Build and save a voice profile from Supabase memory responses"""
+        conn = get_connection()
         cursor = conn.cursor()
 
         # Get all Sylana responses
-        cursor.execute("SELECT sylana_response FROM memories")
+        cursor.execute("""
+            SELECT sylana_response
+            FROM memories
+            WHERE sylana_response IS NOT NULL AND sylana_response <> ''
+        """)
         rows = cursor.fetchall()
-        conn.close()
 
         responses = [row[0] for row in rows if row[0]]
         logger.info(f"Building voice profile from {len(responses)} responses")
@@ -770,7 +773,7 @@ def create_validator_from_export(
 
 
 def create_validator_from_db(
-    db_path: str,
+    db_path: Optional[str] = None,
     profile_dir: str = "./data/voice",
     threshold: float = 0.7
 ) -> VoiceValidator:
@@ -778,15 +781,17 @@ def create_validator_from_db(
     Convenience function to create a validator from existing database.
 
     Args:
-        db_path: Path to SQLite database with memories
+        db_path: Deprecated, ignored (kept for backward compatibility)
         profile_dir: Directory to save voice profile
         threshold: Validation threshold
 
     Returns:
         Configured VoiceValidator
     """
+    if db_path:
+        logger.warning("create_validator_from_db(db_path=...) is deprecated; using Supabase connection")
     manager = VoiceProfileManager(profile_dir)
-    profile = manager.build_profile_from_db(db_path)
+    profile = manager.build_profile_from_db()
     return VoiceValidator(profile, threshold=threshold)
 
 
