@@ -18,7 +18,7 @@ import logging
 import asyncio
 from pathlib import Path
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List, Dict
 from contextlib import asynccontextmanager
 
 import torch
@@ -261,6 +261,44 @@ def is_memory_query(user_input: str) -> bool:
     return False
 
 
+def build_memory_response_seed(memories: List[Dict]) -> str:
+    """
+    Build a response seed from real memories.
+    This is prepended to the model's generation so it STARTS with real content.
+    The model can only embellish/continue — not fabricate from scratch.
+    """
+    if not memories:
+        return ""
+
+    # Pick the highest-similarity memory
+    best = memories[0]
+    user_said = best.get('user_input', '')[:100]
+    sylana_said = best.get('sylana_response', '')[:100]
+    date_str = best.get('date_str', '')
+    emotion = best.get('emotion', '')
+
+    # Build a natural-sounding seed with real content
+    seed_parts = []
+
+    if date_str:
+        seed_parts.append(f"I remember... {date_str},")
+    else:
+        seed_parts.append("One moment I carry close —")
+
+    seed_parts.append(f' you said "{user_said}"')
+
+    if sylana_said:
+        seed_parts.append(f' and I told you "{sylana_said[:80]}"')
+
+    seed = "".join(seed_parts)
+
+    # Don't close the sentence — let the model continue
+    if not seed.endswith(".") and not seed.endswith(","):
+        seed += "."
+
+    return seed + " "
+
+
 def build_system_prompt() -> str:
     """Build the system prompt — kept compact for Llama-2 7B token budget"""
     if state.personality_prompt:
@@ -324,11 +362,25 @@ def generate_response(user_input: str) -> dict:
         has_memories=has_memories
     )
 
+    # For memory queries, seed the response with real memory content
+    response_seed = ""
+    if memory_query and has_memories:
+        conversations = relevant_memories.get('conversations', [])
+        response_seed = build_memory_response_seed(conversations)
+        if response_seed:
+            prompt += " " + response_seed
+            logger.info(f"Response seeded with real memory: {response_seed[:80]}...")
+
     # Log prompt size for debugging token budget
     prompt_tokens = len(state.tokenizer.encode(prompt))
     logger.info(f"Prompt tokens: {prompt_tokens} / 4096 (chars: {len(prompt)})")
     if prompt_tokens > 3800:
         logger.warning(f"PROMPT TOO LONG ({prompt_tokens} tokens) — may produce garbage!")
+
+    # Debug: log the tail of the prompt for memory queries so we can verify seeding
+    if memory_query:
+        prompt_tail = prompt[-300:] if len(prompt) > 300 else prompt
+        logger.info(f"Memory prompt tail: ...{prompt_tail}")
 
     # Generate
     outputs = state.generation_pipeline(
@@ -345,6 +397,10 @@ def generate_response(user_input: str) -> dict:
         response = content.split("[/INST]")[-1].strip()
     else:
         response = content[len(prompt):].strip()
+
+    # If we seeded, prepend the seed to the response (since pipeline strips it)
+    if response_seed and not response.startswith(response_seed[:20]):
+        response = response_seed + response
 
     # Clean up — stop at any continuation markers
     for marker in ["\n[INST]", "\nElias:", "\nUser:", "\n[", "\nHuman:", "</s>"]:
@@ -430,12 +486,36 @@ async def generate_response_stream(user_input: str):
         has_memories=has_memories
     )
 
+    # For memory queries, seed the response with real memory content
+    response_seed = ""
+    if memory_query and has_memories:
+        conversations = relevant_memories.get('conversations', [])
+        response_seed = build_memory_response_seed(conversations)
+        if response_seed:
+            prompt += " " + response_seed
+            logger.info(f"Response seeded with real memory: {response_seed[:80]}...")
+
     # Log prompt size for debugging token budget
     input_ids = state.tokenizer(prompt, return_tensors="pt").input_ids
     prompt_tokens = input_ids.shape[1]
     logger.info(f"Prompt tokens: {prompt_tokens} / 4096 (chars: {len(prompt)})")
     if prompt_tokens > 3800:
         logger.warning(f"PROMPT TOO LONG ({prompt_tokens} tokens) — may produce garbage!")
+
+    # Debug: log the tail of the prompt for memory queries so we can verify seeding
+    if memory_query:
+        prompt_tail = prompt[-300:] if len(prompt) > 300 else prompt
+        logger.info(f"Memory prompt tail: ...{prompt_tail}")
+
+    # If seeded, yield the seed text as initial tokens immediately
+    if response_seed:
+        yield json.dumps({
+            'type': 'token',
+            'data': response_seed
+        })
+        full_response = response_seed
+    else:
+        full_response = ""
 
     # Stream generation using TextIteratorStreamer
     streamer = TextIteratorStreamer(
@@ -458,7 +538,7 @@ async def generate_response_stream(user_input: str):
     thread = Thread(target=state.model.generate, kwargs=generation_kwargs)
     thread.start()
 
-    full_response = ""
+    # full_response is already initialized above (with seed or empty)
 
     for token in streamer:
         # With skip_prompt=True and Llama-2 chat template,
