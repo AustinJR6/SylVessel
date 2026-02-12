@@ -43,7 +43,7 @@ class SoulConfig:
     faiss_index_path: str = "./data/faiss_index.bin"
 
     # Models
-    embedding_model: str = "all-MiniLM-L6-v2"
+    embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
     emotion_model: str = "SamLowe/roberta-base-go_emotions"
 
     # Voice validation

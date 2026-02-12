@@ -556,7 +556,7 @@ class ChatGPTMemoryImporter:
     def __init__(
         self,
         db_path: str,
-        embedding_model: str = "all-MiniLM-L6-v2",
+        embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
         assistant_name: str = "Sylana"
     ):
         """
@@ -945,7 +945,7 @@ def main():
     )
     parser.add_argument(
         '--embedding-model', '-e',
-        default='all-MiniLM-L6-v2',
+        default='sentence-transformers/all-MiniLM-L6-v2',
         help="SentenceTransformer model for embeddings"
     )
     parser.add_argument(

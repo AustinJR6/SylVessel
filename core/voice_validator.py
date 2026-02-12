@@ -132,7 +132,7 @@ class VoicePatternAnalyzer:
         flags=re.UNICODE
     )
 
-    def __init__(self, embedding_model: str = "all-MiniLM-L6-v2"):
+    def __init__(self, embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"):
         """Initialize the analyzer"""
         logger.info("Initializing Voice Pattern Analyzer")
         self.embedder = SentenceTransformer(embedding_model)
@@ -397,7 +397,7 @@ class VoiceValidator:
     def __init__(
         self,
         profile: VoiceProfile,
-        embedding_model: str = "all-MiniLM-L6-v2",
+        embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
         threshold: float = 0.7
     ):
         """

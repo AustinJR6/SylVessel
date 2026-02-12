@@ -6,7 +6,7 @@ import faiss
 import numpy as np
 
 # Initialize the embedding model
-embedder = SentenceTransformer('all-MiniLM-L6-v2')
+embedder = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
 
 def build_index():
     with sqlite3.connect(DB_PATH) as conn:

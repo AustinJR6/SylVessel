@@ -48,7 +48,7 @@ class Config:
         )
         self.EMBEDDING_MODEL = os.getenv(
             "EMBEDDING_MODEL",
-            "all-MiniLM-L6-v2"
+            "sentence-transformers/all-MiniLM-L6-v2"
         )
 
         # Fine-Tuning Controls

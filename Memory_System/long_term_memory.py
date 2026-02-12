@@ -6,7 +6,7 @@ import numpy as np
 from config import DB_PATH
 
 # Initialize the embedding model
-embedder = SentenceTransformer('all-MiniLM-L6-v2')
+embedder = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')
 
 def fetch_all_memories():
     with sqlite3.connect(DB_PATH) as conn:
