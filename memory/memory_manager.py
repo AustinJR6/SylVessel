@@ -168,8 +168,12 @@ class MemoryManager:
             'has_memories': False
         }
 
+        # Fetch a wider candidate pool, then prefer imported memories
+        # (those have conversation_id set). This avoids retrieval loops
+        # where fresh test chats dominate "favorite memory" style prompts.
+        candidate_k = max(30, k * 6)
         conversations = self.semantic_engine.search(
-            query, k=k, similarity_threshold=0.3
+            query, k=candidate_k, similarity_threshold=0.25
         )
 
         # Enrich with conversation titles and formatted timestamps
@@ -181,13 +185,14 @@ class MemoryManager:
                 if mem_id:
                     try:
                         cur.execute("""
-                            SELECT conversation_title, weight, timestamp
+                            SELECT conversation_title, weight, timestamp, conversation_id
                             FROM memories WHERE id = %s
                         """, (mem_id,))
                         row = cur.fetchone()
                         if row:
                             conv['conversation_title'] = row[0] or ''
                             conv['weight'] = row[1] or 50
+                            conv['conversation_id'] = row[3] or ''
                             try:
                                 ts = float(row[2]) if row[2] else None
                                 if ts:
@@ -199,6 +204,14 @@ class MemoryManager:
                                 conv['date_str'] = ''
                     except Exception as e:
                         logger.warning(f"Failed to enrich memory {mem_id}: {e}")
+
+        # Prefer imported/exported memories over recent live test chat rows.
+        imported = [c for c in conversations if c.get('conversation_id')]
+        if imported:
+            conversations = imported
+
+        # Keep original similarity ordering and trim to target k.
+        conversations = conversations[:k]
 
         result['conversations'] = conversations
         result['has_memories'] = len(conversations) > 0
