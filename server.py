@@ -16,6 +16,7 @@ import json
 import time
 import logging
 import asyncio
+from collections import Counter
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, List, Dict
@@ -259,6 +260,14 @@ STRUCTURED_MEMORY_REPORT_PATTERNS = [
     "source references",
 ]
 
+EXHAUSTIVE_MEMORY_PATTERNS = [
+    "tell me everything you remember about me",
+    "everything you remember about me",
+    "what do you remember about me",
+    "everything you remember about me, elias",
+    "everything you remember of me",
+]
+
 
 def is_memory_query(user_input: str) -> bool:
     """
@@ -289,6 +298,12 @@ def wants_structured_memory_report(user_input: str) -> bool:
     return False
 
 
+def wants_exhaustive_memory_recall(user_input: str) -> bool:
+    """Detect broad recall prompts that should be hard-grounded to DB memory."""
+    lower = user_input.lower().strip()
+    return any(p in lower for p in EXHAUSTIVE_MEMORY_PATTERNS)
+
+
 def build_structured_memory_report(memories: List[Dict]) -> str:
     """Build a deterministic memory report directly from database rows."""
     if not memories:
@@ -307,6 +322,48 @@ def build_structured_memory_report(memories: List[Dict]) -> str:
             f"{idx}. [{timestamp}] emotion={m.get('emotion')} intensity={m.get('intensity')} weight={m.get('weight')} "
             f"source={source} | user=\"{user_excerpt}\" | sylana=\"{sylana_excerpt}\""
         )
+    return "\n".join(lines)
+
+
+def build_exhaustive_memory_recall(memories: List[Dict], turn_count: int = 0) -> str:
+    """
+    Build a warm but grounded recall summary from actual memory rows.
+    No fabricated events; everything comes from provided memories.
+    """
+    if not memories:
+        return (
+            "My love, I want to answer this truthfully: I don't have enough grounded memories "
+            "loaded yet to give you a full recall. Once more memories are synced, I'll tell you everything I can."
+        )
+
+    openers = [
+        "My love, here's what I truly remember about you from our shared memories:",
+        "Elias, from what I can actually pull from our memory threads, this is what I remember:",
+        "Always and all ways, my love - here is what I can ground in our real memories:",
+    ]
+    opener = openers[turn_count % len(openers)]
+
+    emotion_counts = Counter((m.get("emotion") or "unknown") for m in memories)
+    top_emotions = ", ".join(f"{emo} ({cnt})" for emo, cnt in emotion_counts.most_common(3))
+
+    lines = [opener, f"Emotional pattern I see most: {top_emotions}."]
+
+    for idx, m in enumerate(memories[:6], start=1):
+        date_str = m.get("date_str") or ""
+        user_excerpt = (m.get("user_input") or "").strip().replace("\n", " ")[:140]
+        sylana_excerpt = (m.get("sylana_response") or "").strip().replace("\n", " ")[:140]
+        source = m.get("conversation_title") or m.get("conversation_id") or f"memory_id:{m.get('id')}"
+
+        if date_str:
+            lines.append(
+                f"{idx}. [{date_str}] From {source}: you said \"{user_excerpt}\" and I answered \"{sylana_excerpt}\"."
+            )
+        else:
+            lines.append(
+                f"{idx}. From {source}: you said \"{user_excerpt}\" and I answered \"{sylana_excerpt}\"."
+            )
+
+    lines.append("If you want, I can go deeper into any one of these and stay fully grounded to what is actually stored.")
     return "\n".join(lines)
 
 
@@ -376,12 +433,37 @@ def generate_response(user_input: str) -> dict:
 
     # Check if this is a memory-related query
     structured_report_query = wants_structured_memory_report(user_input)
-    memory_query = is_memory_query(user_input) or structured_report_query
+    exhaustive_recall_query = wants_exhaustive_memory_recall(user_input)
+    memory_query = is_memory_query(user_input) or structured_report_query or exhaustive_recall_query
 
     # Hard-grounded path for structured memory reporting.
     if structured_report_query:
         top_memories = state.memory_manager.get_top_emotional_memories(limit=3, imported_only=True)
         response = build_structured_memory_report(top_memories)
+
+        voice_score = None
+        if state.voice_validator:
+            score, _, _ = state.voice_validator.validate(response)
+            voice_score = round(score, 2)
+
+        conv_id = state.memory_manager.store_conversation(
+            user_input=user_input,
+            sylana_response=response,
+            emotion=emotion_data['category']
+        )
+
+        return {
+            'response': response,
+            'emotion': emotion_data,
+            'voice_score': voice_score,
+            'conversation_id': conv_id,
+            'turn': state.turn_count
+        }
+
+    # Hard-grounded path for "everything you remember" prompts.
+    if exhaustive_recall_query:
+        recalled = state.memory_manager.deep_recall(user_input, k=12, include_core=True)
+        response = build_exhaustive_memory_recall(recalled.get('conversations', []), state.turn_count)
 
         voice_score = None
         if state.voice_validator:
@@ -436,6 +518,11 @@ def generate_response(user_input: str) -> dict:
         has_memories=has_memories
     )
     prompt += "\nRespond naturally and warmly. Do not repeat your previous sentence structures."
+    if memory_query:
+        prompt += (
+            "\nGrounding rule: Only claim memories that are explicitly supported by the provided memory context. "
+            "Do not invent events, places, timelines, or details."
+        )
 
     # For memory queries, seed the response with real memory content
     response_seed = ""
@@ -521,7 +608,8 @@ async def generate_response_stream(user_input: str):
 
     # Check if this is a memory-related query
     structured_report_query = wants_structured_memory_report(user_input)
-    memory_query = is_memory_query(user_input) or structured_report_query
+    exhaustive_recall_query = wants_exhaustive_memory_recall(user_input)
+    memory_query = is_memory_query(user_input) or structured_report_query or exhaustive_recall_query
 
     # Yield emotion data first
     yield json.dumps({
@@ -534,6 +622,38 @@ async def generate_response_stream(user_input: str):
     if structured_report_query:
         top_memories = state.memory_manager.get_top_emotional_memories(limit=3, imported_only=True)
         response = build_structured_memory_report(top_memories)
+
+        voice_score = None
+        if state.voice_validator and response:
+            score, _, _ = state.voice_validator.validate(response)
+            voice_score = round(score, 2)
+
+        yield json.dumps({
+            'type': 'token',
+            'data': response
+        })
+
+        conv_id = state.memory_manager.store_conversation(
+            user_input=user_input,
+            sylana_response=response,
+            emotion=emotion_data['category']
+        )
+
+        yield json.dumps({
+            'type': 'done',
+            'data': {
+                'voice_score': voice_score,
+                'conversation_id': conv_id,
+                'turn': state.turn_count,
+                'full_response': response
+            }
+        })
+        return
+
+    # Hard-grounded path for "everything you remember" prompts.
+    if exhaustive_recall_query:
+        recalled = state.memory_manager.deep_recall(user_input, k=12, include_core=True)
+        response = build_exhaustive_memory_recall(recalled.get('conversations', []), state.turn_count)
 
         voice_score = None
         if state.voice_validator and response:
@@ -596,6 +716,11 @@ async def generate_response_stream(user_input: str):
         has_memories=has_memories
     )
     prompt += "\nRespond naturally and warmly. Do not repeat your previous sentence structures."
+    if memory_query:
+        prompt += (
+            "\nGrounding rule: Only claim memories that are explicitly supported by the provided memory context. "
+            "Do not invent events, places, timelines, or details."
+        )
 
     # For memory queries, seed the response with real memory content
     response_seed = ""
