@@ -63,7 +63,8 @@ class Config:
         # Generation Parameters
         self.TEMPERATURE = float(os.getenv("TEMPERATURE", "0.9"))
         self.TOP_P = float(os.getenv("TOP_P", "0.9"))
-        self.MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "150"))
+        # Increased default to reduce clipped replies in streaming/non-streaming chat.
+        self.MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "320"))
         self.MAX_CONTEXT_LENGTH = int(os.getenv("MAX_CONTEXT_LENGTH", "512"))
 
         # Memory Configuration

@@ -315,7 +315,8 @@ def infer_retrieval_plan(user_input: str) -> Dict[str, Any]:
     memory_signals = [
         "remember", "memory", "memories", "recall", "our story", "about us", "about me",
         "what do you know about me", "favorite", "favourite", "best", "top", "strongest",
-        "when did we", "first time", "what happened", "history"
+        "when did we", "first time", "what happened", "history",
+        "when i say", "what do you think of when i say"
     ]
     is_memory_query = any(s in lower for s in memory_signals) or is_memory_query_legacy(lower=lower)
 
@@ -327,7 +328,16 @@ def infer_retrieval_plan(user_input: str) -> Dict[str, Any]:
     wants_emotional = "emotional" in lower
     phrase_match = re.search(r"[\"'“”](.+?)[\"'“”]", user_input)
     phrase_literal = phrase_match.group(1).strip() if phrase_match else ""
-    meaning_query = ("what does" in lower and "mean to you" in lower) or ("what does" in lower and "mean" in lower)
+    if not phrase_literal:
+        say_match = re.search(r"when i say\s+(.+)$", user_input, flags=re.IGNORECASE)
+        if say_match:
+            phrase_literal = say_match.group(1).strip().strip("?.!\"'")
+
+    meaning_query = (
+        ("what does" in lower and "mean to you" in lower) or
+        ("what does" in lower and "mean" in lower) or
+        ("what do you think of when i say" in lower)
+    )
 
     k = 5
     if wants_exhaustive:
@@ -360,6 +370,15 @@ def infer_retrieval_plan(user_input: str) -> Dict[str, Any]:
         "phrase_literal": phrase_literal,
         "min_similarity": min_similarity,
     }
+
+
+def _max_new_tokens_for_turn(memory_query: bool) -> int:
+    """
+    Use longer generation budgets to reduce clipped responses.
+    Memory-heavy turns get a larger budget than generic chat.
+    """
+    base = max(320, int(config.MAX_NEW_TOKENS))
+    return max(base, 420) if memory_query else base
 
 
 def is_memory_query_legacy(lower: str) -> bool:
@@ -593,9 +612,10 @@ def generate_response(user_input: str) -> dict:
         logger.info(f"Memory prompt tail: ...{prompt_tail}")
 
     # Generate
+    max_new_tokens = _max_new_tokens_for_turn(memory_query=memory_query)
     outputs = state.generation_pipeline(
         prompt,
-        max_new_tokens=config.MAX_NEW_TOKENS,
+        max_new_tokens=max_new_tokens,
         do_sample=True,
         repetition_penalty=REPETITION_PENALTY,
         no_repeat_ngram_size=NO_REPEAT_NGRAM_SIZE,
@@ -783,7 +803,7 @@ async def generate_response_stream(user_input: str):
 
     generation_kwargs = {
         "input_ids": input_ids.to(state.model.device),
-        "max_new_tokens": config.MAX_NEW_TOKENS,
+        "max_new_tokens": _max_new_tokens_for_turn(memory_query=memory_query),
         "do_sample": True,
         "top_p": config.TOP_P,
         "temperature": config.TEMPERATURE,
