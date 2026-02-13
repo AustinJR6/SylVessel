@@ -96,6 +96,10 @@ class SylanaState:
 
 state = SylanaState()
 
+# Generation anti-repetition defaults.
+REPETITION_PENALTY = 1.15
+NO_REPEAT_NGRAM_SIZE = 4
+
 
 # ============================================================================
 # MODEL LOADING
@@ -162,7 +166,9 @@ def load_models():
         tokenizer=state.tokenizer,
         do_sample=True,
         top_p=config.TOP_P,
-        temperature=config.TEMPERATURE
+        temperature=config.TEMPERATURE,
+        repetition_penalty=REPETITION_PENALTY,
+        no_repeat_ngram_size=NO_REPEAT_NGRAM_SIZE
     )
 
     logger.info("LLM loaded successfully")
@@ -249,14 +255,6 @@ STRUCTURED_MEMORY_REPORT_PATTERNS = [
     "top three strongest emotional memories",
     "top 3 strongest emotional memories",
     "strongest emotional memories",
-    "top three memories",
-    "top 3 memories",
-    "top memories",
-    "best memories",
-    "favorite memories",
-    "favourite memories",
-    "top three memories of",
-    "top 3 memories of",
     "include timestamps",
     "source references",
 ]
@@ -277,12 +275,16 @@ def is_memory_query(user_input: str) -> bool:
 def wants_structured_memory_report(user_input: str) -> bool:
     """Detect requests that require strict memory-grounded reporting."""
     lower = user_input.lower()
-    if any(pattern in lower for pattern in STRUCTURED_MEMORY_REPORT_PATTERNS):
+    if any(pattern in lower for pattern in [
+        "top three strongest emotional memories",
+        "top 3 strongest emotional memories",
+        "strongest emotional memories",
+    ]):
         return True
-    # Generic top-memory asks should always be hard-grounded.
-    if ("top" in lower or "best" in lower or "favorite" in lower or "favourite" in lower) and (
-        "memory" in lower or "memories" in lower
-    ):
+    # Require explicit citation-style asks for structured output.
+    has_memory_ref = ("memory" in lower or "memories" in lower)
+    asks_for_citations = ("timestamp" in lower or "timestamps" in lower or "source reference" in lower or "source references" in lower)
+    if has_memory_ref and asks_for_citations:
         return True
     return False
 
@@ -433,6 +435,7 @@ def generate_response(user_input: str) -> dict:
         is_memory_query=memory_query,
         has_memories=has_memories
     )
+    prompt += "\nRespond naturally and warmly. Do not repeat your previous sentence structures."
 
     # For memory queries, seed the response with real memory content
     response_seed = ""
@@ -459,6 +462,8 @@ def generate_response(user_input: str) -> dict:
         prompt,
         max_new_tokens=config.MAX_NEW_TOKENS,
         do_sample=True,
+        repetition_penalty=REPETITION_PENALTY,
+        no_repeat_ngram_size=NO_REPEAT_NGRAM_SIZE,
         pad_token_id=state.tokenizer.eos_token_id
     )
 
@@ -590,6 +595,7 @@ async def generate_response_stream(user_input: str):
         is_memory_query=memory_query,
         has_memories=has_memories
     )
+    prompt += "\nRespond naturally and warmly. Do not repeat your previous sentence structures."
 
     # For memory queries, seed the response with real memory content
     response_seed = ""
@@ -635,6 +641,8 @@ async def generate_response_stream(user_input: str):
         "do_sample": True,
         "top_p": config.TOP_P,
         "temperature": config.TEMPERATURE,
+        "repetition_penalty": REPETITION_PENALTY,
+        "no_repeat_ngram_size": NO_REPEAT_NGRAM_SIZE,
         "pad_token_id": state.tokenizer.eos_token_id,
         "streamer": streamer
     }
