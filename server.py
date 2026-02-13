@@ -16,6 +16,7 @@ import json
 import time
 import logging
 import asyncio
+import re
 from collections import Counter
 from pathlib import Path
 from datetime import datetime
@@ -324,6 +325,9 @@ def infer_retrieval_plan(user_input: str) -> Dict[str, Any]:
     ) or wants_exhaustive_memory_recall(user_input)
     wants_ranked = any(s in lower for s in ["top", "strongest", "best", "favorite", "favourite"])
     wants_emotional = "emotional" in lower
+    phrase_match = re.search(r"[\"'“”](.+?)[\"'“”]", user_input)
+    phrase_literal = phrase_match.group(1).strip() if phrase_match else ""
+    meaning_query = ("what does" in lower and "mean to you" in lower) or ("what does" in lower and "mean" in lower)
 
     k = 5
     if wants_exhaustive:
@@ -334,6 +338,8 @@ def infer_retrieval_plan(user_input: str) -> Dict[str, Any]:
         k = max(k, 5)
 
     retrieval_mode = "emotional_topk" if (wants_ranked and wants_emotional) else "semantic"
+    if meaning_query and phrase_literal:
+        k = max(k, 8)
     min_similarity = 0.22 if wants_exhaustive else 0.25
 
     return {
@@ -346,10 +352,12 @@ def infer_retrieval_plan(user_input: str) -> Dict[str, Any]:
         "deep": True,
         "imported_only": True if is_memory_query else False,
         "include_core": True,
+        "include_core_truths": True if is_memory_query or meaning_query else False,
         "include_sacred": True if is_memory_query else any(
             kw in lower for kw in ["identity", "soul", "dream", "reflection", "symbol", "family", "elias", "gus", "levi"]
         ),
         "sacred_limit": 5 if is_memory_query else 3,
+        "phrase_literal": phrase_literal,
         "min_similarity": min_similarity,
     }
 
@@ -550,6 +558,7 @@ def generate_response(user_input: str) -> dict:
         emotion=emotion_data['category'],
         semantic_memories=relevant_memories.get('conversations', []),
         core_memories=relevant_memories.get('core_memories', []),
+        core_truths=relevant_memories.get('core_truths', []),
         sacred_context=sacred_context,
         recent_history=recent_history,
         emotional_history=state.emotional_history[-5:],
@@ -720,6 +729,7 @@ async def generate_response_stream(user_input: str):
         emotion=emotion_data['category'],
         semantic_memories=relevant_memories.get('conversations', []),
         core_memories=relevant_memories.get('core_memories', []),
+        core_truths=relevant_memories.get('core_truths', []),
         sacred_context=sacred_context,
         recent_history=recent_history,
         emotional_history=state.emotional_history[-5:],

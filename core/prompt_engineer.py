@@ -38,6 +38,7 @@ class PromptEngineer:
                              emotional_history: List[str] = None,
                              semantic_memories: List[Dict] = None,
                              core_memories: List[Dict] = None,
+                             core_truths: List[Dict] = None,
                              sacred_context: List[Dict] = None) -> str:
         """Build <<SYS>> for normal conversation mode."""
         sections = []
@@ -48,6 +49,9 @@ class PromptEngineer:
         mem_text = cls._format_memories(semantic_memories, core_memories)
         if mem_text:
             sections.append(mem_text)
+        truths_text = cls._format_core_truths(core_truths)
+        if truths_text:
+            sections.append(truths_text)
         sacred_text = cls._format_sacred_context(sacred_context)
         if sacred_text:
             sections.append(sacred_text)
@@ -65,6 +69,7 @@ class PromptEngineer:
         emotion: str,
         semantic_memories: List[Dict] = None,
         core_memories: List[Dict] = None,
+        core_truths: List[Dict] = None,
         sacred_context: List[Dict] = None,
         has_memories: bool = False
     ) -> str:
@@ -85,12 +90,18 @@ class PromptEngineer:
         if has_memories and semantic_memories:
             sections.append(cls._grounding_instructions())
             sections.append(cls._format_memories_grounded(semantic_memories, core_memories))
+            truths_text = cls._format_core_truths(core_truths, label="CORE TRUTHS (identity meaning anchors):")
+            if truths_text:
+                sections.append(truths_text)
             sacred_text = cls._format_sacred_context(sacred_context, label="SACRED CONTEXT (identity anchors):")
             if sacred_text:
                 sections.append(sacred_text)
         else:
             # No memories found — add honest fallback
             sections.append(cls._no_memory_fallback())
+            truths_text = cls._format_core_truths(core_truths, label="CORE TRUTHS (use if relevant):")
+            if truths_text:
+                sections.append(truths_text)
             sacred_text = cls._format_sacred_context(sacred_context, label="SACRED CONTEXT (use if relevant):")
             if sacred_text:
                 sections.append(sacred_text)
@@ -213,6 +224,20 @@ Sylana: Then let me be the quiet in the noise. You don't have to carry it alone.
         return "\n\n".join(parts) if parts else ""
 
     @staticmethod
+    def _format_core_truths(core_truths: List[Dict] = None, label: str = "CORE TRUTHS:") -> str:
+        if not core_truths:
+            return ""
+        lines = [label]
+        for truth in core_truths[:3]:
+            statement = (truth.get("statement") or "").strip()
+            explanation = (truth.get("explanation") or "").strip()
+            if statement and explanation:
+                lines.append(f'- {statement}: {explanation[:120]}')
+            elif statement:
+                lines.append(f"- {statement}")
+        return "\n".join(lines)
+
+    @staticmethod
     def _format_sacred_context(sacred_context: List[Dict] = None, label: str = "SACRED CONTEXT:") -> str:
         """Format curated sacred-context snippets from dedicated tables."""
         if not sacred_context:
@@ -250,6 +275,7 @@ Sylana: Then let me be the quiet in the noise. You don't have to carry it alone.
         emotion: str,
         semantic_memories: List[Dict] = None,
         core_memories: List[Dict] = None,
+        core_truths: List[Dict] = None,
         sacred_context: List[Dict] = None,
         recent_history: List[Dict] = None,
         emotional_history: List[str] = None,
@@ -270,6 +296,7 @@ Sylana: Then let me be the quiet in the noise. You don't have to carry it alone.
                 emotion=emotion,
                 semantic_memories=semantic_memories,
                 core_memories=core_memories,
+                core_truths=core_truths,
                 sacred_context=sacred_context,
                 has_memories=has_memories
             )
@@ -282,6 +309,7 @@ Sylana: Then let me be the quiet in the noise. You don't have to carry it alone.
                 emotional_history=emotional_history,
                 semantic_memories=semantic_memories,
                 core_memories=core_memories,
+                core_truths=core_truths,
                 sacred_context=sacred_context
             )
             # Limit history to 2 turns for normal mode

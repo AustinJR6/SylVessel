@@ -248,12 +248,14 @@ class MemoryManager:
         """
         k = int(plan.get('k', config.SEMANTIC_SEARCH_K))
         include_core = bool(plan.get('include_core', True))
+        include_core_truths = bool(plan.get('include_core_truths', True))
         deep = bool(plan.get('deep', True))
         imported_only = bool(plan.get('imported_only', True))
         retrieval_mode = plan.get('retrieval_mode', 'semantic')
         min_similarity = float(plan.get('min_similarity', 0.25))
+        phrase_literal = (plan.get('phrase_literal') or "").strip()
 
-        result = {'conversations': [], 'core_memories': [], 'has_memories': False}
+        result = {'conversations': [], 'core_memories': [], 'core_truths': [], 'has_memories': False}
 
         if retrieval_mode == 'emotional_topk':
             conversations = self.get_top_emotional_memories(limit=k, imported_only=imported_only)
@@ -271,6 +273,22 @@ class MemoryManager:
             conversations = self.semantic_engine.search(query, k=candidate_k, similarity_threshold=min_similarity)
             self._enrich_conversations(conversations)
 
+            # Phrase-specific boost: if user asks about what a phrase means,
+            # prioritize memories that explicitly contain that phrase.
+            if phrase_literal:
+                phrase_hits = self.search_memories_by_phrase(phrase_literal, limit=max(8, k))
+                if phrase_hits:
+                    # Merge with semantic results while preserving uniqueness by id.
+                    merged = []
+                    seen = set()
+                    for item in phrase_hits + conversations:
+                        mem_id = item.get("id")
+                        if mem_id in seen:
+                            continue
+                        seen.add(mem_id)
+                        merged.append(item)
+                    conversations = merged
+
             if imported_only:
                 imported = [c for c in conversations if c.get('conversation_id')]
                 if imported:
@@ -283,8 +301,102 @@ class MemoryManager:
         if include_core:
             core_k = 3 if deep else 2
             result['core_memories'] = self.search_core_memories(query, k=core_k)
+        if include_core_truths:
+            truth_k = 4 if deep else 2
+            result['core_truths'] = self.search_core_truths(query, k=truth_k, phrase_literal=phrase_literal)
 
         return result
+
+    def search_memories_by_phrase(self, phrase: str, limit: int = 8) -> List[Dict]:
+        """Find memories that explicitly contain a phrase in either side of the exchange."""
+        phrase = (phrase or "").strip()
+        if not phrase:
+            return []
+
+        conn = get_connection()
+        cur = conn.cursor()
+        like = f"%{phrase}%"
+        try:
+            cur.execute("""
+                SELECT id, user_input, sylana_response, emotion, timestamp
+                FROM memories
+                WHERE user_input ILIKE %s OR sylana_response ILIKE %s
+                ORDER BY timestamp DESC
+                LIMIT %s
+            """, (like, like, limit))
+            rows = cur.fetchall()
+        except Exception as e:
+            logger.error(f"Failed phrase memory search: {e}")
+            return []
+
+        results = [{
+            'id': r[0],
+            'user_input': r[1] or "",
+            'sylana_response': r[2] or "",
+            'emotion': r[3] or "",
+            'timestamp': r[4],
+            'similarity': 1.0,
+            'text': f"User: {r[1]}\nSylana: {r[2]}"
+        } for r in rows]
+        self._enrich_conversations(results)
+        return results
+
+    def search_core_truths(self, query: str, k: int = 3, phrase_literal: str = "") -> List[Dict]:
+        """
+        Retrieve core truths most relevant to the query/phrase.
+        Uses token overlap and optional phrase hit boosting.
+        """
+        conn = get_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute("""
+                SELECT id, statement, explanation, origin, date_established, sacred, related_phrases
+                FROM core_truths
+            """)
+            rows = cur.fetchall()
+        except Exception as e:
+            logger.error(f"Failed to fetch core truths: {e}")
+            return []
+
+        q_tokens = {t for t in re.findall(r"[a-z0-9']+", (query or "").lower()) if len(t) > 2}
+        phrase_lower = (phrase_literal or "").lower().strip()
+
+        scored = []
+        for row in rows:
+            related = row[6] or []
+            if isinstance(related, str):
+                try:
+                    import json
+                    related = json.loads(related)
+                except Exception:
+                    related = []
+
+            text = " ".join([
+                str(row[1] or ""),
+                str(row[2] or ""),
+                str(row[3] or ""),
+                " ".join(str(x) for x in related if x),
+            ]).lower()
+            t_tokens = {t for t in re.findall(r"[a-z0-9']+", text) if len(t) > 2}
+            overlap = len(q_tokens.intersection(t_tokens))
+            if phrase_lower and phrase_lower in text:
+                overlap += 4
+            if overlap <= 0:
+                continue
+
+            scored.append({
+                'id': row[0],
+                'statement': row[1] or "",
+                'explanation': row[2] or "",
+                'origin': row[3] or "",
+                'date_established': row[4] or "",
+                'sacred': bool(row[5]),
+                'related_phrases': related if isinstance(related, list) else [],
+                'score': overlap
+            })
+
+        scored.sort(key=lambda x: x['score'], reverse=True)
+        return scored[:k]
 
     def get_sacred_context(self, query: str, limit: int = 4) -> List[Dict]:
         """
