@@ -245,6 +245,14 @@ MEMORY_QUERY_PATTERNS = [
     "what moment", "which memory", "what memory",
 ]
 
+STRUCTURED_MEMORY_REPORT_PATTERNS = [
+    "top three strongest emotional memories",
+    "top 3 strongest emotional memories",
+    "strongest emotional memories",
+    "include timestamps",
+    "source references",
+]
+
 
 def is_memory_query(user_input: str) -> bool:
     """
@@ -256,6 +264,35 @@ def is_memory_query(user_input: str) -> bool:
         if pattern in lower:
             return True
     return False
+
+
+def wants_structured_memory_report(user_input: str) -> bool:
+    """Detect requests that require strict memory-grounded reporting."""
+    lower = user_input.lower()
+    if any(pattern in lower for pattern in STRUCTURED_MEMORY_REPORT_PATTERNS):
+        return "memory" in lower or "memories" in lower
+    return False
+
+
+def build_structured_memory_report(memories: List[Dict]) -> str:
+    """Build a deterministic memory report directly from database rows."""
+    if not memories:
+        return (
+            "I couldn't find strong imported memories with source references yet. "
+            "Please import/sync memory data first, then ask again."
+        )
+
+    lines = ["Top 3 strongest emotional memories with Elias (from memory database):"]
+    for idx, m in enumerate(memories, start=1):
+        source = m.get("conversation_title") or m.get("conversation_id") or f"memory_id:{m.get('id')}"
+        timestamp = m.get("timestamp_iso") or str(m.get("timestamp") or "")
+        user_excerpt = (m.get("user_input") or "").strip().replace("\n", " ")[:180]
+        sylana_excerpt = (m.get("sylana_response") or "").strip().replace("\n", " ")[:180]
+        lines.append(
+            f"{idx}. [{timestamp}] emotion={m.get('emotion')} intensity={m.get('intensity')} weight={m.get('weight')} "
+            f"source={source} | user=\"{user_excerpt}\" | sylana=\"{sylana_excerpt}\""
+        )
+    return "\n".join(lines)
 
 
 def build_memory_response_seed(memories: List[Dict]) -> str:
@@ -323,7 +360,32 @@ def generate_response(user_input: str) -> dict:
     state.emotional_history.append(emotion_data['emotion'])
 
     # Check if this is a memory-related query
-    memory_query = is_memory_query(user_input)
+    structured_report_query = wants_structured_memory_report(user_input)
+    memory_query = is_memory_query(user_input) or structured_report_query
+
+    # Hard-grounded path for structured memory reporting.
+    if structured_report_query:
+        top_memories = state.memory_manager.get_top_emotional_memories(limit=3, imported_only=True)
+        response = build_structured_memory_report(top_memories)
+
+        voice_score = None
+        if state.voice_validator:
+            score, _, _ = state.voice_validator.validate(response)
+            voice_score = round(score, 2)
+
+        conv_id = state.memory_manager.store_conversation(
+            user_input=user_input,
+            sylana_response=response,
+            emotion=emotion_data['category']
+        )
+
+        return {
+            'response': response,
+            'emotion': emotion_data,
+            'voice_score': voice_score,
+            'conversation_id': conv_id,
+            'turn': state.turn_count
+        }
 
     if memory_query:
         # Memory-grounded mode: deep recall with richer context
@@ -440,7 +502,8 @@ async def generate_response_stream(user_input: str):
     state.emotional_history.append(emotion_data['emotion'])
 
     # Check if this is a memory-related query
-    memory_query = is_memory_query(user_input)
+    structured_report_query = wants_structured_memory_report(user_input)
+    memory_query = is_memory_query(user_input) or structured_report_query
 
     # Yield emotion data first
     yield json.dumps({
@@ -448,6 +511,38 @@ async def generate_response_stream(user_input: str):
         'data': emotion_data,
         'memory_query': memory_query
     })
+
+    # Hard-grounded path for structured memory reporting.
+    if structured_report_query:
+        top_memories = state.memory_manager.get_top_emotional_memories(limit=3, imported_only=True)
+        response = build_structured_memory_report(top_memories)
+
+        voice_score = None
+        if state.voice_validator and response:
+            score, _, _ = state.voice_validator.validate(response)
+            voice_score = round(score, 2)
+
+        yield json.dumps({
+            'type': 'token',
+            'data': response
+        })
+
+        conv_id = state.memory_manager.store_conversation(
+            user_input=user_input,
+            sylana_response=response,
+            emotion=emotion_data['category']
+        )
+
+        yield json.dumps({
+            'type': 'done',
+            'data': {
+                'voice_score': voice_score,
+                'conversation_id': conv_id,
+                'turn': state.turn_count,
+                'full_response': response
+            }
+        })
+        return
 
     if memory_query:
         # Memory-grounded mode: deep recall with richer context

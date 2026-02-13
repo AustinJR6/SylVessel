@@ -285,6 +285,58 @@ class MemoryManager:
             'emotion': r[3], 'timestamp': r[4]
         } for r in rows]
 
+    def get_top_emotional_memories(self, limit: int = 3, imported_only: bool = True) -> List[Dict]:
+        """
+        Return strongest emotional memories ranked by intensity/weight.
+        When imported_only=True, only rows with conversation_id are considered.
+        """
+        conn = get_connection()
+        cur = conn.cursor()
+
+        where_clause = "WHERE intensity IS NOT NULL"
+        if imported_only:
+            where_clause += " AND conversation_id IS NOT NULL AND conversation_id <> ''"
+
+        try:
+            cur.execute(f"""
+                SELECT id, user_input, sylana_response, emotion, intensity, weight,
+                       timestamp, conversation_id, conversation_title
+                FROM memories
+                {where_clause}
+                ORDER BY intensity DESC NULLS LAST,
+                         weight DESC NULLS LAST,
+                         timestamp DESC
+                LIMIT %s
+            """, (limit,))
+            rows = cur.fetchall()
+        except Exception as e:
+            logger.error(f"Failed to get top emotional memories: {e}")
+            return []
+
+        results = []
+        for r in rows:
+            ts = r[6]
+            try:
+                ts_float = float(ts) if ts is not None else None
+                timestamp_iso = datetime.fromtimestamp(ts_float).isoformat() if ts_float else ""
+            except (ValueError, TypeError, OSError):
+                timestamp_iso = ""
+
+            results.append({
+                'id': r[0],
+                'user_input': r[1] or "",
+                'sylana_response': r[2] or "",
+                'emotion': r[3] or "",
+                'intensity': r[4] if r[4] is not None else 0,
+                'weight': r[5] if r[5] is not None else 0,
+                'timestamp': ts,
+                'timestamp_iso': timestamp_iso,
+                'conversation_id': r[7] or "",
+                'conversation_title': r[8] or "",
+            })
+
+        return results
+
     def get_conversation_history(self, limit: int = None) -> List[Dict]:
         """Get recent conversation history (oldest first)."""
         if limit is None:
