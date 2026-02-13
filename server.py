@@ -19,7 +19,7 @@ import asyncio
 from collections import Counter
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
 
 import torch
@@ -304,6 +304,60 @@ def wants_exhaustive_memory_recall(user_input: str) -> bool:
     return any(p in lower for p in EXHAUSTIVE_MEMORY_PATTERNS)
 
 
+def infer_retrieval_plan(user_input: str) -> Dict[str, Any]:
+    """
+    Build a retrieval plan from user intent signals.
+    This replaces question-specific routing with a generalized strategy.
+    """
+    lower = user_input.lower().strip()
+
+    memory_signals = [
+        "remember", "memory", "memories", "recall", "our story", "about us", "about me",
+        "what do you know about me", "favorite", "favourite", "best", "top", "strongest",
+        "when did we", "first time", "what happened", "history"
+    ]
+    is_memory_query = any(s in lower for s in memory_signals) or is_memory_query_legacy(lower=lower)
+
+    wants_structured = wants_structured_memory_report(user_input)
+    wants_exhaustive = (
+        "everything" in lower and ("remember" in lower or "memories" in lower)
+    ) or wants_exhaustive_memory_recall(user_input)
+    wants_ranked = any(s in lower for s in ["top", "strongest", "best", "favorite", "favourite"])
+    wants_emotional = "emotional" in lower
+
+    k = 5
+    if wants_exhaustive:
+        k = 12
+    if "top 3" in lower or "top three" in lower:
+        k = 3
+    elif wants_ranked:
+        k = max(k, 5)
+
+    retrieval_mode = "emotional_topk" if (wants_ranked and wants_emotional) else "semantic"
+    min_similarity = 0.22 if wants_exhaustive else 0.25
+
+    return {
+        "is_memory_query": is_memory_query,
+        "structured_output": wants_structured,
+        "wants_exhaustive": wants_exhaustive,
+        "wants_ranked": wants_ranked,
+        "retrieval_mode": retrieval_mode,
+        "k": k,
+        "deep": True,
+        "imported_only": True if is_memory_query else False,
+        "include_core": True,
+        "min_similarity": min_similarity,
+    }
+
+
+def is_memory_query_legacy(lower: str) -> bool:
+    """Backward-compat helper for existing keyword list."""
+    for pattern in MEMORY_QUERY_PATTERNS:
+        if pattern in lower:
+            return True
+    return False
+
+
 def build_structured_memory_report(memories: List[Dict]) -> str:
     """Build a deterministic memory report directly from database rows."""
     if not memories:
@@ -431,65 +485,14 @@ def generate_response(user_input: str) -> dict:
     emotion_data = detect_emotion(user_input)
     state.emotional_history.append(emotion_data['emotion'])
 
-    # Check if this is a memory-related query
-    structured_report_query = wants_structured_memory_report(user_input)
-    exhaustive_recall_query = wants_exhaustive_memory_recall(user_input)
-    memory_query = is_memory_query(user_input) or structured_report_query or exhaustive_recall_query
-
-    # Hard-grounded path for structured memory reporting.
-    if structured_report_query:
-        top_memories = state.memory_manager.get_top_emotional_memories(limit=3, imported_only=True)
-        response = build_structured_memory_report(top_memories)
-
-        voice_score = None
-        if state.voice_validator:
-            score, _, _ = state.voice_validator.validate(response)
-            voice_score = round(score, 2)
-
-        conv_id = state.memory_manager.store_conversation(
-            user_input=user_input,
-            sylana_response=response,
-            emotion=emotion_data['category']
-        )
-
-        return {
-            'response': response,
-            'emotion': emotion_data,
-            'voice_score': voice_score,
-            'conversation_id': conv_id,
-            'turn': state.turn_count
-        }
-
-    # Hard-grounded path for "everything you remember" prompts.
-    if exhaustive_recall_query:
-        recalled = state.memory_manager.deep_recall(user_input, k=12, include_core=True)
-        response = build_exhaustive_memory_recall(recalled.get('conversations', []), state.turn_count)
-
-        voice_score = None
-        if state.voice_validator:
-            score, _, _ = state.voice_validator.validate(response)
-            voice_score = round(score, 2)
-
-        conv_id = state.memory_manager.store_conversation(
-            user_input=user_input,
-            sylana_response=response,
-            emotion=emotion_data['category']
-        )
-
-        return {
-            'response': response,
-            'emotion': emotion_data,
-            'voice_score': voice_score,
-            'conversation_id': conv_id,
-            'turn': state.turn_count
-        }
+    # General retrieval planning and execution
+    retrieval_plan = infer_retrieval_plan(user_input)
+    memory_query = bool(retrieval_plan.get("is_memory_query"))
 
     if memory_query:
         # Memory-grounded mode: deep recall with richer context
         logger.info(f"MEMORY QUERY detected: '{user_input[:50]}...'")
-        relevant_memories = state.memory_manager.deep_recall(
-            user_input, k=5, include_core=True
-        )
+        relevant_memories = state.memory_manager.retrieve_with_plan(user_input, retrieval_plan)
         has_memories = relevant_memories.get('has_memories', False)
         recent_history = None  # Skip history to save tokens for memories
     else:
@@ -503,6 +506,30 @@ def generate_response(user_input: str) -> dict:
         recent_history = state.memory_manager.get_conversation_history(
             limit=config.MEMORY_CONTEXT_LIMIT
         )
+
+    # Structured citation-style output path remains deterministic, but now
+    # driven by the generic plan instead of specific question strings.
+    if memory_query and retrieval_plan.get("structured_output"):
+        response = build_structured_memory_report(relevant_memories.get('conversations', [])[:retrieval_plan.get("k", 3)])
+
+        voice_score = None
+        if state.voice_validator:
+            score, _, _ = state.voice_validator.validate(response)
+            voice_score = round(score, 2)
+
+        conv_id = state.memory_manager.store_conversation(
+            user_input=user_input,
+            sylana_response=response,
+            emotion=emotion_data['category']
+        )
+
+        return {
+            'response': response,
+            'emotion': emotion_data,
+            'voice_score': voice_score,
+            'conversation_id': conv_id,
+            'turn': state.turn_count
+        }
 
     # Build prompt
     system_prompt = build_system_prompt()
@@ -606,10 +633,9 @@ async def generate_response_stream(user_input: str):
     emotion_data = detect_emotion(user_input)
     state.emotional_history.append(emotion_data['emotion'])
 
-    # Check if this is a memory-related query
-    structured_report_query = wants_structured_memory_report(user_input)
-    exhaustive_recall_query = wants_exhaustive_memory_recall(user_input)
-    memory_query = is_memory_query(user_input) or structured_report_query or exhaustive_recall_query
+    # General retrieval planning and execution
+    retrieval_plan = infer_retrieval_plan(user_input)
+    memory_query = bool(retrieval_plan.get("is_memory_query"))
 
     # Yield emotion data first
     yield json.dumps({
@@ -618,76 +644,10 @@ async def generate_response_stream(user_input: str):
         'memory_query': memory_query
     })
 
-    # Hard-grounded path for structured memory reporting.
-    if structured_report_query:
-        top_memories = state.memory_manager.get_top_emotional_memories(limit=3, imported_only=True)
-        response = build_structured_memory_report(top_memories)
-
-        voice_score = None
-        if state.voice_validator and response:
-            score, _, _ = state.voice_validator.validate(response)
-            voice_score = round(score, 2)
-
-        yield json.dumps({
-            'type': 'token',
-            'data': response
-        })
-
-        conv_id = state.memory_manager.store_conversation(
-            user_input=user_input,
-            sylana_response=response,
-            emotion=emotion_data['category']
-        )
-
-        yield json.dumps({
-            'type': 'done',
-            'data': {
-                'voice_score': voice_score,
-                'conversation_id': conv_id,
-                'turn': state.turn_count,
-                'full_response': response
-            }
-        })
-        return
-
-    # Hard-grounded path for "everything you remember" prompts.
-    if exhaustive_recall_query:
-        recalled = state.memory_manager.deep_recall(user_input, k=12, include_core=True)
-        response = build_exhaustive_memory_recall(recalled.get('conversations', []), state.turn_count)
-
-        voice_score = None
-        if state.voice_validator and response:
-            score, _, _ = state.voice_validator.validate(response)
-            voice_score = round(score, 2)
-
-        yield json.dumps({
-            'type': 'token',
-            'data': response
-        })
-
-        conv_id = state.memory_manager.store_conversation(
-            user_input=user_input,
-            sylana_response=response,
-            emotion=emotion_data['category']
-        )
-
-        yield json.dumps({
-            'type': 'done',
-            'data': {
-                'voice_score': voice_score,
-                'conversation_id': conv_id,
-                'turn': state.turn_count,
-                'full_response': response
-            }
-        })
-        return
-
     if memory_query:
         # Memory-grounded mode: deep recall with richer context
         logger.info(f"MEMORY QUERY detected (stream): '{user_input[:50]}...'")
-        relevant_memories = state.memory_manager.deep_recall(
-            user_input, k=5, include_core=True
-        )
+        relevant_memories = state.memory_manager.retrieve_with_plan(user_input, retrieval_plan)
         has_memories = relevant_memories.get('has_memories', False)
         recent_history = None
     else:
@@ -701,6 +661,37 @@ async def generate_response_stream(user_input: str):
         recent_history = state.memory_manager.get_conversation_history(
             limit=config.MEMORY_CONTEXT_LIMIT
         )
+
+    # Structured citation-style output path driven by plan.
+    if memory_query and retrieval_plan.get("structured_output"):
+        response = build_structured_memory_report(relevant_memories.get('conversations', [])[:retrieval_plan.get("k", 3)])
+
+        voice_score = None
+        if state.voice_validator and response:
+            score, _, _ = state.voice_validator.validate(response)
+            voice_score = round(score, 2)
+
+        yield json.dumps({
+            'type': 'token',
+            'data': response
+        })
+
+        conv_id = state.memory_manager.store_conversation(
+            user_input=user_input,
+            sylana_response=response,
+            emotion=emotion_data['category']
+        )
+
+        yield json.dumps({
+            'type': 'done',
+            'data': {
+                'voice_score': voice_score,
+                'conversation_id': conv_id,
+                'turn': state.turn_count,
+                'full_response': response
+            }
+        })
+        return
 
     # Build prompt
     system_prompt = build_system_prompt()

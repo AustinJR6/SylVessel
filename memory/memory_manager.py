@@ -176,34 +176,7 @@ class MemoryManager:
             query, k=candidate_k, similarity_threshold=0.25
         )
 
-        # Enrich with conversation titles and formatted timestamps
-        if conversations:
-            conn = get_connection()
-            cur = conn.cursor()
-            for conv in conversations:
-                mem_id = conv.get('id')
-                if mem_id:
-                    try:
-                        cur.execute("""
-                            SELECT conversation_title, weight, timestamp, conversation_id
-                            FROM memories WHERE id = %s
-                        """, (mem_id,))
-                        row = cur.fetchone()
-                        if row:
-                            conv['conversation_title'] = row[0] or ''
-                            conv['weight'] = row[1] or 50
-                            conv['conversation_id'] = row[3] or ''
-                            try:
-                                ts = float(row[2]) if row[2] else None
-                                if ts:
-                                    dt = datetime.fromtimestamp(ts)
-                                    conv['date_str'] = dt.strftime('%B %Y')
-                                else:
-                                    conv['date_str'] = ''
-                            except (ValueError, TypeError, OSError):
-                                conv['date_str'] = ''
-                    except Exception as e:
-                        logger.warning(f"Failed to enrich memory {mem_id}: {e}")
+        self._enrich_conversations(conversations)
 
         # Prefer imported/exported memories over recent live test chat rows.
         imported = [c for c in conversations if c.get('conversation_id')]
@@ -221,6 +194,95 @@ class MemoryManager:
             result['core_memories'] = core_memories
 
         logger.info(f"Deep recall: {len(conversations)} conversations, {len(result['core_memories'])} core memories")
+        return result
+
+    def _enrich_conversations(self, conversations: List[Dict]):
+        """Add metadata fields needed for downstream formatting/ranking."""
+        if not conversations:
+            return
+
+        conn = get_connection()
+        cur = conn.cursor()
+        for conv in conversations:
+            mem_id = conv.get('id')
+            if not mem_id:
+                continue
+            try:
+                cur.execute("""
+                    SELECT conversation_title, weight, timestamp, conversation_id, intensity, topic
+                    FROM memories WHERE id = %s
+                """, (mem_id,))
+                row = cur.fetchone()
+                if row:
+                    conv['conversation_title'] = row[0] or ''
+                    conv['weight'] = row[1] or 50
+                    conv['conversation_id'] = row[3] or ''
+                    conv['intensity'] = row[4] if row[4] is not None else 0
+                    conv['topic'] = row[5] or ''
+                    try:
+                        ts = float(row[2]) if row[2] else None
+                        if ts:
+                            dt = datetime.fromtimestamp(ts)
+                            conv['date_str'] = dt.strftime('%B %Y')
+                            conv['timestamp_iso'] = dt.isoformat()
+                        else:
+                            conv['date_str'] = ''
+                            conv['timestamp_iso'] = ''
+                    except (ValueError, TypeError, OSError):
+                        conv['date_str'] = ''
+                        conv['timestamp_iso'] = ''
+            except Exception as e:
+                logger.warning(f"Failed to enrich memory {mem_id}: {e}")
+
+    def retrieve_with_plan(self, query: str, plan: Dict) -> Dict:
+        """
+        Execute retrieval based on a planner-produced strategy.
+        Plan keys:
+          - k
+          - include_core
+          - deep
+          - imported_only
+          - retrieval_mode: 'semantic' | 'emotional_topk'
+          - min_similarity
+        """
+        k = int(plan.get('k', config.SEMANTIC_SEARCH_K))
+        include_core = bool(plan.get('include_core', True))
+        deep = bool(plan.get('deep', True))
+        imported_only = bool(plan.get('imported_only', True))
+        retrieval_mode = plan.get('retrieval_mode', 'semantic')
+        min_similarity = float(plan.get('min_similarity', 0.25))
+
+        result = {'conversations': [], 'core_memories': [], 'has_memories': False}
+
+        if retrieval_mode == 'emotional_topk':
+            conversations = self.get_top_emotional_memories(limit=k, imported_only=imported_only)
+            for conv in conversations:
+                if not conv.get('date_str'):
+                    ts = conv.get('timestamp')
+                    try:
+                        ts_float = float(ts) if ts is not None else None
+                        if ts_float:
+                            conv['date_str'] = datetime.fromtimestamp(ts_float).strftime('%B %Y')
+                    except (ValueError, TypeError, OSError):
+                        conv['date_str'] = ''
+        else:
+            candidate_k = max(30, k * 6) if deep else k
+            conversations = self.semantic_engine.search(query, k=candidate_k, similarity_threshold=min_similarity)
+            self._enrich_conversations(conversations)
+
+            if imported_only:
+                imported = [c for c in conversations if c.get('conversation_id')]
+                if imported:
+                    conversations = imported
+            conversations = conversations[:k]
+
+        result['conversations'] = conversations
+        result['has_memories'] = len(conversations) > 0
+
+        if include_core:
+            core_k = 3 if deep else 2
+            result['core_memories'] = self.search_core_memories(query, k=core_k)
+
         return result
 
     def search_core_memories(self, query: str, k: int = 2) -> List[Dict]:
