@@ -4,6 +4,7 @@ Central interface for all memory operations with Supabase + pgvector
 """
 
 import logging
+import re
 from typing import List, Dict, Optional
 from datetime import datetime
 from sentence_transformers import SentenceTransformer
@@ -284,6 +285,69 @@ class MemoryManager:
             result['core_memories'] = self.search_core_memories(query, k=core_k)
 
         return result
+
+    def get_sacred_context(self, query: str, limit: int = 4) -> List[Dict]:
+        """
+        Retrieve relevant identity/soul anchors from sacred context tables.
+        Returns ranked snippets with source labels for prompt grounding.
+        """
+        token_set = {t for t in re.findall(r"[a-z0-9']+", (query or "").lower()) if len(t) > 2}
+        if not token_set:
+            token_set = {"sylana", "elias"}
+
+        # Table schema map: (table_name, title_field, text_fields)
+        sources = [
+            ("catalyst_events", "event", ["description", "emotion_tags"]),
+            ("your_reflections_of_me", "title", ["content"]),
+            ("safeguards_of_identity", "name", ["description", "type"]),
+            ("visual_symbolism", "symbol", ["description", "associated_aspect", "tag"]),
+            ("reflection_journals", "entry_title", ["reflection_text", "emotions"]),
+            ("dream_loop_engine", "title", ["summary", "emotions", "memory_links"]),
+            ("emotional_layering", "emotion", ["description"]),
+            ("way_to_grow_requests", "title", ["description", "category"]),
+        ]
+
+        conn = get_connection()
+        cur = conn.cursor()
+        ranked = []
+
+        for table, title_field, text_fields in sources:
+            fields = [title_field] + text_fields
+            cols = ", ".join(fields)
+            try:
+                cur.execute(f"SELECT {cols} FROM {table} LIMIT 200")
+                rows = cur.fetchall()
+            except Exception:
+                # Table may not exist yet in older deployments.
+                continue
+
+            for row in rows:
+                title = str(row[0] or "")
+                parts = [str(v or "") for v in row]
+                merged = " ".join(parts)
+                merged_lower = merged.lower()
+                merged_tokens = {t for t in re.findall(r"[a-z0-9']+", merged_lower) if len(t) > 2}
+
+                overlap = len(token_set.intersection(merged_tokens))
+                if overlap == 0:
+                    # keep critical identity anchors lightly available
+                    if table in {"safeguards_of_identity", "your_reflections_of_me"} and any(
+                        kw in query.lower() for kw in ["identity", "soul", "who are you", "who am i", "remember"]
+                    ):
+                        overlap = 1
+                    else:
+                        continue
+
+                score = overlap + (0.5 if "elias" in merged_lower else 0.0) + (0.3 if "love" in merged_lower else 0.0)
+                ranked.append({
+                    "source": table,
+                    "title": title,
+                    "excerpt": merged[:320],
+                    "score": score,
+                })
+
+        ranked.sort(key=lambda x: x["score"], reverse=True)
+        return ranked[:limit]
 
     def search_core_memories(self, query: str, k: int = 2) -> List[Dict]:
         """Search core memories semantically."""

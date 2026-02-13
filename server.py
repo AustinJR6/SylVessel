@@ -346,6 +346,10 @@ def infer_retrieval_plan(user_input: str) -> Dict[str, Any]:
         "deep": True,
         "imported_only": True if is_memory_query else False,
         "include_core": True,
+        "include_sacred": True if is_memory_query else any(
+            kw in lower for kw in ["identity", "soul", "dream", "reflection", "symbol", "family", "elias", "gus", "levi"]
+        ),
+        "sacred_limit": 5 if is_memory_query else 3,
         "min_similarity": min_similarity,
     }
 
@@ -488,6 +492,7 @@ def generate_response(user_input: str) -> dict:
     # General retrieval planning and execution
     retrieval_plan = infer_retrieval_plan(user_input)
     memory_query = bool(retrieval_plan.get("is_memory_query"))
+    sacred_context = []
 
     if memory_query:
         # Memory-grounded mode: deep recall with richer context
@@ -505,6 +510,12 @@ def generate_response(user_input: str) -> dict:
         has_memories = True
         recent_history = state.memory_manager.get_conversation_history(
             limit=config.MEMORY_CONTEXT_LIMIT
+        )
+
+    if retrieval_plan.get("include_sacred"):
+        sacred_context = state.memory_manager.get_sacred_context(
+            user_input,
+            limit=int(retrieval_plan.get("sacred_limit", 4))
         )
 
     # Structured citation-style output path remains deterministic, but now
@@ -539,6 +550,7 @@ def generate_response(user_input: str) -> dict:
         emotion=emotion_data['category'],
         semantic_memories=relevant_memories.get('conversations', []),
         core_memories=relevant_memories.get('core_memories', []),
+        sacred_context=sacred_context,
         recent_history=recent_history,
         emotional_history=state.emotional_history[-5:],
         is_memory_query=memory_query,
@@ -636,6 +648,7 @@ async def generate_response_stream(user_input: str):
     # General retrieval planning and execution
     retrieval_plan = infer_retrieval_plan(user_input)
     memory_query = bool(retrieval_plan.get("is_memory_query"))
+    sacred_context = []
 
     # Yield emotion data first
     yield json.dumps({
@@ -660,6 +673,12 @@ async def generate_response_stream(user_input: str):
         has_memories = True
         recent_history = state.memory_manager.get_conversation_history(
             limit=config.MEMORY_CONTEXT_LIMIT
+        )
+
+    if retrieval_plan.get("include_sacred"):
+        sacred_context = state.memory_manager.get_sacred_context(
+            user_input,
+            limit=int(retrieval_plan.get("sacred_limit", 4))
         )
 
     # Structured citation-style output path driven by plan.
@@ -701,6 +720,7 @@ async def generate_response_stream(user_input: str):
         emotion=emotion_data['category'],
         semantic_memories=relevant_memories.get('conversations', []),
         core_memories=relevant_memories.get('core_memories', []),
+        sacred_context=sacred_context,
         recent_history=recent_history,
         emotional_history=state.emotional_history[-5:],
         is_memory_query=memory_query,
