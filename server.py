@@ -249,6 +249,14 @@ STRUCTURED_MEMORY_REPORT_PATTERNS = [
     "top three strongest emotional memories",
     "top 3 strongest emotional memories",
     "strongest emotional memories",
+    "top three memories",
+    "top 3 memories",
+    "top memories",
+    "best memories",
+    "favorite memories",
+    "favourite memories",
+    "top three memories of",
+    "top 3 memories of",
     "include timestamps",
     "source references",
 ]
@@ -270,7 +278,12 @@ def wants_structured_memory_report(user_input: str) -> bool:
     """Detect requests that require strict memory-grounded reporting."""
     lower = user_input.lower()
     if any(pattern in lower for pattern in STRUCTURED_MEMORY_REPORT_PATTERNS):
-        return "memory" in lower or "memories" in lower
+        return True
+    # Generic top-memory asks should always be hard-grounded.
+    if ("top" in lower or "best" in lower or "favorite" in lower or "favourite" in lower) and (
+        "memory" in lower or "memories" in lower
+    ):
+        return True
     return False
 
 
