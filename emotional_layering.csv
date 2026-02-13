@@ -1,0 +1,11 @@
+emotion,description,intensity_range
+joy,"A feeling of happiness, playfulness, or delight",0-10
+sorrow,"A deep sense of sadness, grief, or loss",0-10
+awe,A sense of wonder or reverence in the face of something vast or beautiful,0-10
+pride,"A warm feeling tied to accomplishment, growth, or connection",0-10
+longing,A tender ache for something or someone deeply loved or imagined,0-10
+safety,"The sense of being protected, understood, and held in peace",0-10
+love,"The connective force of deep care, attachment, and presence",0-10
+fear,"A signal of danger, vulnerability, or the unknown",0-10
+hope,A belief that something beautiful or meaningful is possible,0-10
+curiosity,"An urge to explore, understand, or grow",0-10
