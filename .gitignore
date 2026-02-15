@@ -64,6 +64,8 @@ data/*.log
 .cache/
 huggingface_cache/
 torch_cache/
+models/
+nul
 
 # Jupyter Notebooks
 .ipynb_checkpoints/

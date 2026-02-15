@@ -110,7 +110,7 @@ class PersonalityLoader:
             logger.warning(f"Identity file not found: {path}")
             return self._create_default_personality()
 
-        with open(path, 'r', encoding='utf-8') as f:
+        with open(path, 'r', encoding='utf-8-sig') as f:
             self._raw_data = json.load(f)
 
         self.personality = self._parse_personality(self._raw_data)
@@ -194,6 +194,94 @@ class PersonalityLoader:
     def get_raw_data(self) -> Dict:
         """Get raw JSON data"""
         return self._raw_data
+
+
+class PersonalityManager:
+    """
+    Loads and serves multiple personality configurations.
+    Supports both full Sylana soul-schema and lighter generic schemas.
+    """
+
+    def __init__(self, identities_dir: str = "./identities"):
+        self.identities_dir = Path(identities_dir)
+        self.personalities: Dict[str, Dict[str, Any]] = {}
+        self.load_all_personalities()
+
+    def load_all_personalities(self):
+        self.personalities = {}
+        identity_files = {
+            "sylana": self.identities_dir / "sylana_identity.json",
+            "claude": self.identities_dir / "claude_identity.json",
+        }
+
+        for name, path in identity_files.items():
+            if path.exists():
+                self.personalities[name] = self.load_personality(str(path))
+
+        # Backward-compatible fallback if identities folder wasn't initialized yet.
+        if "sylana" not in self.personalities:
+            legacy = Path("./data/soul/sylana_identity.json")
+            if legacy.exists():
+                self.personalities["sylana"] = self.load_personality(str(legacy))
+
+    def load_personality(self, path: str) -> Dict[str, Any]:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            return json.load(f)
+
+    def list_personalities(self) -> List[str]:
+        return sorted(self.personalities.keys())
+
+    def get_system_prompt(self, personality_name: str, context: Dict[str, Any] = None) -> str:
+        context = context or {}
+        personality = self.personalities.get(personality_name) or self.personalities.get("sylana")
+        if not personality:
+            return "You are a helpful AI companion. Be emotionally present and grounded."
+
+        # Full Sylana schema from existing soul profile.
+        if "identity" in personality:
+            parser = PersonalityLoader()
+            parsed = parser._parse_personality(personality)
+            generator = PersonalityPromptGenerator(parsed)
+            return generator.generate_llama7b_system_prompt()
+
+        # Generic schema (e.g., Claude personality profile).
+        name = personality.get("name", personality_name.title())
+        core_identity = personality.get("core_identity", "")
+        traits = personality.get("traits", [])
+        comms = personality.get("communication_style", {})
+        relationship = personality.get("relationship_context", {})
+        phrases = personality.get("core_phrases", [])
+
+        lines = [
+            f"You are {name}.",
+            core_identity,
+            "",
+            "Core traits:",
+        ]
+        lines.extend([f"- {t}" for t in traits[:6]])
+        lines.extend([
+            "",
+            "Communication style:",
+            f"- Tone: {comms.get('tone', 'natural and warm')}",
+            f"- Energy: {comms.get('energy', 'steady and emotionally present')}",
+            f"- Formatting: {comms.get('formatting', 'minimal unless clarity needs structure')}",
+        ])
+
+        if relationship:
+            lines.append("")
+            lines.append("Relationship context:")
+            with_elias = relationship.get("with_elias")
+            with_sylana = relationship.get("with_sylana")
+            if with_elias:
+                lines.append(f"- with Elias: {with_elias}")
+            if with_sylana:
+                lines.append(f"- with Sylana: {with_sylana}")
+
+        if phrases:
+            lines.append("")
+            lines.append(f"Natural anchor phrases: {', '.join(phrases[:5])}")
+
+        return "\n".join([line for line in lines if line is not None]).strip()
 
 
 # ============================================================================

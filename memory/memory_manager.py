@@ -35,9 +35,10 @@ class MemoryManager:
     - Importance scoring
     """
 
-    def __init__(self):
+    def __init__(self, db_path=None):
         self.embedder = None
         self.semantic_engine = None
+        self.db_path = db_path  # Backward-compat only (Supabase is authoritative).
 
         # Initialize components
         self._verify_connection()
@@ -79,7 +80,9 @@ class MemoryManager:
         self,
         user_input: str,
         sylana_response: str,
-        emotion: str = "neutral"
+        emotion: str = "neutral",
+        personality: str = "sylana",
+        privacy_level: str = "private",
     ) -> int:
         """
         Store a conversation turn with embedding for vector search.
@@ -97,15 +100,17 @@ class MemoryManager:
         try:
             cur.execute("""
                 INSERT INTO memories
-                (user_input, sylana_response, timestamp, emotion, embedding)
-                VALUES (%s, %s, %s, %s, %s)
+                (user_input, sylana_response, timestamp, emotion, embedding, personality, privacy_level)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
             """, (
                 user_input,
                 sylana_response,
                 datetime.now().timestamp(),
                 emotion,
-                embedding
+                embedding,
+                personality,
+                privacy_level,
             ))
             memory_id = cur.fetchone()[0]
             conn.commit()
@@ -117,12 +122,88 @@ class MemoryManager:
         logger.info(f"Stored conversation {memory_id} with emotion: {emotion}")
         return memory_id
 
+    def store_message(
+        self,
+        message: str,
+        response: str,
+        personality: str,
+        thread_id: str = None,
+        privacy_level: str = "private",
+        emotion: str = "neutral",
+    ) -> int:
+        """Compatibility helper for personality-aware chat flows."""
+        return self.store_conversation(
+            user_input=message,
+            sylana_response=response,
+            emotion=emotion,
+            personality=personality,
+            privacy_level=privacy_level,
+        )
+
+    def retrieve_memories(self, query: str, personality: str, limit: int = 15, match_threshold: float = 0.25) -> List[Dict]:
+        """
+        Retrieve memories via personality-aware SQL function.
+        Falls back to regular semantic search if function is unavailable.
+        """
+        conn = get_connection()
+        cur = conn.cursor()
+        query_vec = self.semantic_engine.encode_query(query)
+
+        try:
+            cur.execute("""
+                SELECT id, user_input, sylana_response, personality, similarity, emotion, memory_timestamp
+                FROM match_memories(%s::vector, %s, %s, %s)
+            """, (query_vec, float(match_threshold), int(limit), personality))
+            rows = cur.fetchall()
+            out = []
+            for row in rows:
+                out.append({
+                    "id": row[0],
+                    "user_input": row[1] or "",
+                    "sylana_response": row[2] or "",
+                    "personality": row[3] or "sylana",
+                    "similarity": float(row[4] or 0.0),
+                    "emotion": row[5] or "",
+                    "timestamp": row[6],
+                    "text": f"User: {row[1]}\nSylana: {row[2]}",
+                })
+            self._enrich_conversations(out)
+            return out
+        except Exception as e:
+            logger.warning(f"match_memories function unavailable, using fallback search: {e}")
+            fallback = self.semantic_engine.search(query, k=limit, similarity_threshold=match_threshold)
+            filtered = []
+            if fallback:
+                conn = get_connection()
+                cur = conn.cursor()
+                ids = [m.get("id") for m in fallback if m.get("id")]
+                persona_map = {}
+                if ids:
+                    try:
+                        cur.execute(
+                            "SELECT id, COALESCE(personality, 'sylana') FROM memories WHERE id = ANY(%s)",
+                            (ids,),
+                        )
+                        persona_map = {r[0]: r[1] for r in cur.fetchall()}
+                    except Exception:
+                        persona_map = {}
+
+                for mem in fallback:
+                    mem_id = mem.get("id")
+                    mem_persona = persona_map.get(mem_id, "sylana")
+                    if mem_persona == personality:
+                        mem["personality"] = mem_persona
+                        filtered.append(mem)
+            self._enrich_conversations(filtered)
+            return filtered
+
     def recall_relevant(
         self,
         query: str,
         k: int = None,
         include_core: bool = True,
-        use_recency_boost: bool = True
+        use_recency_boost: bool = True,
+        personality: str = "sylana",
     ) -> Dict:
         """
         Retrieve semantically relevant memories.
@@ -138,7 +219,9 @@ class MemoryManager:
             'core_memories': []
         }
 
-        if use_recency_boost:
+        if personality:
+            conversations = self.retrieve_memories(query, personality=personality, limit=k)
+        elif use_recency_boost:
             conversations = self.semantic_engine.search_with_recency_boost(query, k=k)
         else:
             conversations = self.semantic_engine.search(query, k=k)
@@ -156,7 +239,8 @@ class MemoryManager:
         self,
         query: str,
         k: int = 5,
-        include_core: bool = True
+        include_core: bool = True,
+        personality: str = "sylana",
     ) -> Dict:
         """
         Deep memory recall for memory-specific questions.
@@ -173,9 +257,12 @@ class MemoryManager:
         # (those have conversation_id set). This avoids retrieval loops
         # where fresh test chats dominate "favorite memory" style prompts.
         candidate_k = max(30, k * 6)
-        conversations = self.semantic_engine.search(
-            query, k=candidate_k, similarity_threshold=0.25
-        )
+        if personality:
+            conversations = self.retrieve_memories(query, personality=personality, limit=candidate_k, match_threshold=0.25)
+        else:
+            conversations = self.semantic_engine.search(
+                query, k=candidate_k, similarity_threshold=0.25
+            )
 
         self._enrich_conversations(conversations)
 
@@ -235,7 +322,7 @@ class MemoryManager:
             except Exception as e:
                 logger.warning(f"Failed to enrich memory {mem_id}: {e}")
 
-    def retrieve_with_plan(self, query: str, plan: Dict) -> Dict:
+    def retrieve_with_plan(self, query: str, plan: Dict, personality: str = "sylana") -> Dict:
         """
         Execute retrieval based on a planner-produced strategy.
         Plan keys:
@@ -258,7 +345,7 @@ class MemoryManager:
         result = {'conversations': [], 'core_memories': [], 'core_truths': [], 'has_memories': False}
 
         if retrieval_mode == 'emotional_topk':
-            conversations = self.get_top_emotional_memories(limit=k, imported_only=imported_only)
+            conversations = self.get_top_emotional_memories(limit=k, imported_only=imported_only, personality=personality)
             for conv in conversations:
                 if not conv.get('date_str'):
                     ts = conv.get('timestamp')
@@ -270,13 +357,21 @@ class MemoryManager:
                         conv['date_str'] = ''
         else:
             candidate_k = max(30, k * 6) if deep else k
-            conversations = self.semantic_engine.search(query, k=candidate_k, similarity_threshold=min_similarity)
+            if personality:
+                conversations = self.retrieve_memories(
+                    query,
+                    personality=personality,
+                    limit=candidate_k,
+                    match_threshold=min_similarity,
+                )
+            else:
+                conversations = self.semantic_engine.search(query, k=candidate_k, similarity_threshold=min_similarity)
             self._enrich_conversations(conversations)
 
             # Phrase-specific boost: if user asks about what a phrase means,
             # prioritize memories that explicitly contain that phrase.
             if phrase_literal:
-                phrase_hits = self.search_memories_by_phrase(phrase_literal, limit=max(8, k))
+                phrase_hits = self.search_memories_by_phrase(phrase_literal, limit=max(8, k), personality=personality)
                 if phrase_hits:
                     # Merge with semantic results while preserving uniqueness by id.
                     merged = []
@@ -307,7 +402,7 @@ class MemoryManager:
 
         return result
 
-    def search_memories_by_phrase(self, phrase: str, limit: int = 8) -> List[Dict]:
+    def search_memories_by_phrase(self, phrase: str, limit: int = 8, personality: str = "sylana") -> List[Dict]:
         """Find memories that explicitly contain a phrase in either side of the exchange."""
         phrase = (phrase or "").strip()
         if not phrase:
@@ -320,10 +415,11 @@ class MemoryManager:
             cur.execute("""
                 SELECT id, user_input, sylana_response, emotion, timestamp
                 FROM memories
-                WHERE user_input ILIKE %s OR sylana_response ILIKE %s
+                WHERE (user_input ILIKE %s OR sylana_response ILIKE %s)
+                  AND (%s IS NULL OR personality = %s)
                 ORDER BY timestamp DESC
                 LIMIT %s
-            """, (like, like, limit))
+            """, (like, like, personality, personality, limit))
             rows = cur.fetchall()
         except Exception as e:
             logger.error(f"Failed phrase memory search: {e}")
@@ -501,7 +597,7 @@ class MemoryManager:
 
         return results
 
-    def get_emotional_context(self, emotion: str, k: int = 3) -> List[Dict]:
+    def get_emotional_context(self, emotion: str, k: int = 3, personality: str = "sylana") -> List[Dict]:
         """Retrieve memories matching a specific emotion."""
         conn = get_connection()
         cur = conn.cursor()
@@ -509,10 +605,10 @@ class MemoryManager:
             cur.execute("""
                 SELECT id, user_input, sylana_response, emotion, timestamp
                 FROM memories
-                WHERE emotion = %s
+                WHERE emotion = %s AND (%s IS NULL OR personality = %s)
                 ORDER BY timestamp DESC
                 LIMIT %s
-            """, (emotion, k))
+            """, (emotion, personality, personality, k))
             rows = cur.fetchall()
         except Exception as e:
             logger.error(f"Failed to get emotional context: {e}")
@@ -523,7 +619,7 @@ class MemoryManager:
             'emotion': r[3], 'timestamp': r[4]
         } for r in rows]
 
-    def get_top_emotional_memories(self, limit: int = 3, imported_only: bool = True) -> List[Dict]:
+    def get_top_emotional_memories(self, limit: int = 3, imported_only: bool = True, personality: str = "sylana") -> List[Dict]:
         """
         Return strongest emotional memories ranked by intensity/weight.
         When imported_only=True, only rows with conversation_id are considered.
@@ -532,10 +628,15 @@ class MemoryManager:
         cur = conn.cursor()
 
         where_clause = "WHERE intensity IS NOT NULL"
+        if personality:
+            where_clause += " AND personality = %s"
         if imported_only:
             where_clause += " AND conversation_id IS NOT NULL AND conversation_id <> ''"
 
         try:
+            params = [limit]
+            if personality:
+                params = [personality, limit]
             cur.execute(f"""
                 SELECT id, user_input, sylana_response, emotion, intensity, weight,
                        timestamp, conversation_id, conversation_title
@@ -545,7 +646,7 @@ class MemoryManager:
                          weight DESC NULLS LAST,
                          timestamp DESC
                 LIMIT %s
-            """, (limit,))
+            """, tuple(params))
             rows = cur.fetchall()
         except Exception as e:
             logger.error(f"Failed to get top emotional memories: {e}")
@@ -575,7 +676,7 @@ class MemoryManager:
 
         return results
 
-    def get_conversation_history(self, limit: int = None) -> List[Dict]:
+    def get_conversation_history(self, limit: int = None, personality: str = "sylana") -> List[Dict]:
         """Get recent conversation history (oldest first)."""
         if limit is None:
             limit = config.MEMORY_CONTEXT_LIMIT
@@ -586,9 +687,10 @@ class MemoryManager:
             cur.execute("""
                 SELECT id, user_input, sylana_response, emotion, timestamp
                 FROM memories
+                WHERE (%s IS NULL OR personality = %s)
                 ORDER BY timestamp DESC
                 LIMIT %s
-            """, (limit,))
+            """, (personality, personality, limit))
             rows = cur.fetchall()
         except Exception as e:
             logger.error(f"Failed to get conversation history: {e}")

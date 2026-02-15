@@ -1,4 +1,4 @@
-"""
+﻿"""
 Sylana Vessel - Enhanced Entry Point with Semantic Memory
 Main interface using the new MemoryManager and SylanaAgent with FAISS integration
 """
@@ -196,7 +196,7 @@ if __name__ == "__main__":
 
     # Initialize memory manager (includes FAISS indexing)
     logger.info("Initializing MemoryManager with FAISS semantic search...")
-    memory_manager = MemoryManager(config.DB_PATH)
+    memory_manager = MemoryManager()
 
     # Initialize enhanced agent with semantic memory
     logger.info("Initializing SylanaAgent with semantic memory integration...")

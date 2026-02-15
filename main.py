@@ -1,4 +1,4 @@
-# main.py
+﻿# main.py
 """
 Sylana Vessel - Main Entry Point
 Clean interface to start Sylana with various modes
@@ -28,7 +28,7 @@ try:
     multimodal_available = True
 except ImportError:
     multimodal_available = False
-    print("⚠️  Multimodal features not available (CLIP/Whisper not installed)")
+    print("âš ï¸  Multimodal features not available (CLIP/Whisper not installed)")
 
 def display_startup_summary(memory_manager=None):
     """Display system startup information"""
@@ -81,7 +81,7 @@ def display_startup_summary(memory_manager=None):
 
 def start_conversation(agent):
     """Start text-based conversation with Sylana"""
-    print("\n💬 Starting conversation mode (text-based)")
+    print("\nðŸ’¬ Starting conversation mode (text-based)")
     print("   Type 'exit' to quit\n")
 
     while True:
@@ -102,18 +102,18 @@ def start_conversation(agent):
             print("\n\nSylana: Goodbye! Conversation interrupted.")
             break
         except Exception as e:
-            print(f"⚠️  Error: {e}")
+            print(f"âš ï¸  Error: {e}")
             print("Let's try again...\n")
 
 
 def multimodal_menu(agent):
     """Display multimodal options if available"""
     if not multimodal_available:
-        print("⚠️  Multimodal features not available.")
+        print("âš ï¸  Multimodal features not available.")
         print("   Install dependencies: pip install transformers[torch] pillow")
         return start_conversation(agent)
 
-    print("\n🎨 Choose an option:")
+    print("\nðŸŽ¨ Choose an option:")
     print("   1. Test voice transcription")
     print("   2. Test image processing")
     print("   3. Start text conversation")
@@ -125,18 +125,18 @@ def multimodal_menu(agent):
         audio_file = input("Enter path to audio file: ")
         try:
             transcription = transcribe_audio(audio_file)
-            print(f"\n🎤 Transcribed: {transcription}\n")
+            print(f"\nðŸŽ¤ Transcribed: {transcription}\n")
         except Exception as e:
-            print(f"⚠️  Error: {e}")
+            print(f"âš ï¸  Error: {e}")
 
     elif choice == "2":
         image_path = input("Enter path to image file: ")
         query_text = input("Enter query for image: ")
         try:
             probabilities = process_image(image_path, query_text)
-            print(f"\n🖼️  Analysis: {probabilities}\n")
+            print(f"\nðŸ–¼ï¸  Analysis: {probabilities}\n")
         except Exception as e:
-            print(f"⚠️  Error: {e}")
+            print(f"âš ï¸  Error: {e}")
 
     elif choice == "3":
         start_conversation(agent)
@@ -158,7 +158,7 @@ def main():
     if use_new_memory:
         print("\nInitializing enhanced memory system...")
         try:
-            memory_manager = MemoryManager(config.DB_PATH)
+            memory_manager = MemoryManager()
             display_startup_summary(memory_manager)
             print("Semantic memory enabled!")
             print("For full semantic search features, use: python sylana_enhanced.py\n")

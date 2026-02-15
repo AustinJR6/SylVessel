@@ -1,4 +1,4 @@
-"""
+﻿"""
 Sylana Vessel - Quantized Model Entry Point
 Uses llama.cpp for efficient CPU inference with all features
 
@@ -38,17 +38,17 @@ logger = logging.getLogger(__name__)
 def print_banner():
     """Display startup banner"""
     banner = """
-    ╔═══════════════════════════════════════════════════════════════╗
-    ║                                                               ║
-    ║                    SYLANA VESSEL                              ║
-    ║              Quantized Model Edition                          ║
-    ║                                                               ║
-    ║  Emotionally Intelligent AI Companion                         ║
-    ║  With Full Semantic Memory                                    ║
-    ║                                                               ║
-    ║  [OPTIMIZED] CPU-only, ~6GB model, Ancient laptop friendly    ║
-    ║                                                               ║
-    ╚═══════════════════════════════════════════════════════════════╝
+    â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—
+    â•‘                                                               â•‘
+    â•‘                    SYLANA VESSEL                              â•‘
+    â•‘              Quantized Model Edition                          â•‘
+    â•‘                                                               â•‘
+    â•‘  Emotionally Intelligent AI Companion                         â•‘
+    â•‘  With Full Semantic Memory                                    â•‘
+    â•‘                                                               â•‘
+    â•‘  [OPTIMIZED] CPU-only, ~6GB model, Ancient laptop friendly    â•‘
+    â•‘                                                               â•‘
+    â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     """
     print(banner)
 
@@ -123,8 +123,8 @@ def main():
 
     # Initialize memory systems
     logger.info("Initializing memory system...")
-    memory = MemoryManager(config.DB_PATH)
-    core_memory = CoreMemoryManager(config.DB_PATH)
+    memory = MemoryManager()
+    core_memory = CoreMemoryManager()
     logger.info("Core memory system initialized")
 
     # Initialize emotion detection

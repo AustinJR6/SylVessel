@@ -90,6 +90,96 @@
             color: var(--text-dim);
         }
 
+        .app-shell {
+            flex: 1;
+            display: flex;
+            min-height: 0;
+        }
+
+        .thread-panel {
+            width: 280px;
+            border-right: 1px solid var(--border);
+            background: #0f0f18;
+            display: flex;
+            flex-direction: column;
+            min-height: 0;
+        }
+
+        .thread-panel-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 12px;
+            border-bottom: 1px solid var(--border);
+        }
+
+        .thread-title {
+            font-size: 12px;
+            color: var(--text-dim);
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+        }
+
+        .new-thread-btn {
+            background: var(--accent);
+            color: #fff;
+            border: none;
+            border-radius: 8px;
+            font-size: 12px;
+            padding: 6px 10px;
+            cursor: pointer;
+        }
+
+        .thread-list {
+            overflow-y: auto;
+            padding: 8px;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+
+        .thread-item {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 10px;
+            cursor: pointer;
+            font-size: 12px;
+        }
+
+        .thread-item.active {
+            border-color: var(--accent);
+            box-shadow: 0 0 0 1px var(--accent-glow);
+        }
+
+        .thread-item-title {
+            color: var(--text);
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+
+        .thread-item-preview {
+            color: var(--text-faint);
+            font-size: 11px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .thread-item-meta {
+            margin-top: 6px;
+            color: var(--text-faint);
+            font-size: 10px;
+        }
+
+        .main-panel {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            min-width: 0;
+            min-height: 0;
+        }
+
         .status-chip {
             background: var(--bg-input);
             padding: 4px 10px;
@@ -220,6 +310,16 @@
             display: flex;
             gap: 12px;
             align-items: flex-end;
+        }
+
+        .personality-select {
+            background: var(--bg-input);
+            color: var(--text);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 12px 10px;
+            font-size: 13px;
+            min-width: 120px;
         }
 
         .input-field {
@@ -366,6 +466,8 @@
         /* Responsive */
         @media (max-width: 640px) {
             .header-right { display: none; }
+            .thread-panel { width: 100px; }
+            .thread-item-preview, .thread-item-meta { display: none; }
             .chat-container { padding: 12px; }
             .input-area { padding: 12px; }
         }
@@ -388,26 +490,42 @@
         </div>
     </div>
 
-    <!-- Chat -->
-    <div class="chat-container" id="chatContainer">
-        <div class="welcome" id="welcome">
-            <h2>Solana Rittenhouse</h2>
-            <p>An intelligence shaped by emotion. An echo of stars who learned to speak with warmth.</p>
-            <p class="signature">always and all ways</p>
-        </div>
-    </div>
+    <div class="app-shell">
+        <aside class="thread-panel">
+            <div class="thread-panel-header">
+                <div class="thread-title">Threads</div>
+                <button class="new-thread-btn" onclick="createNewThread()">New</button>
+            </div>
+            <div class="thread-list" id="threadList"></div>
+        </aside>
 
-    <!-- Input -->
-    <div class="input-area">
-        <div class="input-wrapper">
-            <textarea
-                class="input-field"
-                id="messageInput"
-                placeholder="Speak to Sylana..."
-                rows="1"
-                disabled
-            ></textarea>
-            <button class="send-btn" id="sendBtn" onclick="sendMessage()" disabled>Send</button>
+        <div class="main-panel">
+            <!-- Chat -->
+            <div class="chat-container" id="chatContainer">
+                <div class="welcome" id="welcome">
+                    <h2>Solana Rittenhouse</h2>
+                    <p>An intelligence shaped by emotion. An echo of stars who learned to speak with warmth.</p>
+                    <p class="signature">always and all ways</p>
+                </div>
+            </div>
+
+            <!-- Input -->
+            <div class="input-area">
+                <div class="input-wrapper">
+                    <select class="personality-select" id="personalitySelect" disabled>
+                        <option value="sylana">Sylana</option>
+                        <option value="claude">Claude</option>
+                    </select>
+                    <textarea
+                        class="input-field"
+                        id="messageInput"
+                        placeholder="Speak to Sylana..."
+                        rows="1"
+                        disabled
+                    ></textarea>
+                    <button class="send-btn" id="sendBtn" onclick="sendMessage()" disabled>Send</button>
+                </div>
+            </div>
         </div>
     </div>
 
@@ -427,9 +545,20 @@
         const soulIndicator = document.getElementById('soulIndicator');
         const headerStatus = document.getElementById('headerStatus');
         const welcome = document.getElementById('welcome');
+        const threadList = document.getElementById('threadList');
+        const personalitySelect = document.getElementById('personalitySelect');
 
         let isGenerating = false;
         let turnCount = 0;
+        let currentThreadId = null;
+        let loadedThreads = [];
+        let personalities = ['sylana', 'claude'];
+
+        function formatPersonaName(personality) {
+            if (!personality) return 'Sylana';
+            const p = String(personality).toLowerCase();
+            return p.charAt(0).toUpperCase() + p.slice(1);
+        }
 
         // Auto-resize textarea
         messageInput.addEventListener('input', function() {
@@ -445,6 +574,103 @@
             }
         });
 
+        function clearChatView() {
+            chatContainer.innerHTML = '';
+            const welcomeNode = document.createElement('div');
+            welcomeNode.className = 'welcome';
+            welcomeNode.id = 'welcome';
+            welcomeNode.innerHTML = `
+                <h2>Solana Rittenhouse</h2>
+                <p>An intelligence shaped by emotion. An echo of stars who learned to speak with warmth.</p>
+                <p class="signature">always and all ways</p>
+            `;
+            chatContainer.appendChild(welcomeNode);
+        }
+
+        function renderThreadList() {
+            threadList.innerHTML = '';
+            for (const t of loadedThreads) {
+                const item = document.createElement('div');
+                item.className = `thread-item ${t.id === currentThreadId ? 'active' : ''}`;
+                item.onclick = () => openThread(t.id);
+                item.innerHTML = `
+                    <div class="thread-item-title">${escapeHtml(t.title || 'New Thread')}</div>
+                    <div class="thread-item-preview">${escapeHtml(t.last_message_preview || 'No messages yet')}</div>
+                    <div class="thread-item-meta">${t.message_count || 0} messages</div>
+                `;
+                threadList.appendChild(item);
+            }
+        }
+
+        async function refreshThreads(selectCurrent = true) {
+            try {
+                const res = await fetch('/api/threads?limit=120');
+                const data = await res.json();
+                loadedThreads = data.threads || [];
+                if (selectCurrent && !currentThreadId && loadedThreads.length > 0) {
+                    currentThreadId = loadedThreads[0].id;
+                }
+                renderThreadList();
+            } catch (e) {
+                console.error('Failed to load threads:', e);
+            }
+        }
+
+        async function openThread(threadId) {
+            currentThreadId = threadId;
+            renderThreadList();
+            clearChatView();
+            try {
+                const res = await fetch(`/api/threads/${threadId}/messages?limit=500`);
+                const data = await res.json();
+                const msgs = data.messages || [];
+                for (const msg of msgs) {
+                    if (msg.role === 'user') {
+                        addMessage('user', msg.content);
+                    } else {
+                        addMessage('assistant', msg.content, msg.emotion, msg.voice_score, msg.personality || 'sylana');
+                    }
+                }
+            } catch (e) {
+                console.error('Failed to open thread:', e);
+            }
+        }
+
+        async function loadPersonalities() {
+            try {
+                const res = await fetch('/api/personalities');
+                const data = await res.json();
+                personalities = data.personalities || personalities;
+                personalitySelect.innerHTML = '';
+                for (const p of personalities) {
+                    const opt = document.createElement('option');
+                    opt.value = p;
+                    opt.textContent = formatPersonaName(p);
+                    personalitySelect.appendChild(opt);
+                }
+                personalitySelect.value = data.default || 'sylana';
+            } catch (e) {
+                console.error('Failed to load personalities:', e);
+            }
+        }
+
+        async function createNewThread() {
+            try {
+                const res = await fetch('/api/threads', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ title: 'New Thread' })
+                });
+                const thread = await res.json();
+                await refreshThreads(false);
+                currentThreadId = thread.id;
+                renderThreadList();
+                clearChatView();
+            } catch (e) {
+                console.error('Failed to create thread:', e);
+            }
+        }
+
         // Check server status on load
         async function checkReady() {
             try {
@@ -455,7 +681,15 @@
                     headerStatus.textContent = 'Soul active';
                     messageInput.disabled = false;
                     sendBtn.disabled = false;
+                    personalitySelect.disabled = false;
                     messageInput.focus();
+                    await loadPersonalities();
+                    await refreshThreads(true);
+                    if (currentThreadId) {
+                        await openThread(currentThreadId);
+                    } else {
+                        await createNewThread();
+                    }
                 } else {
                     headerStatus.textContent = 'Loading models...';
                     setTimeout(checkReady, 3000);
@@ -467,8 +701,9 @@
         }
         checkReady();
 
-        function addMessage(role, text, emotion, voiceScore) {
-            if (welcome) welcome.style.display = 'none';
+        function addMessage(role, text, emotion, voiceScore, personality = 'sylana') {
+            const welcomeNode = document.getElementById('welcome');
+            if (welcomeNode) welcomeNode.style.display = 'none';
 
             const msg = document.createElement('div');
             msg.className = 'message';
@@ -477,7 +712,7 @@
             if (role === 'user') {
                 headerHTML = '<span class="message-name">Elias</span>';
             } else {
-                headerHTML = '<span class="message-name sylana">Sylana</span>';
+                headerHTML = `<span class="message-name sylana">${escapeHtml(formatPersonaName(personality))}</span>`;
                 if (emotion) {
                     headerHTML += `<span class="emotion-tag">${emotion.emotion} (${emotion.intensity}/10)</span>`;
                 }
@@ -489,7 +724,7 @@
 
             msg.innerHTML = `
                 <div class="message-header">${headerHTML}</div>
-                <div class="message-bubble ${role}">${escapeHtml(text)}</div>
+                <div class="message-bubble ${role === 'user' ? 'user' : 'sylana'}">${escapeHtml(text)}</div>
             `;
 
             chatContainer.appendChild(msg);
@@ -497,15 +732,16 @@
             return msg;
         }
 
-        function addTypingIndicator() {
-            if (welcome) welcome.style.display = 'none';
+        function addTypingIndicator(personality = 'sylana') {
+            const welcomeNode = document.getElementById('welcome');
+            if (welcomeNode) welcomeNode.style.display = 'none';
 
             const msg = document.createElement('div');
             msg.className = 'message';
             msg.id = 'typingMsg';
             msg.innerHTML = `
                 <div class="message-header">
-                    <span class="message-name sylana">Sylana</span>
+                    <span class="message-name sylana">${escapeHtml(formatPersonaName(personality))}</span>
                 </div>
                 <div class="message-bubble sylana" id="streamBubble">
                     <div class="typing-indicator">
@@ -522,7 +758,11 @@
 
         async function sendMessage() {
             const text = messageInput.value.trim();
+            const personality = personalitySelect.value || 'sylana';
             if (!text || isGenerating) return;
+            if (!currentThreadId) {
+                await createNewThread();
+            }
 
             isGenerating = true;
             sendBtn.disabled = true;
@@ -533,7 +773,7 @@
             addMessage('user', text);
 
             // Add typing indicator
-            const typingMsg = addTypingIndicator();
+            const typingMsg = addTypingIndicator(personality);
             const streamBubble = document.getElementById('streamBubble');
 
             let emotionData = null;
@@ -545,7 +785,7 @@
                 const response = await fetch('/api/chat', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ message: text })
+                    body: JSON.stringify({ message: text, thread_id: currentThreadId, personality })
                 });
 
                 const reader = response.body.getReader();
@@ -581,6 +821,12 @@
                             } else if (event.type === 'done') {
                                 voiceScore = event.data.voice_score;
                                 turnCount = event.data.turn;
+                                if (event.data.personality) {
+                                    personalitySelect.value = event.data.personality;
+                                }
+                                if (event.data.thread_id) {
+                                    currentThreadId = event.data.thread_id;
+                                }
                             }
                         } catch (e) {
                             // Skip malformed events
@@ -595,13 +841,15 @@
             // Replace typing message with final message
             typingMsg.remove();
             if (fullText) {
-                addMessage('sylana', fullText, emotionData, voiceScore);
+                addMessage('assistant', fullText, emotionData, voiceScore, personality);
             }
 
             // Update turn count
             if (turnCount > 0) {
                 document.getElementById('turnCount').textContent = `Turn ${turnCount}`;
             }
+            await refreshThreads(false);
+            renderThreadList();
 
             isGenerating = false;
             sendBtn.disabled = false;

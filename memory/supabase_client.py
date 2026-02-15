@@ -10,6 +10,7 @@ import time
 
 import psycopg2
 import psycopg2.extras
+from psycopg2 import extensions
 from pgvector.psycopg2 import register_vector
 
 logger = logging.getLogger(__name__)
@@ -25,6 +26,14 @@ def get_connection():
     """
     global _connection
     if _connection is not None and not _connection.closed:
+        # Recover shared connection if a previous statement aborted the transaction.
+        try:
+            tx_status = _connection.get_transaction_status()
+            if tx_status == extensions.TRANSACTION_STATUS_INERROR:
+                _connection.rollback()
+                logger.warning("Recovered Supabase connection from aborted transaction state")
+        except Exception as e:
+            logger.warning(f"Failed transaction-state recovery check: {e}")
         return _connection
 
     db_url = os.getenv("SUPABASE_DB_URL")

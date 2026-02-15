@@ -28,12 +28,12 @@ class Config:
     def __init__(self):
         # Security: API Tokens
         self.HF_TOKEN = os.getenv("HF_TOKEN")
+        self.ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+        self.CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5-20250929")
+        cors_origins_raw = os.getenv("CORS_ORIGINS", "*")
+        self.CORS_ORIGINS = [o.strip() for o in cors_origins_raw.split(",") if o.strip()] or ["*"]
         if not self.HF_TOKEN:
-            print("[ERROR] HF_TOKEN not set in environment!")
-            print("   1. Copy .env.template to .env")
-            print("   2. Add your HuggingFace token to .env")
-            print("   3. Get token from: https://huggingface.co/settings/tokens")
-            # Don't exit - allow for testing/development
+            print("[WARNING] HF_TOKEN not set (only needed for local HuggingFace model paths)")
 
         # Database Configuration
         self.DB_PATH = os.getenv(
@@ -103,8 +103,8 @@ class Config:
         """Validate critical configuration values"""
         errors = []
 
-        if not self.HF_TOKEN:
-            errors.append("HF_TOKEN is required for model downloads")
+        if not self.ANTHROPIC_API_KEY:
+            errors.append("ANTHROPIC_API_KEY is required for Claude API responses")
 
         if self.ENABLE_FINE_TUNING and self.MIN_TRAINING_SAMPLES < 10:
             errors.append("MIN_TRAINING_SAMPLES should be at least 10 for fine-tuning")
@@ -126,6 +126,9 @@ class Config:
         return f"""
 Sylana Vessel Configuration:
   HF_TOKEN: {token_display}
+  ANTHROPIC_API_KEY: {"SET" if self.ANTHROPIC_API_KEY else "NOT_SET"}
+  CLAUDE_MODEL: {self.CLAUDE_MODEL}
+  CORS_ORIGINS: {','.join(self.CORS_ORIGINS)}
   DB_PATH: {self.DB_PATH}
   MODEL_NAME: {self.MODEL_NAME}
   EMBEDDING_MODEL: {self.EMBEDDING_MODEL}

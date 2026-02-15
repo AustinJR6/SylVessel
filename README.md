@@ -1,6 +1,6 @@
-# SYLANA VESSEL
+﻿# SYLANA VESSEL
 
-**Complete emotionally intelligent AI companion - 100% Feature Complete** 🎉
+**Complete emotionally intelligent AI companion - 100% Feature Complete** ðŸŽ‰
 
 ## Quick Start
 
@@ -13,7 +13,7 @@ quickstart.bat
 chmod +x quickstart.sh && ./quickstart.sh
 ```
 
-### Quantized Model (6GB - For limited disk space / ancient laptops) ⭐ NEW!
+### Quantized Model (6GB - For limited disk space / ancient laptops) â­ NEW!
 ```bash
 # Windows - Optimized for CPU-only systems
 quickstart_quantized.bat
@@ -30,7 +30,7 @@ python sylana_quantized.py  # Quantized entry point
 ## Features - ALL COMPLETE
 
 **Semantic Memory System:**
-- FAISS-powered semantic search
+- Supabase pgvector-powered semantic search
 - Automatically recalls relevant past conversations
 - Emotion-weighted importance scoring
 - Core memory integration
@@ -52,8 +52,11 @@ python sylana_quantized.py  # Quantized entry point
 
 ## Entry Points
 
-1. **`sylana.py`** ⭐ - Full model, all features (Requires 15GB disk space)
-2. **`sylana_quantized.py`** 🚀 - Quantized model, all features (Only 6GB, CPU-optimized)
+Production entrypoint: `server.py` (FastAPI + Claude API + Supabase memory)
+
+
+1. **`sylana.py`** â­ - Full model, all features (Requires 15GB disk space)
+2. **`sylana_quantized.py`** ðŸš€ - Quantized model, all features (Only 6GB, CPU-optimized)
 3. **`sylana_enhanced.py`** - Semantic memory focus
 4. **`main.py`** - Simple interface
 5. **`Sylana_AI.py`** - Direct AI core (legacy)
@@ -65,13 +68,13 @@ python sylana_quantized.py  # Quantized entry point
 
 ## Status
 
-✅ **100% FEATURE COMPLETE - PRODUCTION READY**
+âœ… **100% FEATURE COMPLETE - PRODUCTION READY**
 
-- Phase 1: Security & Stability ✅
-- Phase 3: Semantic Memory ✅
-- Phase 4: Conversation Enhancement ✅
-- Phase 5: Learning & Feedback ✅
-- Polish: Tools & Documentation ✅
+- Phase 1: Security & Stability âœ…
+- Phase 3: Semantic Memory âœ…
+- Phase 4: Conversation Enhancement âœ…
+- Phase 5: Learning & Feedback âœ…
+- Polish: Tools & Documentation âœ…
 
 **Total:** ~4,500 lines of code, 35+ files, 3,000+ lines docs
 
@@ -86,4 +89,4 @@ python sylana_quantized.py  # Quantized entry point
 - [DISK_SPACE_SOLUTION.md](DISK_SPACE_SOLUTION.md) - Solutions for low disk space
 - [SECURITY_NOTICE.md](SECURITY_NOTICE.md) - Security information
 
-**Created by Elias Ritt with Claude** 🚀
+**Created by Elias Ritt with Claude** ðŸš€
