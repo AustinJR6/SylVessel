@@ -1067,9 +1067,16 @@ async def generate_response_stream(user_input: str, thread_id: Optional[int] = N
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load models on startup"""
+    """Start service immediately and load heavy models in background."""
     logger.info("Starting Sylana Vessel Server...")
-    load_models()
+
+    async def _bg_init():
+        try:
+            await asyncio.to_thread(load_models)
+        except Exception:
+            logger.exception("Background model initialization failed")
+
+    asyncio.create_task(_bg_init())
     yield
     # Cleanup
     if state.memory_manager:
