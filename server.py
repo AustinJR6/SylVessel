@@ -17,13 +17,12 @@ import time
 import logging
 import asyncio
 import re
+import importlib
 from collections import Counter
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
-
-from transformers import pipeline
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -35,33 +34,21 @@ from sse_starlette.sse import EventSourceResponse
 from core.config_loader import config
 from core.prompt_engineer import PromptEngineer
 from core.claude_model import ClaudeModel
-from memory.memory_manager import MemoryManager
 from memory.supabase_client import get_connection
 
-# Soul preservation components
-try:
-    from core.personality import PersonalityManager
-    PERSONALITY_AVAILABLE = True
-except ImportError:
-    PERSONALITY_AVAILABLE = False
+# Runtime-loaded components (avoid heavy imports before port bind on Render).
+MemoryManager = None
+PersonalityManager = None
+VoiceValidator = None
+VoiceProfileManager = None
+RelationshipMemoryDB = None
+RelationshipContextBuilder = None
+EmotionDetector = None
 
-try:
-    from core.voice_validator import VoiceValidator, VoiceProfileManager
-    VOICE_VALIDATOR_AVAILABLE = True
-except ImportError:
-    VOICE_VALIDATOR_AVAILABLE = False
-
-try:
-    from memory.relationship_memory import RelationshipMemoryDB, RelationshipContextBuilder
-    RELATIONSHIP_AVAILABLE = True
-except ImportError:
-    RELATIONSHIP_AVAILABLE = False
-
-try:
-    from memory.chatgpt_importer import EmotionDetector
-    GOEMO_AVAILABLE = True
-except ImportError:
-    GOEMO_AVAILABLE = False
+PERSONALITY_AVAILABLE = False
+VOICE_VALIDATOR_AVAILABLE = False
+RELATIONSHIP_AVAILABLE = False
+GOEMO_AVAILABLE = False
 
 # Configure logging
 logging.basicConfig(
@@ -396,7 +383,49 @@ def get_chat_messages(thread_id: int, limit: int = 300) -> List[Dict[str, Any]]:
 
 def load_models():
     """Load all runtime services at startup."""
+    global MemoryManager
+    global PersonalityManager, VoiceValidator, VoiceProfileManager
+    global RelationshipMemoryDB, RelationshipContextBuilder
+    global EmotionDetector
+    global PERSONALITY_AVAILABLE, VOICE_VALIDATOR_AVAILABLE, RELATIONSHIP_AVAILABLE, GOEMO_AVAILABLE
+
     state.start_time = time.time()
+
+    # Import runtime modules after app is already serving on a port.
+    if MemoryManager is None:
+        MemoryManager = importlib.import_module("memory.memory_manager").MemoryManager
+
+    if PersonalityManager is None:
+        try:
+            PersonalityManager = importlib.import_module("core.personality").PersonalityManager
+            PERSONALITY_AVAILABLE = True
+        except Exception:
+            PERSONALITY_AVAILABLE = False
+
+    if VoiceValidator is None or VoiceProfileManager is None:
+        try:
+            voice_mod = importlib.import_module("core.voice_validator")
+            VoiceValidator = voice_mod.VoiceValidator
+            VoiceProfileManager = voice_mod.VoiceProfileManager
+            VOICE_VALIDATOR_AVAILABLE = True
+        except Exception:
+            VOICE_VALIDATOR_AVAILABLE = False
+
+    if RelationshipMemoryDB is None or RelationshipContextBuilder is None:
+        try:
+            rel_mod = importlib.import_module("memory.relationship_memory")
+            RelationshipMemoryDB = rel_mod.RelationshipMemoryDB
+            RelationshipContextBuilder = rel_mod.RelationshipContextBuilder
+            RELATIONSHIP_AVAILABLE = True
+        except Exception:
+            RELATIONSHIP_AVAILABLE = False
+
+    if EmotionDetector is None:
+        try:
+            EmotionDetector = importlib.import_module("memory.chatgpt_importer").EmotionDetector
+            GOEMO_AVAILABLE = True
+        except Exception:
+            GOEMO_AVAILABLE = False
 
     # 1. Load personalities
     if PERSONALITY_AVAILABLE:
@@ -413,6 +442,7 @@ def load_models():
         logger.info("GoEmotions (28-class) loaded")
     else:
         # Fallback to basic sentiment
+        from transformers import pipeline
         _sentiment = pipeline(
             "sentiment-analysis",
             model="distilbert-base-uncased-finetuned-sst-2-english",
@@ -463,6 +493,9 @@ def load_models():
 
 def detect_emotion(text: str) -> dict:
     """Detect emotion with full detail"""
+    if not state.emotion_detector:
+        return {'emotion': 'neutral', 'intensity': 5, 'category': 'neutral'}
+
     if GOEMO_AVAILABLE and hasattr(state.emotion_detector, 'detect'):
         emotion, intensity, category = state.emotion_detector.detect(text)
         return {
@@ -1305,7 +1338,7 @@ async def health():
 if __name__ == "__main__":
     import uvicorn
 
-    port = int(os.environ.get("SERVER_PORT", 7860))
+    port = int(os.environ.get("PORT") or os.environ.get("SERVER_PORT") or 10000)
     host = os.environ.get("SERVER_HOST", "0.0.0.0")
 
     logger.info(f"Starting server on {host}:{port}")
