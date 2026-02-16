@@ -81,6 +81,7 @@ Production entrypoint: `server.py` (FastAPI + Claude API + Supabase memory)
 ## Documentation
 
 - [QUICK_START_GUIDE.md](QUICK_START_GUIDE.md) - Get started in 5 minutes
+- [CLOUD_RUN_DEPLOY.md](CLOUD_RUN_DEPLOY.md) - Deploy backend to Google Cloud Run
 - [QUANTIZED_SETUP_GUIDE.md](QUANTIZED_SETUP_GUIDE.md) - Setup for limited disk space / ancient laptops
 - [USAGE_GUIDE.md](USAGE_GUIDE.md) - Complete usage guide with examples
 - [CHANGELOG.md](CHANGELOG.md) - Version history & all features
