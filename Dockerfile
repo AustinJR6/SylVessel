@@ -7,10 +7,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-COPY requirements.txt /app/requirements.txt
+COPY requirements.cloudrun.txt /app/requirements.cloudrun.txt
 
 RUN pip install --upgrade pip setuptools wheel && \
-    pip install -r /app/requirements.txt
+    pip install -r /app/requirements.cloudrun.txt
 
 COPY . /app
 

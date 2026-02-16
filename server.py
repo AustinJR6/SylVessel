@@ -48,7 +48,7 @@ EmotionDetector = None
 PERSONALITY_AVAILABLE = False
 VOICE_VALIDATOR_AVAILABLE = False
 RELATIONSHIP_AVAILABLE = False
-GOEMO_AVAILABLE = False
+EMOTION_API_AVAILABLE = False
 
 # Configure logging
 logging.basicConfig(
@@ -173,6 +173,9 @@ def ensure_personality_schema():
         """)
 
         cur.execute("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS personality VARCHAR(50) DEFAULT 'sylana'")
+        cur.execute("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS external_id TEXT")
+        cur.execute("DROP INDEX IF EXISTS idx_conversations_external_id_unique")
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_external_id_unique ON conversations(external_id)")
 
         cur.execute("""
             CREATE TABLE IF NOT EXISTS memory_sharing (
@@ -186,6 +189,61 @@ def ensure_personality_schema():
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_memory_sharing_memory_id ON memory_sharing(memory_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_memories_personality ON memories(personality)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_memories_thread_id ON memories(thread_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_memories_conversation_id ON memories(conversation_id)")
+
+        # Backfill canonical conversation rows from imported memory metadata.
+        cur.execute("""
+            INSERT INTO conversations (title, personality, external_id)
+            SELECT
+                COALESCE(NULLIF(src.conversation_title, ''), 'Conversation') AS title,
+                COALESCE(NULLIF(src.personality, ''), 'sylana') AS personality,
+                src.conversation_id AS external_id
+            FROM (
+                SELECT DISTINCT ON (m.conversation_id)
+                    m.conversation_id,
+                    m.conversation_title,
+                    m.personality
+                FROM memories m
+                WHERE m.conversation_id IS NOT NULL
+                  AND m.conversation_id <> ''
+                ORDER BY m.conversation_id, m.timestamp DESC NULLS LAST, m.id DESC
+            ) AS src
+            ON CONFLICT (external_id)
+            DO UPDATE SET
+                title = EXCLUDED.title,
+                personality = EXCLUDED.personality
+        """)
+
+        # Add missing FK constraints for graph clarity and integrity.
+        cur.execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conname = 'memories_thread_id_fkey'
+                ) THEN
+                    ALTER TABLE memories
+                    ADD CONSTRAINT memories_thread_id_fkey
+                    FOREIGN KEY (thread_id) REFERENCES chat_threads(id)
+                    ON DELETE SET NULL;
+                END IF;
+            END$$;
+        """)
+        cur.execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM pg_constraint
+                    WHERE conname = 'memories_conversation_id_fkey'
+                ) THEN
+                    ALTER TABLE memories
+                    ADD CONSTRAINT memories_conversation_id_fkey
+                    FOREIGN KEY (conversation_id) REFERENCES conversations(external_id)
+                    ON DELETE SET NULL;
+                END IF;
+            END$$;
+        """)
 
         cur.execute(f"""
             CREATE OR REPLACE FUNCTION match_memories(
@@ -398,7 +456,7 @@ def load_models():
     global PersonalityManager, VoiceValidator, VoiceProfileManager
     global RelationshipMemoryDB, RelationshipContextBuilder
     global EmotionDetector
-    global PERSONALITY_AVAILABLE, VOICE_VALIDATOR_AVAILABLE, RELATIONSHIP_AVAILABLE, GOEMO_AVAILABLE
+    global PERSONALITY_AVAILABLE, VOICE_VALIDATOR_AVAILABLE, RELATIONSHIP_AVAILABLE, EMOTION_API_AVAILABLE
 
     state.start_time = time.time()
 
@@ -433,10 +491,10 @@ def load_models():
 
     if EmotionDetector is None:
         try:
-            EmotionDetector = importlib.import_module("memory.chatgpt_importer").EmotionDetector
-            GOEMO_AVAILABLE = True
+            EmotionDetector = importlib.import_module("core.emotion_api").APIEmotionDetector
+            EMOTION_API_AVAILABLE = True
         except Exception:
-            GOEMO_AVAILABLE = False
+            EMOTION_API_AVAILABLE = False
 
     # 1. Load personalities
     if PERSONALITY_AVAILABLE:
@@ -446,21 +504,14 @@ def load_models():
     else:
         logger.warning("Personality manager unavailable; using fallback prompts")
 
-    # 2. Load emotion detector (GoEmotions 28-class)
-    logger.info("Loading emotion detection model...")
-    if GOEMO_AVAILABLE:
+    # 2. Load API emotion detector (no local model download)
+    logger.info("Initializing emotion detection service...")
+    if EMOTION_API_AVAILABLE:
         state.emotion_detector = EmotionDetector()
-        logger.info("GoEmotions (28-class) loaded")
+        logger.info("API emotion detector ready")
     else:
-        # Fallback to basic sentiment
-        from transformers import pipeline
-        _sentiment = pipeline(
-            "sentiment-analysis",
-            model="distilbert-base-uncased-finetuned-sst-2-english",
-            device=-1
-        )
-        state.emotion_detector = _sentiment
-        logger.info("Basic sentiment model loaded (fallback)")
+        state.emotion_detector = None
+        logger.warning("Emotion API detector unavailable; using neutral fallback")
 
     # 3. Initialize Claude model
     logger.info(f"Initializing Claude model: {config.CLAUDE_MODEL}")
@@ -507,28 +558,14 @@ def detect_emotion(text: str) -> dict:
     if not state.emotion_detector:
         return {'emotion': 'neutral', 'intensity': 5, 'category': 'neutral'}
 
-    if GOEMO_AVAILABLE and hasattr(state.emotion_detector, 'detect'):
+    if hasattr(state.emotion_detector, 'detect'):
         emotion, intensity, category = state.emotion_detector.detect(text)
         return {
             'emotion': emotion,
             'intensity': intensity,
             'category': category
         }
-    else:
-        # Fallback
-        result = state.emotion_detector(text[:512])[0]
-        label = result['label']
-        score = result['score']
-
-        if label == "POSITIVE" and score > 0.75:
-            return {'emotion': 'joy', 'intensity': 8, 'category': 'ecstatic'}
-        elif label == "POSITIVE":
-            return {'emotion': 'approval', 'intensity': 6, 'category': 'happy'}
-        elif label == "NEGATIVE" and score > 0.75:
-            return {'emotion': 'grief', 'intensity': 8, 'category': 'devastated'}
-        elif label == "NEGATIVE":
-            return {'emotion': 'sadness', 'intensity': 6, 'category': 'sad'}
-        return {'emotion': 'neutral', 'intensity': 5, 'category': 'neutral'}
+    return {'emotion': 'neutral', 'intensity': 5, 'category': 'neutral'}
 
 
 # ============================================================================
@@ -979,6 +1016,7 @@ def generate_response(user_input: str, thread_id: Optional[int] = None, personal
             sylana_response=response,
             emotion=emotion_data['category'],
             personality=personality,
+            thread_id=thread_id,
         )
     except Exception as e:
         logger.error(f'Failed to store conversation: {e}')
@@ -1081,6 +1119,7 @@ async def generate_response_stream(user_input: str, thread_id: Optional[int] = N
             sylana_response=full_response,
             emotion=emotion_data['category'],
             personality=personality,
+            thread_id=thread_id,
         )
     except Exception as e:
         logger.error(f'Failed to store conversation (stream): {e}')
@@ -1283,7 +1322,7 @@ async def status():
         "personalities": state.personality_manager.list_personalities() if state.personality_manager else ["sylana", "claude"],
         "voice_validator": state.voice_validator is not None,
         "relationship_memory": state.relationship_db is not None,
-        "emotion_model": "GoEmotions (28-class)" if GOEMO_AVAILABLE else "DistilBERT (basic)",
+        "emotion_model": f"API ({getattr(config, 'EMOTION_MODEL', 'gpt-4o-mini')})" if state.emotion_detector else "neutral-fallback",
         "turns_this_session": state.turn_count
     }
 

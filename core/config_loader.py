@@ -31,6 +31,7 @@ class Config:
         self.ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
         self.OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
         self.CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5-20250929")
+        self.EMOTION_MODEL = os.getenv("EMOTION_MODEL", "gpt-4o-mini")
         cors_origins_raw = os.getenv("CORS_ORIGINS", "*")
         self.CORS_ORIGINS = [o.strip() for o in cors_origins_raw.split(",") if o.strip()] or ["*"]
         if not self.HF_TOKEN:
@@ -131,6 +132,7 @@ Sylana Vessel Configuration:
   ANTHROPIC_API_KEY: {"SET" if self.ANTHROPIC_API_KEY else "NOT_SET"}
   OPENAI_API_KEY: {"SET" if self.OPENAI_API_KEY else "NOT_SET"}
   CLAUDE_MODEL: {self.CLAUDE_MODEL}
+  EMOTION_MODEL: {self.EMOTION_MODEL}
   CORS_ORIGINS: {','.join(self.CORS_ORIGINS)}
   DB_PATH: {self.DB_PATH}
   MODEL_NAME: {self.MODEL_NAME}

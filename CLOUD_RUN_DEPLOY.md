@@ -11,9 +11,15 @@ This project is ready to deploy to Cloud Run using the root `Dockerfile`.
 Optional:
 
 - `CLAUDE_MODEL` (default: `claude-sonnet-4-5-20250929`)
+- `EMOTION_MODEL` (default: `gpt-4o-mini`)
 - `EMBEDDING_MODEL` (default: `text-embedding-3-small`)
 - `EMBEDDING_DIM` (default: `384`; must match your pgvector column dimension)
 - `CORS_ORIGINS` (comma-separated list; use your app origin)
+
+Notes:
+
+- Cloud Run uses `requirements.cloudrun.txt` for a lightweight runtime image.
+- Emotion detection is API-based (no local Hugging Face model downloads).
 
 ## One-time setup
 
@@ -51,7 +57,7 @@ gcloud run deploy sylana-vessel \
   --memory 2Gi \
   --cpu 1 \
   --timeout 300 \
-  --set-env-vars CLAUDE_MODEL=claude-sonnet-4-5-20250929,EMBEDDING_MODEL=text-embedding-3-small,EMBEDDING_DIM=384,CORS_ORIGINS=* \
+  --set-env-vars CLAUDE_MODEL=claude-sonnet-4-5-20250929,EMOTION_MODEL=gpt-4o-mini,EMBEDDING_MODEL=text-embedding-3-small,EMBEDDING_DIM=384,CORS_ORIGINS=* \
   --set-secrets ANTHROPIC_API_KEY=anthropic-api-key:latest,OPENAI_API_KEY=openai-api-key:latest,SUPABASE_DB_URL=supabase-db-url:latest
 ```
 

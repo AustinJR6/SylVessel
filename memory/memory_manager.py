@@ -70,6 +70,7 @@ class MemoryManager:
         emotion: str = "neutral",
         personality: str = "sylana",
         privacy_level: str = "private",
+        thread_id: int = None,
     ) -> int:
         """
         Store a conversation turn with embedding for vector search.
@@ -87,8 +88,8 @@ class MemoryManager:
         try:
             cur.execute("""
                 INSERT INTO memories
-                (user_input, sylana_response, timestamp, emotion, embedding, personality, privacy_level)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                (user_input, sylana_response, timestamp, emotion, embedding, personality, privacy_level, thread_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
             """, (
                 user_input,
@@ -98,6 +99,7 @@ class MemoryManager:
                 embedding,
                 personality,
                 privacy_level,
+                thread_id,
             ))
             memory_id = cur.fetchone()[0]
             conn.commit()
@@ -114,7 +116,7 @@ class MemoryManager:
         message: str,
         response: str,
         personality: str,
-        thread_id: str = None,
+        thread_id: int = None,
         privacy_level: str = "private",
         emotion: str = "neutral",
     ) -> int:
@@ -125,6 +127,7 @@ class MemoryManager:
             emotion=emotion,
             personality=personality,
             privacy_level=privacy_level,
+            thread_id=thread_id,
         )
 
     def retrieve_memories(self, query: str, personality: str, limit: int = 15, match_threshold: float = 0.25) -> List[Dict]:
