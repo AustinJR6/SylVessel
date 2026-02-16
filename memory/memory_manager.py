@@ -7,7 +7,6 @@ import logging
 import re
 from typing import List, Dict, Optional
 from datetime import datetime
-from sentence_transformers import SentenceTransformer
 
 from core.config_loader import config
 from memory.semantic_search import SemanticMemoryEngine
@@ -36,13 +35,11 @@ class MemoryManager:
     """
 
     def __init__(self, db_path=None):
-        self.embedder = None
         self.semantic_engine = None
         self.db_path = db_path  # Backward-compat only (Supabase is authoritative).
 
         # Initialize components
         self._verify_connection()
-        self._initialize_embedder()
         self._initialize_semantic_engine()
 
         logger.info("MemoryManager initialized with Supabase backend")
@@ -58,19 +55,9 @@ class MemoryManager:
             logger.exception(f"Failed to connect to Supabase: {e}")
             raise
 
-    def _initialize_embedder(self):
-        """Load sentence transformer for embeddings"""
-        try:
-            logger.info(f"Loading embedding model: {config.EMBEDDING_MODEL}")
-            self.embedder = SentenceTransformer(config.EMBEDDING_MODEL)
-            logger.info("Embedding model loaded")
-        except Exception as e:
-            logger.exception(f"Failed to load embedding model: {e}")
-            raise
-
     def _initialize_semantic_engine(self):
         """Initialize semantic search engine"""
-        self.semantic_engine = SemanticMemoryEngine(embedder=self.embedder)
+        self.semantic_engine = SemanticMemoryEngine()
 
     def rebuild_index(self):
         """No-op: pgvector handles indexing automatically."""
@@ -575,8 +562,8 @@ class MemoryManager:
         from numpy.linalg import norm
 
         events = [row[1] for row in core_memories]
-        event_embeddings = self.embedder.encode(events, convert_to_numpy=True)
-        query_embedding = self.embedder.encode([query], convert_to_numpy=True)
+        event_embeddings = np.array([self.semantic_engine.encode_text(event) for event in events], dtype=float)
+        query_embedding = np.array([self.semantic_engine.encode_query(query)], dtype=float)
 
         event_embeddings_norm = event_embeddings / norm(event_embeddings, axis=1, keepdims=True)
         query_embedding_norm = query_embedding / norm(query_embedding)

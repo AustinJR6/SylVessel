@@ -128,18 +128,19 @@ def ensure_chat_thread_tables():
 
 def ensure_personality_schema():
     """Ensure personality-aware memory schema exists."""
+    configured_dim = int(getattr(config, "EMBEDDING_DIM", 384))
     conn = get_connection()
     cur = conn.cursor()
     try:
         cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
-        cur.execute("""
+        cur.execute(f"""
             CREATE TABLE IF NOT EXISTS memories (
                 id BIGSERIAL PRIMARY KEY,
                 user_input TEXT,
                 sylana_response TEXT,
                 timestamp DOUBLE PRECISION,
                 emotion TEXT DEFAULT 'neutral',
-                embedding vector(384),
+                embedding vector({configured_dim}),
                 intensity INTEGER DEFAULT 5,
                 topic TEXT DEFAULT '',
                 core_memory BOOLEAN DEFAULT FALSE,
@@ -148,6 +149,16 @@ def ensure_personality_schema():
                 conversation_title TEXT
             )
         """)
+        # Keep SQL function vector type aligned with the existing column dim.
+        cur.execute("""
+            SELECT CASE WHEN a.atttypmod > 0 THEN a.atttypmod - 4 ELSE NULL END
+            FROM pg_attribute a
+            JOIN pg_class c ON a.attrelid = c.oid
+            WHERE c.relname = 'memories' AND a.attname = 'embedding'
+            LIMIT 1
+        """)
+        row = cur.fetchone()
+        effective_dim = int(row[0]) if row and row[0] else configured_dim
         cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS personality VARCHAR(50) DEFAULT 'sylana'")
         cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS privacy_level VARCHAR(20) DEFAULT 'private'")
         cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS thread_id BIGINT")
@@ -176,9 +187,9 @@ def ensure_personality_schema():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_memory_sharing_memory_id ON memory_sharing(memory_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_memories_personality ON memories(personality)")
 
-        cur.execute("""
+        cur.execute(f"""
             CREATE OR REPLACE FUNCTION match_memories(
-              query_embedding vector(384),
+              query_embedding vector({effective_dim}),
               match_threshold float,
               match_count int,
               personality_filter text

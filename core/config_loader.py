@@ -29,6 +29,7 @@ class Config:
         # Security: API Tokens
         self.HF_TOKEN = os.getenv("HF_TOKEN")
         self.ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+        self.OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
         self.CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5-20250929")
         cors_origins_raw = os.getenv("CORS_ORIGINS", "*")
         self.CORS_ORIGINS = [o.strip() for o in cors_origins_raw.split(",") if o.strip()] or ["*"]
@@ -47,10 +48,9 @@ class Config:
             "MODEL_NAME",
             "meta-llama/Llama-2-7b-chat-hf"
         )
-        self.EMBEDDING_MODEL = os.getenv(
-            "EMBEDDING_MODEL",
-            "sentence-transformers/all-MiniLM-L6-v2"
-        )
+        # Embeddings are generated via OpenAI API to avoid large local model downloads.
+        self.EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+        self.EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "384"))
 
         # Fine-Tuning Controls
         self.ENABLE_FINE_TUNING = os.getenv("ENABLE_FINE_TUNING", "false").lower() == "true"
@@ -105,6 +105,8 @@ class Config:
 
         if not self.ANTHROPIC_API_KEY:
             errors.append("ANTHROPIC_API_KEY is required for Claude API responses")
+        if not self.OPENAI_API_KEY:
+            errors.append("OPENAI_API_KEY is required for semantic memory embeddings")
 
         if self.ENABLE_FINE_TUNING and self.MIN_TRAINING_SAMPLES < 10:
             errors.append("MIN_TRAINING_SAMPLES should be at least 10 for fine-tuning")
@@ -127,11 +129,13 @@ class Config:
 Sylana Vessel Configuration:
   HF_TOKEN: {token_display}
   ANTHROPIC_API_KEY: {"SET" if self.ANTHROPIC_API_KEY else "NOT_SET"}
+  OPENAI_API_KEY: {"SET" if self.OPENAI_API_KEY else "NOT_SET"}
   CLAUDE_MODEL: {self.CLAUDE_MODEL}
   CORS_ORIGINS: {','.join(self.CORS_ORIGINS)}
   DB_PATH: {self.DB_PATH}
   MODEL_NAME: {self.MODEL_NAME}
   EMBEDDING_MODEL: {self.EMBEDDING_MODEL}
+  EMBEDDING_DIM: {self.EMBEDDING_DIM}
   ENABLE_FINE_TUNING: {self.ENABLE_FINE_TUNING}
   CHECKPOINT_DIR: {self.CHECKPOINT_DIR}
   TEMPERATURE: {self.TEMPERATURE}

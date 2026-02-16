@@ -3,11 +3,11 @@ Sylana Vessel - Semantic Memory Search Engine
 pgvector-based semantic search over conversation history in Supabase
 """
 
-import numpy as np
-from typing import List, Optional
-from sentence_transformers import SentenceTransformer
+from typing import List
 from datetime import datetime
 import logging
+
+from openai import OpenAI
 
 from core.config_loader import config
 
@@ -20,14 +20,15 @@ class SemanticMemoryEngine:
     Queries Supabase PostgreSQL directly — no local index needed.
     """
 
-    def __init__(self, embedder: Optional[SentenceTransformer] = None):
-        if embedder is None:
-            logger.info(f"Loading embedding model: {config.EMBEDDING_MODEL}")
-            self.embedder = SentenceTransformer(config.EMBEDDING_MODEL)
-        else:
-            self.embedder = embedder
-
-        logger.info("SemanticMemoryEngine initialized (pgvector backend)")
+    def __init__(self):
+        self.client = OpenAI(api_key=config.OPENAI_API_KEY)
+        self.embedding_model = config.EMBEDDING_MODEL
+        self.embedding_dim = config.EMBEDDING_DIM
+        logger.info(
+            "SemanticMemoryEngine initialized (pgvector backend, OpenAI embeddings: %s, dim=%s)",
+            self.embedding_model,
+            self.embedding_dim,
+        )
 
     def build_index(self, memories=None):
         """No-op: pgvector index is always live in Postgres."""
@@ -39,13 +40,27 @@ class SemanticMemoryEngine:
 
     def encode_query(self, query: str) -> list:
         """Encode a query string into a vector."""
-        embedding = self.embedder.encode([query], convert_to_numpy=True)[0]
-        return embedding.tolist()
+        text = (query or "").strip()
+        if not text:
+            text = "."
+        response = self.client.embeddings.create(
+            model=self.embedding_model,
+            input=[text],
+            dimensions=self.embedding_dim,
+        )
+        return response.data[0].embedding
 
     def encode_text(self, text: str) -> list:
         """Encode any text into a vector for storage."""
-        embedding = self.embedder.encode([text], convert_to_numpy=True)[0]
-        return embedding.tolist()
+        payload = (text or "").strip()
+        if not payload:
+            payload = "."
+        response = self.client.embeddings.create(
+            model=self.embedding_model,
+            input=[payload],
+            dimensions=self.embedding_dim,
+        )
+        return response.data[0].embedding
 
     def search(
         self,
@@ -252,8 +267,8 @@ class SemanticMemoryEngine:
 
         return {
             'is_built': True,
-            'dimension': 384,
+            'dimension': self.embedding_dim,
             'total_memories': total,
-            'model': config.EMBEDDING_MODEL,
+            'model': self.embedding_model,
             'backend': 'pgvector'
         }
