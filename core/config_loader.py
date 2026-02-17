@@ -22,14 +22,27 @@ else:
     print(f"[WARNING] Using default values (may not work without HF_TOKEN)")
 
 
+def _clean_secret_env(name: str):
+    """
+    Normalize secret-like env values from .env/Secret Manager.
+    Strips accidental wrapping quotes and trailing CR/LF whitespace.
+    """
+    value = os.getenv(name)
+    if value is None:
+        return None
+    cleaned = value.strip().strip('"').strip("'")
+    os.environ[name] = cleaned
+    return cleaned
+
+
 class Config:
     """Centralized configuration management with environment variable loading"""
 
     def __init__(self):
         # Security: API Tokens
-        self.HF_TOKEN = os.getenv("HF_TOKEN")
-        self.ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-        self.OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+        self.HF_TOKEN = _clean_secret_env("HF_TOKEN")
+        self.ANTHROPIC_API_KEY = _clean_secret_env("ANTHROPIC_API_KEY")
+        self.OPENAI_API_KEY = _clean_secret_env("OPENAI_API_KEY")
         self.CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-5-20250929")
         self.EMOTION_MODEL = os.getenv("EMOTION_MODEL", "gpt-4o-mini")
         cors_origins_raw = os.getenv("CORS_ORIGINS", "*")
@@ -42,7 +55,7 @@ class Config:
             "SYLANA_DB_PATH",
             str(PROJECT_ROOT / "data" / "sylana_memory.db")
         )
-        self.SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL")
+        self.SUPABASE_DB_URL = _clean_secret_env("SUPABASE_DB_URL")
 
         # Model Configuration
         self.MODEL_NAME = os.getenv(

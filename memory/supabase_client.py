@@ -7,6 +7,7 @@ All modules import get_connection() from here instead of using sqlite3.
 import os
 import logging
 import time
+from urllib.parse import urlparse
 
 import psycopg2
 import psycopg2.extras
@@ -16,6 +17,48 @@ from pgvector.psycopg2 import register_vector
 logger = logging.getLogger(__name__)
 
 _connection = None
+
+
+def _get_sanitized_db_url() -> str:
+    """Read SUPABASE_DB_URL and normalize common secret-manager formatting issues."""
+    raw_value = os.getenv("SUPABASE_DB_URL", "")
+    db_url = raw_value.strip().strip('"').strip("'")
+
+    if not db_url:
+        raise RuntimeError(
+            "SUPABASE_DB_URL not set. Add it to .env.\n"
+            "Format: postgresql://postgres.[ref]:[password]@[host]:5432/postgres"
+        )
+
+    if "\n" in db_url or "\r" in db_url:
+        raise RuntimeError("SUPABASE_DB_URL contains newline characters; it must be a single line")
+
+    parsed = urlparse(db_url)
+    if parsed.netloc.count("@") > 1:
+        raise RuntimeError(
+            "SUPABASE_DB_URL appears to have an unescaped '@' in credentials. "
+            "URL-encode your password before putting it in the connection URL."
+        )
+
+    if not parsed.hostname or not parsed.path or parsed.path == "/":
+        raise RuntimeError(
+            "SUPABASE_DB_URL is malformed. Expected: postgresql://user:pass@host:5432/postgres"
+        )
+
+    return db_url
+
+
+def _log_connection_target(db_url: str) -> None:
+    """Log safe connection target fields to aid cloud debugging."""
+    parsed = urlparse(db_url)
+    db_name = parsed.path.lstrip("/") or "<missing>"
+    port = parsed.port or 5432
+    logger.info(
+        "Connecting to Supabase PostgreSQL host=%s port=%s db=%s",
+        parsed.hostname,
+        port,
+        db_name,
+    )
 
 
 def get_connection():
@@ -36,12 +79,8 @@ def get_connection():
             logger.warning(f"Failed transaction-state recovery check: {e}")
         return _connection
 
-    db_url = os.getenv("SUPABASE_DB_URL")
-    if not db_url:
-        raise RuntimeError(
-            "SUPABASE_DB_URL not set. Add it to .env.\n"
-            "Format: postgresql://postgres.[ref]:[password]@[host]:5432/postgres"
-        )
+    db_url = _get_sanitized_db_url()
+    _log_connection_target(db_url)
 
     # Retry up to 3 times for transient network issues
     for attempt in range(3):

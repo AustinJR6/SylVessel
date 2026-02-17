@@ -174,7 +174,6 @@ def ensure_personality_schema():
 
         cur.execute("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS personality VARCHAR(50) DEFAULT 'sylana'")
         cur.execute("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS external_id TEXT")
-        cur.execute("DROP INDEX IF EXISTS idx_conversations_external_id_unique")
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_external_id_unique ON conversations(external_id)")
 
         cur.execute("""
@@ -1277,8 +1276,18 @@ async def chat_sync(request: Request):
         thread = create_chat_thread(title=f"[{personality}] {user_input[:80]}")
         thread_id = thread["id"]
 
-    result = generate_response(user_input, thread_id=thread_id, personality=personality)
-    return JSONResponse(content=result)
+    try:
+        result = generate_response(user_input, thread_id=thread_id, personality=personality)
+        return JSONResponse(content=result)
+    except Exception as e:
+        logger.exception(f"chat_sync failed for thread_id={thread_id}: {e}")
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "Upstream model service unavailable. Please retry.",
+                "thread_id": thread_id,
+            },
+        )
 
 
 @app.get("/api/threads")
