@@ -121,9 +121,20 @@ def ensure_chat_thread_tables():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_chat_messages_thread_created ON chat_messages(thread_id, created_at)")
         conn.commit()
     except Exception as e:
-        conn.rollback()
+        _safe_rollback(conn, "ensure_chat_thread_tables")
         logger.error(f"Failed to ensure chat thread tables: {e}")
         raise
+
+
+def _safe_rollback(conn, context: str) -> None:
+    """Best-effort rollback that won't raise if the connection already died."""
+    if not conn:
+        return
+    try:
+        if not conn.closed:
+            conn.rollback()
+    except Exception as rollback_err:
+        logger.warning(f"Rollback skipped for {context}: {rollback_err}")
 
 
 def ensure_personality_schema():
@@ -287,7 +298,7 @@ def ensure_personality_schema():
 
         conn.commit()
     except Exception as e:
-        conn.rollback()
+        _safe_rollback(conn, "ensure_personality_schema")
         logger.error(f"Failed to ensure personality schema: {e}")
         raise
 
@@ -318,7 +329,7 @@ def create_chat_thread(title: str = "") -> Dict[str, Any]:
             "last_message_preview": "",
         }
     except Exception as e:
-        conn.rollback()
+        _safe_rollback(conn, "create_chat_thread")
         logger.error(f"Failed to create chat thread: {e}")
         raise
 
@@ -360,7 +371,7 @@ def save_thread_turn(
         cur.execute("UPDATE chat_threads SET updated_at = NOW() WHERE id = %s", (thread_id,))
         conn.commit()
     except Exception as e:
-        conn.rollback()
+        _safe_rollback(conn, "save_thread_turn")
         logger.error(f"Failed to save thread turn for thread {thread_id}: {e}")
 
 

@@ -19,6 +19,22 @@ logger = logging.getLogger(__name__)
 _connection = None
 
 
+def _discard_connection(reason: str = "") -> None:
+    """Drop cached connection reference safely so a new one can be created."""
+    global _connection
+    if _connection is None:
+        return
+    try:
+        if not _connection.closed:
+            _connection.close()
+    except Exception:
+        pass
+    finally:
+        _connection = None
+    if reason:
+        logger.warning("Discarded Supabase connection: %s", reason)
+
+
 def _get_sanitized_db_url() -> str:
     """Read SUPABASE_DB_URL and normalize common secret-manager formatting issues."""
     raw_value = os.getenv("SUPABASE_DB_URL", "")
@@ -75,9 +91,15 @@ def get_connection():
             if tx_status == extensions.TRANSACTION_STATUS_INERROR:
                 _connection.rollback()
                 logger.warning("Recovered Supabase connection from aborted transaction state")
+            # Detect stale sockets that still report closed=0.
+            with _connection.cursor() as cur:
+                cur.execute("SELECT 1")
+                cur.fetchone()
+            return _connection
+        except (psycopg2.InterfaceError, psycopg2.OperationalError) as e:
+            _discard_connection(f"stale or closed socket detected ({e})")
         except Exception as e:
             logger.warning(f"Failed transaction-state recovery check: {e}")
-        return _connection
 
     db_url = _get_sanitized_db_url()
     _log_connection_target(db_url)
@@ -85,12 +107,21 @@ def get_connection():
     # Retry up to 3 times for transient network issues
     for attempt in range(3):
         try:
-            _connection = psycopg2.connect(db_url)
+            _connection = psycopg2.connect(
+                db_url,
+                connect_timeout=10,
+                keepalives=1,
+                keepalives_idle=30,
+                keepalives_interval=10,
+                keepalives_count=3,
+                application_name="sylana-vessel",
+            )
             _connection.autocommit = False
             register_vector(_connection)
             logger.info("Connected to Supabase PostgreSQL")
             return _connection
         except psycopg2.OperationalError as e:
+            _discard_connection(f"connect attempt failed ({e})")
             if attempt < 2:
                 wait = (attempt + 1) * 2
                 logger.warning(f"Connection attempt {attempt + 1} failed, retrying in {wait}s: {e}")
