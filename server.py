@@ -2989,7 +2989,17 @@ def load_models():
     ensure_chat_thread_tables()
     ensure_github_actions_table()
     ensure_code_execution_table()
-    ensure_workflow_tables()
+    workflow_tables_ready = False
+    for attempt in range(1, 4):
+        try:
+            ensure_workflow_tables()
+            workflow_tables_ready = True
+            break
+        except Exception as e:
+            logger.warning("Workflow table setup attempt %s failed: %s", attempt, e)
+            time.sleep(1.5)
+    if not workflow_tables_ready:
+        raise RuntimeError("Failed to initialize workflow tables after retries")
     ensure_default_schedule_configs()
     ensure_personality_schema()
     try:
