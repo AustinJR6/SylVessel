@@ -27,6 +27,8 @@ python-multipart>=0.0.5
 # Configuration Management
 python-dotenv>=0.19.0
 apscheduler>=3.10.4
+resend>=2.4.0
+svix>=1.20.0
 
 # Database (Supabase PostgreSQL + pgvector)
 psycopg2-binary>=2.9.0
