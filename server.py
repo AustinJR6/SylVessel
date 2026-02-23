@@ -1353,7 +1353,9 @@ def _runtime_tool_runner(name: str, tool_input: Dict[str, Any]) -> Dict[str, Any
             "https://api.resend.com/domains",
             headers={
                 "Authorization": f"Bearer {api_key}",
+                "Accept": "application/json",
                 "Content-Type": "application/json",
+                "User-Agent": "sylana-vessel",
             },
             method="GET",
         )
