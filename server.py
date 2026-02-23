@@ -1027,6 +1027,79 @@ def _get_latest_health_snapshot() -> Dict[str, Any]:
     return {}
 
 
+def _get_github_access_snapshot(limit: int = 30) -> Dict[str, Any]:
+    try:
+        client = _get_github_client()
+        repos = client.list_repos()
+    except Exception as e:
+        return {"error": f"github_unavailable: {e}"}
+    items = []
+    for repo in (repos or [])[: max(1, min(limit, 100))]:
+        items.append({
+            "name": repo.get("full_name") or repo.get("name"),
+            "default_branch": repo.get("default_branch") or "main",
+            "private": bool(repo.get("private")),
+            "updated_at": repo.get("updated_at"),
+        })
+    return {"repo_count": len(items), "repos": items}
+
+
+def _get_work_session_summary() -> Dict[str, Any]:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT
+                COUNT(*) FILTER (WHERE status = 'running') AS running_count,
+                COUNT(*) FILTER (WHERE status = 'pending') AS pending_count,
+                COUNT(*) FILTER (WHERE status = 'completed') AS completed_count
+            FROM work_sessions
+        """)
+        row = cur.fetchone()
+        return {
+            "running": int((row or [0, 0, 0])[0] or 0),
+            "pending": int((row or [0, 0, 0])[1] or 0),
+            "completed": int((row or [0, 0, 0])[2] or 0),
+        }
+    except Exception:
+        return {}
+
+
+def _get_outreach_summary() -> Dict[str, Any]:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT
+                (SELECT COUNT(*) FROM prospects) AS prospects_total,
+                (SELECT COUNT(*) FROM prospects WHERE status = 'email_drafted') AS prospects_drafted,
+                (SELECT COUNT(*) FROM email_drafts WHERE status = 'draft') AS drafts_pending,
+                (SELECT COUNT(*) FROM email_drafts WHERE status = 'sent') AS drafts_sent
+        """)
+        row = cur.fetchone()
+        return {
+            "prospects_total": int((row or [0, 0, 0, 0])[0] or 0),
+            "prospects_drafted": int((row or [0, 0, 0, 0])[1] or 0),
+            "drafts_pending": int((row or [0, 0, 0, 0])[2] or 0),
+            "drafts_sent": int((row or [0, 0, 0, 0])[3] or 0),
+        }
+    except Exception:
+        return {}
+
+
+def _build_user_context(active_tools: List[str]) -> Dict[str, Any]:
+    ctx: Dict[str, Any] = {}
+    if "health_data" in active_tools:
+        ctx["health_snapshot"] = _get_latest_health_snapshot()
+    if "github" in active_tools:
+        ctx["github_snapshot"] = _get_github_access_snapshot()
+    if "work_sessions" in active_tools:
+        ctx["work_sessions_summary"] = _get_work_session_summary()
+    if "outreach" in active_tools:
+        ctx["outreach_summary"] = _get_outreach_summary()
+    return ctx
+
+
 def _get_thread_tools(thread_id: int) -> List[str]:
     conn = get_connection()
     cur = conn.cursor()
@@ -2984,9 +3057,13 @@ def build_system_prompt(entity: str, active_tools: List[str], user_context: Opti
         f"Current date/time (UTC): {now_iso}",
         "User name: Elias",
         "Relationship context: You are Elias's trusted AI collaborator and companion. Keep responses clear, direct, and caring.",
+        "Context safety: Only use data from tools currently active in this turn. If a tool is not active, do not reference its private data.",
     ]
 
     health_snapshot = user_ctx.get("health_snapshot") or {}
+    github_snapshot = user_ctx.get("github_snapshot") or {}
+    work_sessions_summary = user_ctx.get("work_sessions_summary") or {}
+    outreach_summary = user_ctx.get("outreach_summary") or {}
     tool_blocks = {
         "web_search": "You have access to web search. Use it when current information would improve your response.",
         "code_execution": "You have access to code execution. You can write and run Python, JavaScript, or bash. Use this to produce real outputs, not just describe them.",
@@ -3004,6 +3081,12 @@ def build_system_prompt(entity: str, active_tools: List[str], user_context: Opti
             base_lines.append(line)
         if tool == "health_data" and health_snapshot:
             base_lines.append(f"Latest health snapshot: {json.dumps(health_snapshot)[:1200]}")
+        if tool == "github" and github_snapshot:
+            base_lines.append(f"GitHub access snapshot: {json.dumps(github_snapshot)[:1800]}")
+        if tool == "work_sessions" and work_sessions_summary:
+            base_lines.append(f"Work session summary: {json.dumps(work_sessions_summary)}")
+        if tool == "outreach" and outreach_summary:
+            base_lines.append(f"Outreach summary: {json.dumps(outreach_summary)}")
     return "\n\n".join(base_lines)
 
 
@@ -3129,8 +3212,7 @@ def generate_response(
     state.turn_count += 1
     resolved_tools = normalize_active_tools(active_tools)
     memories_active = "memories" in resolved_tools
-    health_active = "health_data" in resolved_tools
-    user_context = {"health_snapshot": _get_latest_health_snapshot() if health_active else {}}
+    user_context = _build_user_context(resolved_tools)
 
     emotion_data = detect_emotion(user_input)
     state.emotional_history.append(emotion_data['emotion'])
@@ -3189,6 +3271,7 @@ def generate_response(
             system_prompt=claude_inputs['system_prompt'],
             messages=claude_inputs['messages'],
             max_tokens=_max_new_tokens_for_turn(memory_query=memory_query),
+            active_tools=resolved_tools,
         ).strip()
         if not response:
             response = "I'm here with you. Say that again for me."
@@ -3255,8 +3338,7 @@ async def generate_response_stream(
     state.turn_count += 1
     resolved_tools = normalize_active_tools(active_tools)
     memories_active = "memories" in resolved_tools
-    health_active = "health_data" in resolved_tools
-    user_context = {"health_snapshot": _get_latest_health_snapshot() if health_active else {}}
+    user_context = _build_user_context(resolved_tools)
 
     emotion_data = detect_emotion(user_input)
     state.emotional_history.append(emotion_data['emotion'])
@@ -3321,6 +3403,7 @@ async def generate_response_stream(
             system_prompt=claude_inputs['system_prompt'],
             messages=claude_inputs['messages'],
             max_tokens=_max_new_tokens_for_turn(memory_query=memory_query),
+            active_tools=resolved_tools,
         ):
             full_response += token
             yield json.dumps({'type': 'token', 'data': token})
@@ -4814,7 +4897,7 @@ async def chat(request: Request):
     body = await request.json()
     user_input = body.get("message", "").strip()
     thread_id = body.get("thread_id")
-    requested_tools = body.get("active_tools", None)
+    requested_tools = body.get("active_tools", body.get("activeTools", None))
     personality = (body.get("personality") or "sylana").strip().lower()
     if state.personality_manager and personality not in state.personality_manager.list_personalities():
         personality = "sylana"
@@ -4867,7 +4950,7 @@ async def chat_sync(request: Request):
     body = await request.json()
     user_input = body.get("message", "").strip()
     thread_id = body.get("thread_id")
-    requested_tools = body.get("active_tools", None)
+    requested_tools = body.get("active_tools", body.get("activeTools", None))
     personality = (body.get("personality") or "sylana").strip().lower()
     if state.personality_manager and personality not in state.personality_manager.list_personalities():
         personality = "sylana"
@@ -4918,7 +5001,7 @@ async def create_thread(request: Request):
     """Create a new empty thread."""
     body = await request.json()
     title = (body.get("title") or "").strip()
-    active_tools = normalize_active_tools(body.get("active_tools", None))
+    active_tools = normalize_active_tools(body.get("active_tools", body.get("activeTools", None)))
     thread = create_chat_thread(title=title or "New Thread", active_tools=active_tools)
     return JSONResponse(content=thread)
 
@@ -4944,7 +5027,7 @@ async def update_conversation_tools(conversation_id: int, request: Request):
     if not _thread_exists(conversation_id):
         return JSONResponse(status_code=404, content={"error": "Conversation not found"})
     body = await request.json()
-    active_tools = normalize_active_tools(body.get("active_tools", None))
+    active_tools = normalize_active_tools(body.get("active_tools", body.get("activeTools", None)))
     _set_thread_tools(conversation_id, active_tools)
     thread = get_chat_thread(conversation_id) or {}
     return JSONResponse(content={
