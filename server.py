@@ -20,6 +20,10 @@ import re
 import importlib
 import base64
 import uuid
+import shutil
+import tempfile
+import subprocess
+import selectors
 from collections import Counter
 from pathlib import Path
 from datetime import datetime, timezone
@@ -34,6 +38,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from sse_starlette.sse import EventSourceResponse
 from anthropic import (
     APIConnectionError,
@@ -50,6 +56,10 @@ from core.config_loader import config
 from core.prompt_engineer import PromptEngineer
 from core.claude_model import ClaudeModel
 from memory.supabase_client import get_connection
+try:
+    from google.cloud import storage as gcs_storage
+except Exception:
+    gcs_storage = None
 
 # Runtime-loaded components (avoid heavy imports before port bind on Render).
 MemoryManager = None
@@ -492,6 +502,381 @@ def _maybe_attach_card_to_thread(
     _save_github_card_message(thread_id=thread_id, personality=persona, title=title, card=card)
 
 
+MAX_CODE_TIMEOUT_SECONDS = 120
+MAX_EXEC_OUTPUT_BYTES = 1024 * 1024
+MAX_UPLOAD_FILE_BYTES = 10 * 1024 * 1024
+
+
+def ensure_code_execution_table():
+    """Create table for persistent code execution audit records."""
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS code_executions (
+                execution_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                entity TEXT NOT NULL CHECK (entity IN ('claude', 'sylana')),
+                language TEXT NOT NULL CHECK (language IN ('python', 'javascript', 'bash')),
+                code TEXT NOT NULL,
+                output TEXT,
+                error TEXT,
+                return_code INTEGER,
+                success BOOLEAN NOT NULL DEFAULT FALSE,
+                execution_time_ms INTEGER NOT NULL DEFAULT 0,
+                files_produced JSONB NOT NULL DEFAULT '[]'::jsonb,
+                timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                session_id TEXT
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_code_executions_timestamp ON code_executions(timestamp DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_code_executions_session ON code_executions(session_id)")
+        conn.commit()
+    except Exception as e:
+        _safe_rollback(conn, "ensure_code_execution_table")
+        logger.error(f"Failed to ensure code_executions table: {e}")
+        raise
+
+
+def _log_code_execution(
+    *,
+    execution_id: str,
+    entity: str,
+    language: str,
+    code: str,
+    output: str,
+    error: Optional[str],
+    return_code: Optional[int],
+    success: bool,
+    execution_time_ms: int,
+    files_produced: List[Dict[str, Any]],
+    session_id: Optional[str] = None,
+) -> None:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO code_executions (
+                execution_id, entity, language, code, output, error, return_code, success,
+                execution_time_ms, files_produced, session_id
+            )
+            VALUES (%s::uuid, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+        """, (
+            execution_id,
+            entity,
+            language,
+            code,
+            output,
+            error,
+            return_code,
+            success,
+            execution_time_ms,
+            json.dumps(files_produced or []),
+            session_id,
+        ))
+        conn.commit()
+    except Exception as e:
+        _safe_rollback(conn, "_log_code_execution")
+        logger.error(f"Failed to log code execution {execution_id}: {e}")
+
+
+def _save_code_execution_card_message(
+    *,
+    thread_id: int,
+    personality: str,
+    execution: Dict[str, Any],
+) -> None:
+    conn = get_connection()
+    cur = conn.cursor()
+    title = f"Code execution ({execution.get('language', 'unknown')})"
+    try:
+        cur.execute("""
+            INSERT INTO chat_messages (thread_id, role, content, personality, emotion, turn, metadata)
+            VALUES (%s, 'assistant', %s, %s, '{}'::jsonb, NULL, %s::jsonb)
+        """, (
+            thread_id,
+            title,
+            personality,
+            json.dumps({"code_execution": execution}),
+        ))
+        cur.execute("UPDATE chat_threads SET updated_at = NOW() WHERE id = %s", (thread_id,))
+        conn.commit()
+    except Exception as e:
+        _safe_rollback(conn, "_save_code_execution_card_message")
+        logger.error(f"Failed to persist code execution card for thread {thread_id}: {e}")
+
+
+def _maybe_attach_code_execution_to_thread(
+    *,
+    session_id: Optional[str],
+    entity: str,
+    execution: Dict[str, Any],
+) -> None:
+    if not session_id:
+        return
+    try:
+        thread_id = int(session_id)
+    except Exception:
+        return
+    if not _thread_exists(thread_id):
+        return
+    persona = "claude" if entity == "claude" else "sylana"
+    _save_code_execution_card_message(thread_id=thread_id, personality=persona, execution=execution)
+
+
+def _code_runner_spec(language: str) -> Dict[str, Any]:
+    lang = language.strip().lower()
+    if lang == "python":
+        return {
+            "image": os.getenv("CODE_EXEC_PYTHON_IMAGE", "python:3.11-slim"),
+            "filename": "main.py",
+            "command": ["/bin/sh", "-lc", "python /workspace/main.py"],
+        }
+    if lang == "javascript":
+        return {
+            "image": os.getenv("CODE_EXEC_NODE_IMAGE", "node:20-alpine"),
+            "filename": "main.js",
+            "command": ["/bin/sh", "-lc", "node /workspace/main.js"],
+        }
+    if lang == "bash":
+        return {
+            "image": os.getenv("CODE_EXEC_BASH_IMAGE", "bash:5.2"),
+            "filename": "main.sh",
+            "command": ["/bin/sh", "-lc", "bash /workspace/main.sh"],
+        }
+    raise HTTPException(status_code=400, detail="language must be python|javascript|bash")
+
+
+def _drain_process_output(proc: subprocess.Popen, timeout_seconds: int) -> Dict[str, Any]:
+    selector = selectors.DefaultSelector()
+    if proc.stdout:
+        selector.register(proc.stdout, selectors.EVENT_READ, data="stdout")
+    if proc.stderr:
+        selector.register(proc.stderr, selectors.EVENT_READ, data="stderr")
+
+    stdout_buf = bytearray()
+    stderr_buf = bytearray()
+    truncated = False
+    timed_out = False
+    deadline = time.monotonic() + timeout_seconds
+
+    while True:
+        if proc.poll() is not None and not selector.get_map():
+            break
+        if time.monotonic() > deadline:
+            timed_out = True
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            break
+
+        events = selector.select(timeout=0.1)
+        for key, _ in events:
+            stream = key.fileobj
+            chunk = stream.read1(4096) if hasattr(stream, "read1") else stream.read(4096)
+            if not chunk:
+                try:
+                    selector.unregister(stream)
+                except Exception:
+                    pass
+                continue
+
+            total_len = len(stdout_buf) + len(stderr_buf)
+            remaining = MAX_EXEC_OUTPUT_BYTES - total_len
+            if remaining <= 0:
+                truncated = True
+                continue
+
+            if len(chunk) > remaining:
+                chunk = chunk[:remaining]
+                truncated = True
+
+            if key.data == "stdout":
+                stdout_buf.extend(chunk)
+            else:
+                stderr_buf.extend(chunk)
+
+    try:
+        proc.wait(timeout=2)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+    stdout_text = stdout_buf.decode("utf-8", errors="replace")
+    stderr_text = stderr_buf.decode("utf-8", errors="replace")
+    if truncated:
+        marker = "\n[output truncated at 1MB]"
+        if len(stdout_text) <= len(stderr_text):
+            stdout_text += marker
+        else:
+            stderr_text += marker
+
+    return {
+        "stdout": stdout_text,
+        "stderr": stderr_text,
+        "timed_out": timed_out,
+        "return_code": proc.returncode,
+    }
+
+
+def _upload_execution_files_to_gcs(
+    *,
+    execution_id: str,
+    work_dir: Path,
+    input_filename: str,
+) -> List[Dict[str, Any]]:
+    produced = []
+    if not work_dir.exists():
+        return produced
+
+    bucket_name = (os.getenv("CODE_EXEC_GCS_BUCKET") or "").strip()
+    client = None
+    bucket = None
+    if bucket_name and gcs_storage is not None:
+        try:
+            client = gcs_storage.Client()
+            bucket = client.bucket(bucket_name)
+        except Exception as e:
+            logger.warning(f"GCS upload unavailable for code execution artifacts: {e}")
+            bucket = None
+    elif bucket_name and gcs_storage is None:
+        logger.warning("CODE_EXEC_GCS_BUCKET is set, but google-cloud-storage is not installed")
+
+    for path in work_dir.rglob("*"):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(work_dir).as_posix()
+        if rel == input_filename:
+            continue
+        try:
+            size = path.stat().st_size
+        except Exception:
+            continue
+        if size > MAX_UPLOAD_FILE_BYTES:
+            produced.append({
+                "name": rel,
+                "size_bytes": size,
+                "uploaded": False,
+                "error": "file exceeds upload size limit (10MB)",
+            })
+            continue
+
+        entry = {
+            "name": rel,
+            "size_bytes": size,
+            "uploaded": False,
+        }
+        if bucket is not None:
+            object_name = f"code-exec/{execution_id}/{rel}"
+            try:
+                blob = bucket.blob(object_name)
+                blob.upload_from_filename(str(path))
+                entry["uploaded"] = True
+                entry["gcs_uri"] = f"gs://{bucket_name}/{object_name}"
+            except Exception as e:
+                entry["error"] = f"upload failed: {e}"
+        produced.append(entry)
+    return produced
+
+
+def execute_code_in_sandbox(
+    *,
+    language: str,
+    code: str,
+    timeout_seconds: int,
+    execution_id: str,
+) -> Dict[str, Any]:
+    docker_bin = shutil.which("docker")
+    if not docker_bin:
+        raise HTTPException(status_code=503, detail="Docker is required for /code/execute but is not available")
+
+    spec = _code_runner_spec(language)
+    tmp_dir = Path(tempfile.mkdtemp(prefix=f"code_exec_{execution_id}_"))
+    source_file = tmp_dir / spec["filename"]
+    source_file.write_text(code or "", encoding="utf-8")
+
+    container_name = f"sv-code-{execution_id[:12]}"
+    docker_cmd = [
+        docker_bin,
+        "run",
+        "--name",
+        container_name,
+        "--rm",
+        "--network",
+        "none",
+        "--cpus",
+        os.getenv("CODE_EXEC_CPUS", "1"),
+        "--memory",
+        os.getenv("CODE_EXEC_MEMORY", "768m"),
+        "--pids-limit",
+        "256",
+        "--security-opt",
+        "no-new-privileges",
+        "--cap-drop",
+        "ALL",
+        "--read-only",
+        "--tmpfs",
+        "/tmp:rw,noexec,nosuid,size=64m",
+        "-u",
+        "65534:65534",
+        "-v",
+        f"{str(tmp_dir)}:/workspace:rw",
+        "-w",
+        "/workspace",
+        spec["image"],
+    ] + spec["command"]
+
+    start = time.perf_counter()
+    result = {
+        "stdout": "",
+        "stderr": "",
+        "return_code": None,
+        "timed_out": False,
+        "execution_time_ms": 0,
+        "files_produced": [],
+    }
+
+    try:
+        proc = subprocess.Popen(
+            docker_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            text=False,
+        )
+        out = _drain_process_output(proc, timeout_seconds=timeout_seconds)
+        elapsed_ms = int((time.perf_counter() - start) * 1000)
+        files_produced = _upload_execution_files_to_gcs(
+            execution_id=execution_id,
+            work_dir=tmp_dir,
+            input_filename=spec["filename"],
+        )
+        result.update({
+            "stdout": out["stdout"],
+            "stderr": out["stderr"],
+            "return_code": out["return_code"],
+            "timed_out": out["timed_out"],
+            "execution_time_ms": elapsed_ms,
+            "files_produced": files_produced,
+        })
+        return result
+    finally:
+        try:
+            subprocess.run(
+                [docker_bin, "rm", "-f", container_name],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+                timeout=10,
+            )
+        except Exception:
+            pass
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 # ============================================================================
 # GLOBAL STATE
 # ============================================================================
@@ -516,6 +901,7 @@ class SylanaState:
 
 
 state = SylanaState()
+scheduler: Optional[AsyncIOScheduler] = None
 
 # Generation anti-repetition defaults.
 REPETITION_PENALTY = 1.15
@@ -571,6 +957,687 @@ def _safe_rollback(conn, context: str) -> None:
             conn.rollback()
     except Exception as rollback_err:
         logger.warning(f"Rollback skipped for {context}: {rollback_err}")
+
+
+def ensure_workflow_tables():
+    """Create autonomous workflow/session tables."""
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS work_sessions (
+                session_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                entity TEXT NOT NULL CHECK (entity IN ('claude', 'sylana')),
+                goal TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'completed', 'failed')),
+                session_type TEXT NOT NULL CHECK (session_type IN ('prospect_research', 'email_drafting', 'content', 'general')),
+                started_at TIMESTAMPTZ,
+                completed_at TIMESTAMPTZ,
+                summary TEXT,
+                metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS tasks (
+                task_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                session_id UUID NOT NULL REFERENCES work_sessions(session_id) ON DELETE CASCADE,
+                task_type TEXT NOT NULL CHECK (task_type IN ('web_search', 'draft_email', 'research_company', 'build_prospect_profile')),
+                status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'completed', 'failed')),
+                input JSONB NOT NULL DEFAULT '{}'::jsonb,
+                output JSONB NOT NULL DEFAULT '{}'::jsonb,
+                error TEXT,
+                started_at TIMESTAMPTZ,
+                completed_at TIMESTAMPTZ,
+                execution_order INTEGER NOT NULL DEFAULT 1,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS prospects (
+                prospect_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                company_name TEXT NOT NULL,
+                contact_name TEXT,
+                contact_title TEXT,
+                email TEXT,
+                phone TEXT,
+                website TEXT,
+                location TEXT,
+                company_size TEXT,
+                notes TEXT,
+                source TEXT,
+                product TEXT NOT NULL CHECK (product IN ('manifest', 'onevine')),
+                status TEXT NOT NULL CHECK (status IN ('new', 'email_drafted', 'email_sent', 'responded', 'converted', 'not_interested')),
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                session_id UUID REFERENCES work_sessions(session_id) ON DELETE SET NULL
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS email_drafts (
+                draft_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                prospect_id UUID REFERENCES prospects(prospect_id) ON DELETE CASCADE,
+                session_id UUID REFERENCES work_sessions(session_id) ON DELETE SET NULL,
+                entity TEXT NOT NULL CHECK (entity IN ('claude', 'sylana')),
+                subject TEXT NOT NULL,
+                body TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('draft', 'approved', 'rejected', 'sent', 'bounced')),
+                feedback TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                approved_at TIMESTAMPTZ,
+                sent_at TIMESTAMPTZ
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS device_tokens (
+                token_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                token TEXT NOT NULL UNIQUE,
+                provider TEXT NOT NULL CHECK (provider IN ('expo', 'fcm')),
+                platform TEXT,
+                active BOOLEAN NOT NULL DEFAULT TRUE,
+                metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS schedule_configs (
+                config_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                job_name TEXT NOT NULL UNIQUE,
+                session_type TEXT NOT NULL CHECK (session_type IN ('prospect_research', 'email_drafting', 'content', 'general')),
+                product TEXT,
+                count INTEGER NOT NULL DEFAULT 5,
+                cron_expr TEXT NOT NULL,
+                active BOOLEAN NOT NULL DEFAULT TRUE,
+                metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                last_run_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_work_sessions_status ON work_sessions(status, created_at DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_tasks_session_order ON tasks(session_id, execution_order)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_prospects_product_status ON prospects(product, status, created_at DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_email_drafts_status ON email_drafts(status, created_at DESC)")
+        conn.commit()
+    except Exception as e:
+        _safe_rollback(conn, "ensure_workflow_tables")
+        logger.error(f"Failed to ensure workflow tables: {e}")
+        raise
+
+
+def ensure_default_schedule_configs():
+    """Seed default autonomous research schedule."""
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO schedule_configs (job_name, session_type, product, count, cron_expr, active, metadata)
+            VALUES ('manifest-prospect-research', 'prospect_research', 'manifest', 5, '0 8 * * 1,4', TRUE, '{}'::jsonb)
+            ON CONFLICT (job_name) DO NOTHING
+        """)
+        conn.commit()
+    except Exception as e:
+        _safe_rollback(conn, "ensure_default_schedule_configs")
+        logger.error(f"Failed to seed schedule configs: {e}")
+
+
+def _create_work_session(entity: str, goal: str, session_type: str, metadata: Dict[str, Any], status: str = "pending") -> str:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO work_sessions (entity, goal, status, session_type, metadata, started_at)
+            VALUES (%s, %s, %s, %s, %s::jsonb, CASE WHEN %s='running' THEN NOW() ELSE NULL END)
+            RETURNING session_id
+        """, (entity, goal, status, session_type, json.dumps(metadata or {}), status))
+        row = cur.fetchone()
+        conn.commit()
+        return str(row[0])
+    except Exception as e:
+        _safe_rollback(conn, "_create_work_session")
+        raise RuntimeError(f"Failed to create work session: {e}")
+
+
+def _update_work_session(
+    session_id: str,
+    *,
+    status: Optional[str] = None,
+    summary: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        updates = []
+        params: List[Any] = []
+        if status is not None:
+            updates.append("status = %s")
+            params.append(status)
+            if status == "running":
+                updates.append("started_at = COALESCE(started_at, NOW())")
+            if status in {"completed", "failed"}:
+                updates.append("completed_at = NOW()")
+        if summary is not None:
+            updates.append("summary = %s")
+            params.append(summary)
+        if metadata is not None:
+            updates.append("metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb")
+            params.append(json.dumps(metadata))
+        if not updates:
+            return
+        params.append(session_id)
+        cur.execute(f"UPDATE work_sessions SET {', '.join(updates)} WHERE session_id = %s::uuid", tuple(params))
+        conn.commit()
+    except Exception as e:
+        _safe_rollback(conn, "_update_work_session")
+        logger.error(f"Failed to update work session {session_id}: {e}")
+
+
+def _create_task(
+    *,
+    session_id: str,
+    task_type: str,
+    execution_order: int,
+    input_payload: Optional[Dict[str, Any]] = None,
+    status: str = "pending",
+) -> str:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO tasks (session_id, task_type, status, input, execution_order, started_at)
+            VALUES (%s::uuid, %s, %s, %s::jsonb, %s, CASE WHEN %s='running' THEN NOW() ELSE NULL END)
+            RETURNING task_id
+        """, (session_id, task_type, status, json.dumps(input_payload or {}), execution_order, status))
+        row = cur.fetchone()
+        conn.commit()
+        return str(row[0])
+    except Exception as e:
+        _safe_rollback(conn, "_create_task")
+        raise RuntimeError(f"Failed to create task: {e}")
+
+
+def _update_task(
+    task_id: str,
+    *,
+    status: Optional[str] = None,
+    output_payload: Optional[Dict[str, Any]] = None,
+    error: Optional[str] = None,
+) -> None:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        updates = []
+        params: List[Any] = []
+        if status is not None:
+            updates.append("status = %s")
+            params.append(status)
+            if status == "running":
+                updates.append("started_at = COALESCE(started_at, NOW())")
+            if status in {"completed", "failed"}:
+                updates.append("completed_at = NOW()")
+        if output_payload is not None:
+            updates.append("output = %s::jsonb")
+            params.append(json.dumps(output_payload))
+        if error is not None:
+            updates.append("error = %s")
+            params.append(error[:4000])
+        if not updates:
+            return
+        params.append(task_id)
+        cur.execute(f"UPDATE tasks SET {', '.join(updates)} WHERE task_id = %s::uuid", tuple(params))
+        conn.commit()
+    except Exception as e:
+        _safe_rollback(conn, "_update_task")
+        logger.error(f"Failed to update task {task_id}: {e}")
+
+
+def _insert_prospect(payload: Dict[str, Any]) -> str:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO prospects (
+                company_name, contact_name, contact_title, email, phone, website, location,
+                company_size, notes, source, product, status, session_id
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::uuid)
+            RETURNING prospect_id
+        """, (
+            payload.get("company_name"),
+            payload.get("contact_name"),
+            payload.get("contact_title"),
+            payload.get("email"),
+            payload.get("phone"),
+            payload.get("website"),
+            payload.get("location"),
+            payload.get("company_size"),
+            payload.get("notes"),
+            payload.get("source"),
+            payload.get("product"),
+            payload.get("status", "new"),
+            payload.get("session_id"),
+        ))
+        row = cur.fetchone()
+        conn.commit()
+        return str(row[0])
+    except Exception as e:
+        _safe_rollback(conn, "_insert_prospect")
+        raise RuntimeError(f"Failed to insert prospect: {e}")
+
+
+def _insert_email_draft(payload: Dict[str, Any]) -> str:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO email_drafts (prospect_id, session_id, entity, subject, body, status)
+            VALUES (%s::uuid, %s::uuid, %s, %s, %s, %s)
+            RETURNING draft_id
+        """, (
+            payload.get("prospect_id"),
+            payload.get("session_id"),
+            payload.get("entity"),
+            payload.get("subject"),
+            payload.get("body"),
+            payload.get("status", "draft"),
+        ))
+        row = cur.fetchone()
+        cur.execute("UPDATE prospects SET status = 'email_drafted', updated_at = NOW() WHERE prospect_id = %s::uuid", (payload.get("prospect_id"),))
+        conn.commit()
+        return str(row[0])
+    except Exception as e:
+        _safe_rollback(conn, "_insert_email_draft")
+        raise RuntimeError(f"Failed to insert email draft: {e}")
+
+
+def _run_web_search(query: str, count: int = 8) -> Dict[str, Any]:
+    if state.claude_model and getattr(state.claude_model, "enable_web_search", False):
+        return state.claude_model._brave_web_search(query, count=count)  # noqa: SLF001
+    return {"query": query, "count": count, "results": []}
+
+
+def _parse_company_from_result(result: Dict[str, Any]) -> str:
+    title = (result.get("title") or "").strip()
+    if not title:
+        return "Unknown Solar Installer"
+    for sep in ["|", "-", "—", "–", ":"]:
+        if sep in title:
+            title = title.split(sep, 1)[0].strip()
+            break
+    return title[:140] or "Unknown Solar Installer"
+
+
+def _extract_contact_hints(result: Dict[str, Any]) -> Dict[str, Any]:
+    snippet = (result.get("snippet") or "").strip()
+    email_match = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", snippet)
+    phone_match = re.search(r"(?:\+?1[\s\-.]?)?\(?\d{3}\)?[\s\-.]?\d{3}[\s\-.]?\d{4}", snippet)
+    return {
+        "email": email_match.group(0) if email_match else None,
+        "phone": phone_match.group(0) if phone_match else None,
+    }
+
+
+def _draft_manifest_email(prospect: Dict[str, Any], entity: str) -> Dict[str, str]:
+    company = prospect.get("company_name") or "your team"
+    contact = prospect.get("contact_name") or "there"
+    subject = f"{company}: quicker solar BOMs without extra admin"
+    system_prompt = (
+        "Write concise, direct cold outreach emails for solar installers. "
+        "Tone must be peer-to-peer, not salesy. Under 150 words."
+    )
+    prompt = (
+        f"Write an outreach email to {contact} at {company}. "
+        "Product: Manifest inventory management for solar installers. "
+        "Differentiator: AI-powered BOM generation from blueprints. "
+        "Price starts at $49.99/month. 14-day free trial, no credit card. "
+        "URL: https://manifest-inventory.vercel.app. "
+        "Include a specific subject line if possible and end with: "
+        "\"Would it be worth a quick look?\""
+    )
+    body = ""
+    if state.claude_model:
+        try:
+            body = state.claude_model.generate(
+                system_prompt=system_prompt,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=320,
+            ).strip()
+        except Exception as e:
+            logger.warning("Email drafting model fallback used: %s", e)
+    if not body:
+        body = (
+            f"Hey {contact},\n\n"
+            f"I work with solar teams like {company}, and we built Manifest to reduce inventory chaos in the field. "
+            "It generates BOMs from blueprints with AI, so your team can move faster without spreadsheet cleanup.\n\n"
+            "Plans start at $49.99/month with a 14-day free trial (no credit card): "
+            "https://manifest-inventory.vercel.app\n\n"
+            "Would it be worth a quick look?"
+        )
+    words = body.split()
+    if len(words) > 150:
+        body = " ".join(words[:150]).strip()
+    return {"subject": subject, "body": body}
+
+
+def _collect_active_device_tokens() -> List[Dict[str, str]]:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT token, provider
+            FROM device_tokens
+            WHERE active = TRUE
+            ORDER BY updated_at DESC
+        """)
+        rows = cur.fetchall()
+        return [{"token": r[0], "provider": r[1]} for r in rows]
+    except Exception as e:
+        logger.warning(f"Failed to load device tokens: {e}")
+        return []
+
+
+def _send_expo_push(token: str, title: str, body: str, data: Optional[Dict[str, Any]] = None) -> bool:
+    payload = {
+        "to": token,
+        "title": title,
+        "body": body,
+        "data": data or {},
+        "sound": "default",
+    }
+    req = UrlRequest(
+        "https://exp.host/--/api/v2/push/send",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(req, timeout=10) as resp:
+            ok = int(resp.status) < 300
+            return ok
+    except Exception as e:
+        logger.warning(f"Expo push send failed: {e}")
+        return False
+
+
+def _send_session_notifications(session_id: str, prospects_found: int, drafts_ready: int) -> int:
+    tokens = _collect_active_device_tokens()
+    if not tokens:
+        return 0
+    title = "Prospect Research Complete"
+    body = f"{prospects_found} new prospects found, {drafts_ready} email drafts ready for review"
+    sent = 0
+    for item in tokens:
+        token = item.get("token") or ""
+        provider = item.get("provider") or "expo"
+        if provider == "expo":
+            if _send_expo_push(token, title, body, {"session_id": session_id, "type": "draft_queue"}):
+                sent += 1
+    return sent
+
+
+def _list_schedule_configs() -> List[Dict[str, Any]]:
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT job_name, session_type, product, count, cron_expr, active
+        FROM schedule_configs
+        ORDER BY job_name
+    """)
+    rows = cur.fetchall()
+    return [
+        {
+            "job_name": r[0],
+            "session_type": r[1],
+            "product": r[2],
+            "count": int(r[3] or 5),
+            "cron_expr": r[4],
+            "active": bool(r[5]),
+        }
+        for r in rows
+    ]
+
+
+def run_prospect_research_session(
+    *,
+    session_id: str,
+    entity: str,
+    product: str,
+    count: int,
+    source: str = "manual",
+) -> Dict[str, Any]:
+    max_count = max(1, min(int(count or 5), 25))
+    order = 1
+    prospects_created = 0
+    drafts_created = 0
+    failures = 0
+
+    _update_work_session(session_id, status="running", metadata={"source": source, "product": product, "target_count": max_count})
+    base_query = (
+        "solar installation companies without inventory software"
+        if product == "manifest"
+        else "solar installation companies growing operations"
+    )
+
+    search_task_id = _create_task(
+        session_id=session_id,
+        task_type="web_search",
+        execution_order=order,
+        input_payload={"query": base_query, "count": max_count * 3},
+        status="running",
+    )
+    order += 1
+
+    try:
+        search_results = _run_web_search(base_query, count=max_count * 3)
+        _update_task(search_task_id, status="completed", output_payload=search_results)
+    except Exception as e:
+        _update_task(search_task_id, status="failed", error=str(e))
+        _update_work_session(session_id, status="failed", summary=f"Initial search failed: {e}")
+        return {"session_id": session_id, "prospects_created": 0, "drafts_created": 0, "status": "failed"}
+
+    raw_results = (search_results or {}).get("results") or []
+    seen_companies = set()
+
+    for result in raw_results:
+        if prospects_created >= max_count:
+            break
+        company = _parse_company_from_result(result)
+        if company.lower() in seen_companies:
+            continue
+        seen_companies.add(company.lower())
+
+        research_task_id = _create_task(
+            session_id=session_id,
+            task_type="research_company",
+            execution_order=order,
+            input_payload={"result": result, "company_name": company},
+            status="running",
+        )
+        order += 1
+
+        try:
+            contact_hints = _extract_contact_hints(result)
+            website = (result.get("url") or "").strip()
+            profile = {
+                "company_name": company,
+                "contact_name": "",
+                "contact_title": "",
+                "email": contact_hints.get("email"),
+                "phone": contact_hints.get("phone"),
+                "website": website,
+                "location": "",
+                "company_size": "",
+                "notes": (result.get("snippet") or "")[:500],
+                "source": f"web_search:{base_query}",
+                "product": product,
+                "status": "new",
+                "session_id": session_id,
+            }
+            _update_task(research_task_id, status="completed", output_payload=profile)
+        except Exception as e:
+            failures += 1
+            _update_task(research_task_id, status="failed", error=str(e))
+            continue
+
+        profile_task_id = _create_task(
+            session_id=session_id,
+            task_type="build_prospect_profile",
+            execution_order=order,
+            input_payload={"company_name": company},
+            status="running",
+        )
+        order += 1
+
+        try:
+            prospect_id = _insert_prospect(profile)
+            profile["prospect_id"] = prospect_id
+            prospects_created += 1
+            _update_task(profile_task_id, status="completed", output_payload=profile)
+        except Exception as e:
+            failures += 1
+            _update_task(profile_task_id, status="failed", error=str(e))
+            continue
+
+        draft_task_id = _create_task(
+            session_id=session_id,
+            task_type="draft_email",
+            execution_order=order,
+            input_payload={"prospect_id": prospect_id, "company_name": company, "product": product},
+            status="running",
+        )
+        order += 1
+
+        try:
+            if product == "manifest":
+                draft = _draft_manifest_email(profile, entity=entity)
+            else:
+                draft = _draft_manifest_email(profile, entity=entity)
+            draft_payload = {
+                "prospect_id": prospect_id,
+                "session_id": session_id,
+                "entity": entity,
+                "subject": draft.get("subject") or f"{company} outreach",
+                "body": draft.get("body") or "",
+                "status": "draft",
+            }
+            draft_id = _insert_email_draft(draft_payload)
+            drafts_created += 1
+            _update_task(draft_task_id, status="completed", output_payload={"draft_id": draft_id, **draft_payload})
+        except Exception as e:
+            failures += 1
+            _update_task(draft_task_id, status="failed", error=str(e))
+
+    status = "completed" if prospects_created > 0 else "failed"
+    summary = (
+        f"{prospects_created} prospects found, {drafts_created} drafts created, {failures} task failures. "
+        "No emails were sent automatically."
+    )
+    _update_work_session(
+        session_id,
+        status=status,
+        summary=summary,
+        metadata={
+            "prospects_created": prospects_created,
+            "drafts_created": drafts_created,
+            "failures": failures,
+            "source": source,
+        },
+    )
+    sent_push = _send_session_notifications(session_id, prospects_created, drafts_created)
+    if sent_push:
+        _update_work_session(session_id, metadata={"notifications_sent": sent_push})
+    return {
+        "session_id": session_id,
+        "prospects_created": prospects_created,
+        "drafts_created": drafts_created,
+        "task_failures": failures,
+        "status": status,
+        "summary": summary,
+    }
+
+
+async def _scheduled_prospect_research_job(job_name: str, product: str, count: int) -> None:
+    entity = "claude"
+    goal = f"Scheduled prospect research for {product} ({count} prospects)"
+    session_id = _create_work_session(
+        entity=entity,
+        goal=goal,
+        session_type="prospect_research",
+        metadata={"scheduled_job": job_name, "product": product, "count": count},
+        status="pending",
+    )
+    try:
+        run_prospect_research_session(
+            session_id=session_id,
+            entity=entity,
+            product=product,
+            count=count,
+            source=f"schedule:{job_name}",
+        )
+        conn = get_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute("UPDATE schedule_configs SET last_run_at = NOW(), updated_at = NOW() WHERE job_name = %s", (job_name,))
+            conn.commit()
+        except Exception:
+            _safe_rollback(conn, "_scheduled_prospect_research_job")
+    except Exception as e:
+        _update_work_session(session_id, status="failed", summary=f"Scheduled run failed: {e}")
+        logger.error("Scheduled job %s failed: %s", job_name, e)
+
+
+def sync_scheduler_jobs() -> None:
+    global scheduler
+    if scheduler is None:
+        return
+    for job in list(scheduler.get_jobs()):
+        if str(job.id).startswith("schedule-config:"):
+            scheduler.remove_job(job.id)
+
+    configs = _list_schedule_configs()
+    for cfg in configs:
+        if not cfg.get("active"):
+            continue
+        cron_expr = (cfg.get("cron_expr") or "").strip()
+        parts = cron_expr.split()
+        if len(parts) != 5:
+            logger.warning("Skipping schedule with invalid cron '%s' (%s)", cron_expr, cfg.get("job_name"))
+            continue
+        minute, hour, day, month, dow = parts
+        trigger = CronTrigger(
+            minute=minute,
+            hour=hour,
+            day=day,
+            month=month,
+            day_of_week=dow,
+            timezone=getattr(config, "APP_TIMEZONE", "America/Chicago"),
+        )
+        scheduler.add_job(
+            _scheduled_prospect_research_job,
+            trigger=trigger,
+            id=f"schedule-config:{cfg['job_name']}",
+            replace_existing=True,
+            kwargs={
+                "job_name": cfg["job_name"],
+                "product": cfg.get("product") or "manifest",
+                "count": int(cfg.get("count") or 5),
+            },
+            coalesce=True,
+            max_instances=1,
+            misfire_grace_time=300,
+        )
+
+
+async def start_scheduler_if_needed() -> None:
+    global scheduler
+    if scheduler is not None and scheduler.running:
+        return
+    scheduler = AsyncIOScheduler(timezone=getattr(config, "APP_TIMEZONE", "America/Chicago"))
+    sync_scheduler_jobs()
+    scheduler.start()
+    logger.info("APScheduler started with %s jobs", len(scheduler.get_jobs()))
 
 
 def ensure_personality_schema():
@@ -995,6 +2062,9 @@ def load_models():
     logger.info("Memory system ready")
     ensure_chat_thread_tables()
     ensure_github_actions_table()
+    ensure_code_execution_table()
+    ensure_workflow_tables()
+    ensure_default_schedule_configs()
     ensure_personality_schema()
     try:
         state.session_continuity = state.memory_manager.load_startup_continuity()
@@ -1682,6 +2752,45 @@ class GitHubCommitRequest(BaseModel):
     session_id: Optional[str] = None
 
 
+class CodeExecutionRequest(BaseModel):
+    entity: str
+    language: str
+    code: str
+    session_id: Optional[str] = None
+    timeout: int = 30
+
+
+class SessionCreateRequest(BaseModel):
+    entity: str
+    goal: str
+    session_type: str = "general"
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ProspectResearchRunRequest(BaseModel):
+    product: str = "manifest"
+    count: int = 5
+    entity: str = "claude"
+
+
+class EmailDraftRejectRequest(BaseModel):
+    feedback: Optional[str] = None
+
+
+class DeviceTokenRegisterRequest(BaseModel):
+    token: str
+    provider: str = "expo"
+    platform: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ScheduleConfigUpdateRequest(BaseModel):
+    active: Optional[bool] = None
+    cron_expr: Optional[str] = None
+    count: Optional[int] = None
+    product: Optional[str] = None
+
+
 class GitHubBranchRequest(BaseModel):
     repo: str
     branch_name: str
@@ -1710,6 +2819,11 @@ class GitHubIssueRequest(BaseModel):
 
 
 github_router = APIRouter(prefix="/github", tags=["github"])
+code_router = APIRouter(prefix="/code", tags=["code"])
+sessions_router = APIRouter(prefix="/sessions", tags=["sessions"])
+prospects_router = APIRouter(prefix="/prospects", tags=["prospects"])
+email_drafts_router = APIRouter(prefix="/email-drafts", tags=["email-drafts"])
+devices_router = APIRouter(prefix="/device-tokens", tags=["device-tokens"])
 
 
 def _normalized_entity(value: str) -> str:
@@ -1717,6 +2831,592 @@ def _normalized_entity(value: str) -> str:
     if entity not in {"claude", "sylana", "system"}:
         raise HTTPException(status_code=400, detail="entity must be claude|sylana|system")
     return entity
+
+
+def _normalized_execution_entity(value: str) -> str:
+    entity = (value or "").strip().lower()
+    if entity not in {"claude", "sylana"}:
+        raise HTTPException(status_code=400, detail="entity must be claude|sylana")
+    return entity
+
+
+def _normalized_session_type(value: str) -> str:
+    session_type = (value or "").strip().lower()
+    allowed = {"prospect_research", "email_drafting", "content", "general"}
+    if session_type not in allowed:
+        raise HTTPException(status_code=400, detail="session_type must be prospect_research|email_drafting|content|general")
+    return session_type
+
+
+def _normalized_product(value: str) -> str:
+    product = (value or "").strip().lower()
+    if product not in {"manifest", "onevine"}:
+        raise HTTPException(status_code=400, detail="product must be manifest|onevine")
+    return product
+
+
+@code_router.post("/execute")
+async def code_execute(payload: CodeExecutionRequest):
+    entity = _normalized_execution_entity(payload.entity)
+    language = (payload.language or "").strip().lower()
+    code = payload.code or ""
+    timeout_seconds = int(payload.timeout or 30)
+    timeout_seconds = max(1, min(timeout_seconds, MAX_CODE_TIMEOUT_SECONDS))
+    execution_id = str(uuid.uuid4())
+
+    run = execute_code_in_sandbox(
+        language=language,
+        code=code,
+        timeout_seconds=timeout_seconds,
+        execution_id=execution_id,
+    )
+    success = bool(run.get("return_code") == 0 and not run.get("timed_out"))
+    stderr_text = run.get("stderr") or ""
+    error_msg = None
+    if run.get("timed_out"):
+        error_msg = f"Execution timed out at {timeout_seconds}s"
+    elif not success and stderr_text:
+        error_msg = stderr_text[:10000]
+
+    output = (run.get("stdout") or "")[:MAX_EXEC_OUTPUT_BYTES]
+    files_produced = run.get("files_produced") or []
+
+    response_payload = {
+        "execution_id": execution_id,
+        "entity": entity,
+        "language": language,
+        "success": success,
+        "output": output,
+        "error": error_msg,
+        "execution_time_ms": int(run.get("execution_time_ms") or 0),
+        "files_produced": files_produced,
+        "return_code": run.get("return_code"),
+    }
+
+    _log_code_execution(
+        execution_id=execution_id,
+        entity=entity,
+        language=language,
+        code=code,
+        output=output,
+        error=error_msg,
+        return_code=run.get("return_code"),
+        success=success,
+        execution_time_ms=int(run.get("execution_time_ms") or 0),
+        files_produced=files_produced,
+        session_id=payload.session_id,
+    )
+    card_execution = dict(response_payload)
+    card_execution["code"] = code
+    card_execution["timeout"] = timeout_seconds
+    _maybe_attach_code_execution_to_thread(
+        session_id=payload.session_id,
+        entity=entity,
+        execution=card_execution,
+    )
+    return JSONResponse(content=response_payload)
+
+
+@sessions_router.post("/create")
+async def create_work_session_endpoint(payload: SessionCreateRequest):
+    entity = _normalized_execution_entity(payload.entity)
+    goal = (payload.goal or "").strip()
+    if not goal:
+        raise HTTPException(status_code=400, detail="goal is required")
+    session_type = _normalized_session_type(payload.session_type)
+    session_id = _create_work_session(
+        entity=entity,
+        goal=goal,
+        session_type=session_type,
+        metadata=payload.metadata or {},
+        status="pending",
+    )
+    return JSONResponse(content={"session_id": session_id, "status": "pending"})
+
+
+@sessions_router.get("")
+async def list_sessions(
+    page: int = 1,
+    page_size: int = 20,
+    entity: Optional[str] = None,
+    status: Optional[str] = None,
+    session_type: Optional[str] = None,
+):
+    page = max(1, int(page or 1))
+    page_size = max(1, min(int(page_size or 20), 100))
+    offset = (page - 1) * page_size
+    conn = get_connection()
+    cur = conn.cursor()
+    where = []
+    params: List[Any] = []
+
+    if entity:
+        entity_n = _normalized_execution_entity(entity)
+        where.append("s.entity = %s")
+        params.append(entity_n)
+    if status:
+        status_n = status.strip().lower()
+        if status_n not in {"pending", "running", "completed", "failed"}:
+            raise HTTPException(status_code=400, detail="status must be pending|running|completed|failed")
+        where.append("s.status = %s")
+        params.append(status_n)
+    if session_type:
+        st = _normalized_session_type(session_type)
+        where.append("s.session_type = %s")
+        params.append(st)
+
+    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+    try:
+        cur.execute(f"""
+            SELECT
+                s.session_id, s.entity, s.goal, s.status, s.session_type, s.started_at, s.completed_at, s.summary, s.metadata,
+                COALESCE(t.task_count, 0) AS task_count
+            FROM work_sessions s
+            LEFT JOIN (
+                SELECT session_id, COUNT(*) AS task_count
+                FROM tasks
+                GROUP BY session_id
+            ) t ON t.session_id = s.session_id
+            {where_sql}
+            ORDER BY s.created_at DESC
+            LIMIT %s OFFSET %s
+        """, tuple(params + [page_size, offset]))
+        rows = cur.fetchall()
+
+        cur.execute(f"SELECT COUNT(*) FROM work_sessions s {where_sql}", tuple(params))
+        total = int(cur.fetchone()[0] or 0)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to list sessions: {e}")
+
+    sessions = []
+    for r in rows:
+        sessions.append({
+            "session_id": str(r[0]),
+            "entity": r[1],
+            "goal": r[2],
+            "status": r[3],
+            "session_type": r[4],
+            "started_at": r[5].isoformat() if r[5] else None,
+            "completed_at": r[6].isoformat() if r[6] else None,
+            "summary": r[7] or "",
+            "metadata": r[8] or {},
+            "task_count": int(r[9] or 0),
+        })
+
+    return JSONResponse(content={
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "sessions": sessions,
+    })
+
+
+@sessions_router.get("/schedules/configs")
+async def list_session_schedules():
+    return JSONResponse(content={"schedules": _list_schedule_configs()})
+
+
+@sessions_router.patch("/schedules/{job_name}")
+async def update_session_schedule(job_name: str, payload: ScheduleConfigUpdateRequest):
+    updates = []
+    params: List[Any] = []
+    if payload.active is not None:
+        updates.append("active = %s")
+        params.append(bool(payload.active))
+    if payload.cron_expr is not None:
+        cron = (payload.cron_expr or "").strip()
+        if len(cron.split()) != 5:
+            raise HTTPException(status_code=400, detail="cron_expr must be five-field cron format")
+        updates.append("cron_expr = %s")
+        params.append(cron)
+    if payload.count is not None:
+        cnt = max(1, min(int(payload.count), 25))
+        updates.append("count = %s")
+        params.append(cnt)
+    if payload.product is not None:
+        prod = _normalized_product(payload.product)
+        updates.append("product = %s")
+        params.append(prod)
+    if not updates:
+        raise HTTPException(status_code=400, detail="No update fields provided")
+
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        params.append(job_name)
+        cur.execute(
+            f"UPDATE schedule_configs SET {', '.join(updates)}, updated_at = NOW() WHERE job_name = %s RETURNING job_name",
+            tuple(params),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        if not row:
+            raise HTTPException(status_code=404, detail="Schedule config not found")
+        sync_scheduler_jobs()
+        return JSONResponse(content={"job_name": job_name, "updated": True})
+    except HTTPException:
+        raise
+    except Exception as e:
+        _safe_rollback(conn, "update_session_schedule")
+        raise HTTPException(status_code=500, detail=f"Failed to update schedule config: {e}")
+
+
+@sessions_router.post("/run-prospect-research")
+async def run_prospect_research(payload: ProspectResearchRunRequest):
+    entity = _normalized_execution_entity(payload.entity)
+    product = _normalized_product(payload.product)
+    count = max(1, min(int(payload.count or 5), 25))
+    goal = f"Find {count} {product} prospects and prepare draft outreach emails"
+
+    session_id = _create_work_session(
+        entity=entity,
+        goal=goal,
+        session_type="prospect_research",
+        metadata={"product": product, "count": count},
+        status="pending",
+    )
+
+    result = run_prospect_research_session(
+        session_id=session_id,
+        entity=entity,
+        product=product,
+        count=count,
+        source="manual",
+    )
+    return JSONResponse(content=result)
+
+
+@sessions_router.get("/{session_id}")
+async def get_session_details(session_id: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT session_id, entity, goal, status, session_type, started_at, completed_at, summary, metadata, created_at
+            FROM work_sessions
+            WHERE session_id = %s::uuid
+        """, (session_id,))
+        s = cur.fetchone()
+        if not s:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        cur.execute("""
+            SELECT task_id, task_type, status, input, output, error, started_at, completed_at, execution_order, created_at
+            FROM tasks
+            WHERE session_id = %s::uuid
+            ORDER BY execution_order ASC, created_at ASC
+        """, (session_id,))
+        t_rows = cur.fetchall()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load session: {e}")
+
+    tasks = []
+    for r in t_rows:
+        tasks.append({
+            "task_id": str(r[0]),
+            "task_type": r[1],
+            "status": r[2],
+            "input": r[3] or {},
+            "output": r[4] or {},
+            "error": r[5],
+            "started_at": r[6].isoformat() if r[6] else None,
+            "completed_at": r[7].isoformat() if r[7] else None,
+            "execution_order": int(r[8] or 0),
+            "created_at": r[9].isoformat() if r[9] else None,
+        })
+
+    return JSONResponse(content={
+        "session": {
+            "session_id": str(s[0]),
+            "entity": s[1],
+            "goal": s[2],
+            "status": s[3],
+            "session_type": s[4],
+            "started_at": s[5].isoformat() if s[5] else None,
+            "completed_at": s[6].isoformat() if s[6] else None,
+            "summary": s[7] or "",
+            "metadata": s[8] or {},
+            "created_at": s[9].isoformat() if s[9] else None,
+            "tasks": tasks,
+        }
+    })
+
+
+@prospects_router.get("")
+async def list_prospects(
+    page: int = 1,
+    page_size: int = 20,
+    product: Optional[str] = None,
+    status: Optional[str] = None,
+):
+    page = max(1, int(page or 1))
+    page_size = max(1, min(int(page_size or 20), 100))
+    offset = (page - 1) * page_size
+    conn = get_connection()
+    cur = conn.cursor()
+    where = []
+    params: List[Any] = []
+
+    if product:
+        prod = _normalized_product(product)
+        where.append("p.product = %s")
+        params.append(prod)
+    if status:
+        st = status.strip().lower()
+        allowed = {"new", "email_drafted", "email_sent", "responded", "converted", "not_interested"}
+        if st not in allowed:
+            raise HTTPException(status_code=400, detail="invalid prospect status filter")
+        where.append("p.status = %s")
+        params.append(st)
+
+    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+    try:
+        cur.execute(f"""
+            SELECT
+                p.prospect_id, p.company_name, p.contact_name, p.contact_title, p.email, p.phone, p.website,
+                p.location, p.company_size, p.notes, p.source, p.product, p.status, p.created_at, p.updated_at, p.session_id
+            FROM prospects p
+            {where_sql}
+            ORDER BY p.created_at DESC
+            LIMIT %s OFFSET %s
+        """, tuple(params + [page_size, offset]))
+        rows = cur.fetchall()
+        cur.execute(f"SELECT COUNT(*) FROM prospects p {where_sql}", tuple(params))
+        total = int(cur.fetchone()[0] or 0)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to list prospects: {e}")
+
+    prospect_ids = [str(r[0]) for r in rows]
+    drafts_by_prospect: Dict[str, List[Dict[str, Any]]] = {}
+    if prospect_ids:
+        cur.execute("""
+            SELECT draft_id, prospect_id, session_id, entity, subject, body, status, feedback, created_at, approved_at, sent_at
+            FROM email_drafts
+            WHERE prospect_id = ANY(%s::uuid[])
+            ORDER BY created_at DESC
+        """, (prospect_ids,))
+        for d in cur.fetchall():
+            pid = str(d[1])
+            drafts_by_prospect.setdefault(pid, []).append({
+                "draft_id": str(d[0]),
+                "prospect_id": str(d[1]),
+                "session_id": str(d[2]) if d[2] else None,
+                "entity": d[3],
+                "subject": d[4],
+                "body": d[5],
+                "status": d[6],
+                "feedback": d[7],
+                "created_at": d[8].isoformat() if d[8] else None,
+                "approved_at": d[9].isoformat() if d[9] else None,
+                "sent_at": d[10].isoformat() if d[10] else None,
+            })
+
+    prospects = []
+    for r in rows:
+        pid = str(r[0])
+        prospects.append({
+            "prospect_id": pid,
+            "company_name": r[1],
+            "contact_name": r[2],
+            "contact_title": r[3],
+            "email": r[4],
+            "phone": r[5],
+            "website": r[6],
+            "location": r[7],
+            "company_size": r[8],
+            "notes": r[9],
+            "source": r[10],
+            "product": r[11],
+            "status": r[12],
+            "created_at": r[13].isoformat() if r[13] else None,
+            "updated_at": r[14].isoformat() if r[14] else None,
+            "session_id": str(r[15]) if r[15] else None,
+            "email_drafts": drafts_by_prospect.get(pid, []),
+        })
+
+    return JSONResponse(content={
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "prospects": prospects,
+    })
+
+
+@prospects_router.get("/{prospect_id}")
+async def get_prospect(prospect_id: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT prospect_id, company_name, contact_name, contact_title, email, phone, website, location,
+                   company_size, notes, source, product, status, created_at, updated_at, session_id
+            FROM prospects
+            WHERE prospect_id = %s::uuid
+        """, (prospect_id,))
+        p = cur.fetchone()
+        if not p:
+            raise HTTPException(status_code=404, detail="Prospect not found")
+
+        cur.execute("""
+            SELECT draft_id, prospect_id, session_id, entity, subject, body, status, feedback, created_at, approved_at, sent_at
+            FROM email_drafts
+            WHERE prospect_id = %s::uuid
+            ORDER BY created_at DESC
+        """, (prospect_id,))
+        d_rows = cur.fetchall()
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load prospect: {e}")
+
+    drafts = []
+    for d in d_rows:
+        drafts.append({
+            "draft_id": str(d[0]),
+            "prospect_id": str(d[1]),
+            "session_id": str(d[2]) if d[2] else None,
+            "entity": d[3],
+            "subject": d[4],
+            "body": d[5],
+            "status": d[6],
+            "feedback": d[7],
+            "created_at": d[8].isoformat() if d[8] else None,
+            "approved_at": d[9].isoformat() if d[9] else None,
+            "sent_at": d[10].isoformat() if d[10] else None,
+        })
+
+    return JSONResponse(content={
+        "prospect": {
+            "prospect_id": str(p[0]),
+            "company_name": p[1],
+            "contact_name": p[2],
+            "contact_title": p[3],
+            "email": p[4],
+            "phone": p[5],
+            "website": p[6],
+            "location": p[7],
+            "company_size": p[8],
+            "notes": p[9],
+            "source": p[10],
+            "product": p[11],
+            "status": p[12],
+            "created_at": p[13].isoformat() if p[13] else None,
+            "updated_at": p[14].isoformat() if p[14] else None,
+            "session_id": str(p[15]) if p[15] else None,
+            "email_drafts": drafts,
+        }
+    })
+
+
+@email_drafts_router.get("")
+async def list_pending_email_drafts():
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT draft_id, prospect_id, session_id, entity, subject, body, status, feedback, created_at, approved_at, sent_at
+            FROM email_drafts
+            WHERE status = 'draft'
+            ORDER BY created_at ASC
+        """)
+        rows = cur.fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to list drafts: {e}")
+
+    drafts = []
+    for d in rows:
+        drafts.append({
+            "draft_id": str(d[0]),
+            "prospect_id": str(d[1]) if d[1] else None,
+            "session_id": str(d[2]) if d[2] else None,
+            "entity": d[3],
+            "subject": d[4],
+            "body": d[5],
+            "status": d[6],
+            "feedback": d[7],
+            "created_at": d[8].isoformat() if d[8] else None,
+            "approved_at": d[9].isoformat() if d[9] else None,
+            "sent_at": d[10].isoformat() if d[10] else None,
+        })
+    return JSONResponse(content={"drafts": drafts})
+
+
+@email_drafts_router.patch("/{draft_id}/approve")
+async def approve_email_draft(draft_id: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            UPDATE email_drafts
+            SET status = 'approved', approved_at = NOW()
+            WHERE draft_id = %s::uuid
+            RETURNING draft_id
+        """, (draft_id,))
+        row = cur.fetchone()
+        conn.commit()
+        if not row:
+            raise HTTPException(status_code=404, detail="Draft not found")
+        return JSONResponse(content={"draft_id": draft_id, "status": "approved"})
+    except HTTPException:
+        raise
+    except Exception as e:
+        _safe_rollback(conn, "approve_email_draft")
+        raise HTTPException(status_code=500, detail=f"Failed to approve draft: {e}")
+
+
+@email_drafts_router.patch("/{draft_id}/reject")
+async def reject_email_draft(draft_id: str, payload: EmailDraftRejectRequest):
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            UPDATE email_drafts
+            SET status = 'rejected', feedback = %s
+            WHERE draft_id = %s::uuid
+            RETURNING draft_id
+        """, ((payload.feedback or "").strip() or None, draft_id))
+        row = cur.fetchone()
+        conn.commit()
+        if not row:
+            raise HTTPException(status_code=404, detail="Draft not found")
+        return JSONResponse(content={"draft_id": draft_id, "status": "rejected"})
+    except HTTPException:
+        raise
+    except Exception as e:
+        _safe_rollback(conn, "reject_email_draft")
+        raise HTTPException(status_code=500, detail=f"Failed to reject draft: {e}")
+
+
+@devices_router.post("/register")
+async def register_device_token(payload: DeviceTokenRegisterRequest):
+    token = (payload.token or "").strip()
+    if not token:
+        raise HTTPException(status_code=400, detail="token is required")
+    provider = (payload.provider or "expo").strip().lower()
+    if provider not in {"expo", "fcm"}:
+        raise HTTPException(status_code=400, detail="provider must be expo|fcm")
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO device_tokens (token, provider, platform, active, metadata, updated_at)
+            VALUES (%s, %s, %s, TRUE, %s::jsonb, NOW())
+            ON CONFLICT (token) DO UPDATE
+            SET provider = EXCLUDED.provider,
+                platform = EXCLUDED.platform,
+                active = TRUE,
+                metadata = EXCLUDED.metadata,
+                updated_at = NOW()
+            RETURNING token_id
+        """, (token, provider, payload.platform, json.dumps(payload.metadata or {})))
+        token_id = str(cur.fetchone()[0])
+        conn.commit()
+        return JSONResponse(content={"token_id": token_id, "active": True})
+    except Exception as e:
+        _safe_rollback(conn, "register_device_token")
+        raise HTTPException(status_code=500, detail=f"Failed to register token: {e}")
 
 
 @github_router.post("/commit")
@@ -2045,6 +3745,7 @@ async def lifespan(app: FastAPI):
     async def _bg_init():
         try:
             await asyncio.to_thread(load_models)
+            await start_scheduler_if_needed()
         except Exception:
             logger.exception("Background model initialization failed")
 
@@ -2055,6 +3756,9 @@ async def lifespan(app: FastAPI):
         state.memory_manager.close()
     if state.relationship_db:
         state.relationship_db.close()
+    global scheduler
+    if scheduler is not None and scheduler.running:
+        scheduler.shutdown(wait=False)
     logger.info("Sylana Vessel Server shut down")
 
 
@@ -2065,6 +3769,11 @@ app = FastAPI(
     lifespan=lifespan
 )
 app.include_router(github_router)
+app.include_router(code_router)
+app.include_router(sessions_router)
+app.include_router(prospects_router)
+app.include_router(email_drafts_router)
+app.include_router(devices_router)
 
 # Cross-origin support for mobile/web clients hitting deployed API domains.
 app.add_middleware(
