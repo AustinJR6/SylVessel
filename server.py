@@ -1100,6 +1100,309 @@ def _build_user_context(active_tools: List[str]) -> Dict[str, Any]:
     return ctx
 
 
+def _runtime_tool_specs(active_tools: Optional[List[str]]) -> List[Dict[str, Any]]:
+    active = {str(t or "").strip().lower() for t in (active_tools or [])}
+    specs: List[Dict[str, Any]] = []
+
+    if "github" in active:
+        specs.extend([
+            {
+                "name": "github_list_repos",
+                "description": "List accessible GitHub repositories for the configured token.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 100}
+                    },
+                },
+            },
+            {
+                "name": "github_repo_tree",
+                "description": "Get repository file tree for a branch.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "repo": {"type": "string", "description": "owner/repo"},
+                        "branch": {"type": "string", "description": "Branch name"},
+                    },
+                    "required": ["repo"],
+                },
+            },
+            {
+                "name": "github_get_file",
+                "description": "Read a text file from a GitHub repository branch.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "repo": {"type": "string", "description": "owner/repo"},
+                        "file_path": {"type": "string", "description": "Path to file in repository"},
+                        "branch": {"type": "string", "description": "Branch name"},
+                    },
+                    "required": ["repo", "file_path"],
+                },
+            },
+        ])
+
+    if "outreach" in active:
+        specs.extend([
+            {
+                "name": "outreach_summary",
+                "description": "Get aggregate outreach counters for prospects and drafts.",
+                "input_schema": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "outreach_list_prospects",
+                "description": "List outreach prospects with status and key contact fields.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "product": {"type": "string", "description": "manifest or onevine"},
+                        "status": {"type": "string", "description": "Prospect status filter"},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                    },
+                },
+            },
+            {
+                "name": "outreach_list_pending_drafts",
+                "description": "List pending outreach email drafts.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                    },
+                },
+            },
+            {
+                "name": "outreach_resend_health",
+                "description": "Check whether Resend API credentials are working for outreach email sending.",
+                "input_schema": {"type": "object", "properties": {}},
+            },
+        ])
+
+    if "work_sessions" in active:
+        specs.append(
+            {
+                "name": "work_sessions_list",
+                "description": "List recent autonomous work sessions.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "status": {"type": "string"},
+                        "session_type": {"type": "string"},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+                    },
+                },
+            }
+        )
+
+    return specs
+
+
+def _runtime_tool_runner(name: str, tool_input: Dict[str, Any]) -> Dict[str, Any]:
+    tool_input = tool_input or {}
+
+    if name == "github_list_repos":
+        client = _get_github_client()
+        limit = max(1, min(int(tool_input.get("limit") or 30), 100))
+        repos = client.list_repos()[:limit]
+        return {
+            "count": len(repos),
+            "repos": [
+                {
+                    "full_name": r.get("full_name"),
+                    "private": bool(r.get("private")),
+                    "default_branch": r.get("default_branch"),
+                    "updated_at": r.get("updated_at"),
+                    "html_url": r.get("html_url"),
+                }
+                for r in repos
+            ],
+        }
+
+    if name == "github_repo_tree":
+        repo = _validate_repo_name(tool_input.get("repo") or "")
+        branch = (tool_input.get("branch") or "main").strip()
+        client = _get_github_client()
+        _require_repo_access(client, repo, access="read")
+        tree = client.get_repo_tree(repo, branch)
+        nodes = (tree or {}).get("tree") or []
+        return {
+            "repo": repo,
+            "branch": branch,
+            "node_count": len(nodes),
+            "nodes": [
+                {
+                    "path": n.get("path"),
+                    "type": n.get("type"),
+                    "size": n.get("size"),
+                }
+                for n in nodes[:500]
+            ],
+            "truncated": len(nodes) > 500,
+        }
+
+    if name == "github_get_file":
+        repo = _validate_repo_name(tool_input.get("repo") or "")
+        file_path = (tool_input.get("file_path") or "").strip().lstrip("/")
+        branch = (tool_input.get("branch") or "main").strip()
+        if not file_path:
+            return {"error": "file_path is required"}
+        client = _get_github_client()
+        _require_repo_access(client, repo, access="read")
+        file_obj = client.get_file(repo, file_path, branch)
+        encoded = (file_obj or {}).get("content") or ""
+        if isinstance(encoded, str):
+            encoded = encoded.replace("\n", "")
+        decoded = ""
+        if encoded:
+            try:
+                decoded = base64.b64decode(encoded.encode("utf-8")).decode("utf-8", errors="replace")
+            except Exception:
+                decoded = ""
+        return {
+            "repo": repo,
+            "branch": branch,
+            "path": file_obj.get("path"),
+            "sha": file_obj.get("sha"),
+            "size": file_obj.get("size"),
+            "html_url": file_obj.get("html_url"),
+            "content": decoded[:50000],
+            "content_truncated": len(decoded) > 50000,
+        }
+
+    if name == "outreach_summary":
+        return _get_outreach_summary()
+
+    if name == "outreach_list_prospects":
+        limit = max(1, min(int(tool_input.get("limit") or 20), 100))
+        product = (tool_input.get("product") or "").strip().lower()
+        status = (tool_input.get("status") or "").strip().lower()
+        conn = get_connection()
+        cur = conn.cursor()
+        where = []
+        params: List[Any] = []
+        if product:
+            if product not in {"manifest", "onevine"}:
+                return {"error": "product must be manifest|onevine"}
+            where.append("product = %s")
+            params.append(product)
+        if status:
+            where.append("status = %s")
+            params.append(status)
+        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+        cur.execute(f"""
+            SELECT prospect_id, company_name, contact_name, contact_title, email, product, status, created_at
+            FROM prospects
+            {where_sql}
+            ORDER BY created_at DESC
+            LIMIT %s
+        """, tuple(params + [limit]))
+        rows = cur.fetchall()
+        return {
+            "count": len(rows),
+            "prospects": [
+                {
+                    "prospect_id": str(r[0]),
+                    "company_name": r[1],
+                    "contact_name": r[2],
+                    "contact_title": r[3],
+                    "email": r[4],
+                    "product": r[5],
+                    "status": r[6],
+                    "created_at": r[7].isoformat() if r[7] else None,
+                }
+                for r in rows
+            ],
+        }
+
+    if name == "outreach_list_pending_drafts":
+        limit = max(1, min(int(tool_input.get("limit") or 20), 100))
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT d.draft_id, d.prospect_id, d.subject, d.status, d.created_at, p.company_name, p.contact_name, p.email
+            FROM email_drafts d
+            LEFT JOIN prospects p ON p.prospect_id = d.prospect_id
+            WHERE d.status IN ('draft', 'approved')
+            ORDER BY d.created_at DESC
+            LIMIT %s
+        """, (limit,))
+        rows = cur.fetchall()
+        return {
+            "count": len(rows),
+            "drafts": [
+                {
+                    "draft_id": str(r[0]),
+                    "prospect_id": str(r[1]) if r[1] else None,
+                    "subject": r[2],
+                    "status": r[3],
+                    "created_at": r[4].isoformat() if r[4] else None,
+                    "company_name": r[5],
+                    "contact_name": r[6],
+                    "email": r[7],
+                }
+                for r in rows
+            ],
+        }
+
+    if name == "outreach_resend_health":
+        api_key = (getattr(config, "RESEND_API_KEY", "") or "").strip()
+        if not api_key:
+            return {"ok": False, "error": "RESEND_API_KEY is not configured"}
+        req = UrlRequest(
+            "https://api.resend.com/domains",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            method="GET",
+        )
+        with urlopen(req, timeout=12) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        domains = payload.get("data") or []
+        return {"ok": True, "domain_count": len(domains)}
+
+    if name == "work_sessions_list":
+        status = (tool_input.get("status") or "").strip().lower()
+        session_type = (tool_input.get("session_type") or "").strip().lower()
+        limit = max(1, min(int(tool_input.get("limit") or 10), 50))
+        conn = get_connection()
+        cur = conn.cursor()
+        where = []
+        params: List[Any] = []
+        if status:
+            where.append("status = %s")
+            params.append(status)
+        if session_type:
+            where.append("session_type = %s")
+            params.append(session_type)
+        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+        cur.execute(f"""
+            SELECT session_id, entity, goal, status, session_type, created_at
+            FROM work_sessions
+            {where_sql}
+            ORDER BY created_at DESC
+            LIMIT %s
+        """, tuple(params + [limit]))
+        rows = cur.fetchall()
+        return {
+            "count": len(rows),
+            "sessions": [
+                {
+                    "session_id": str(r[0]),
+                    "entity": r[1],
+                    "goal": r[2],
+                    "status": r[3],
+                    "session_type": r[4],
+                    "created_at": r[5].isoformat() if r[5] else None,
+                }
+                for r in rows
+            ],
+        }
+
+    return {"error": f"Unknown tool: {name}"}
+
+
 def _get_thread_tools(thread_id: int) -> List[str]:
     conn = get_connection()
     cur = conn.cursor()
@@ -2670,6 +2973,10 @@ def load_models():
     state.claude_model = ClaudeModel(
         api_key=config.ANTHROPIC_API_KEY,
         model=config.CLAUDE_MODEL,
+    )
+    state.claude_model.set_external_tools(
+        provider=_runtime_tool_specs,
+        runner=_runtime_tool_runner,
     )
     logger.info("Claude model initialized")
 

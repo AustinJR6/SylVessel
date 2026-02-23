@@ -319,6 +319,110 @@
             text-decoration: underline;
         }
 
+        .code-card {
+            background: linear-gradient(170deg, #1f1b2f, #131726);
+            border: 1px solid #3b3561;
+            border-radius: 14px;
+            padding: 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .code-card-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+        }
+
+        .code-card-type {
+            font-size: 10px;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+            color: #c4b5fd;
+            background: rgba(124, 58, 237, 0.14);
+            border: 1px solid rgba(167, 139, 250, 0.35);
+            border-radius: 999px;
+            padding: 3px 8px;
+        }
+
+        .code-card-run {
+            background: transparent;
+            color: #ddd6fe;
+            border: 1px solid #6d5dd3;
+            border-radius: 8px;
+            font-size: 11px;
+            padding: 4px 8px;
+            cursor: pointer;
+        }
+
+        .code-card-run:hover {
+            background: rgba(124, 58, 237, 0.16);
+        }
+
+        .code-block {
+            margin: 0;
+            border-radius: 10px;
+            background: #0b1020;
+            border: 1px solid #2f3e66;
+            color: #c7d2fe;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: 12px;
+            line-height: 1.45;
+            padding: 10px 12px;
+            white-space: pre-wrap;
+            overflow-x: auto;
+        }
+
+        .code-output-title {
+            font-size: 11px;
+            color: var(--text-dim);
+        }
+
+        .code-output {
+            margin: 0;
+            border-radius: 10px;
+            background: #0c1725;
+            border: 1px solid #24415e;
+            color: #bae6fd;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: 12px;
+            line-height: 1.45;
+            padding: 10px 12px;
+            white-space: pre-wrap;
+            overflow-x: auto;
+        }
+
+        .code-error {
+            margin: 0;
+            border-radius: 10px;
+            background: #2b1116;
+            border: 1px solid #7f1d1d;
+            color: #fecaca;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: 12px;
+            line-height: 1.45;
+            padding: 10px 12px;
+            white-space: pre-wrap;
+            overflow-x: auto;
+        }
+
+        .file-list {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+
+        .file-card {
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 7px 9px;
+            font-size: 12px;
+            color: var(--text-dim);
+            background: rgba(15, 23, 42, 0.45);
+        }
+
         .typing-indicator {
             display: inline-flex;
             gap: 4px;
@@ -598,6 +702,21 @@
         let currentThreadId = null;
         let loadedThreads = [];
         let personalities = ['sylana', 'claude'];
+        const defaultActiveTools = ['web_search', 'memories', 'github', 'outreach', 'work_sessions'];
+        let currentActiveTools = [...defaultActiveTools];
+        const codeRunCache = {};
+        let codeRunSeq = 0;
+
+        function normalizeActiveTools(tools) {
+            if (!Array.isArray(tools) || tools.length === 0) return [...defaultActiveTools];
+            const out = [];
+            for (const raw of tools) {
+                const val = String(raw || '').trim().toLowerCase();
+                if (!val || out.includes(val)) continue;
+                out.push(val);
+            }
+            return out.length ? out : [...defaultActiveTools];
+        }
 
         function formatPersonaName(personality) {
             if (!personality) return 'Sylana';
@@ -668,6 +787,7 @@
             try {
                 const res = await fetch(`/api/threads/${threadId}/messages?limit=500`);
                 const data = await res.json();
+                currentActiveTools = normalizeActiveTools(data.active_tools);
                 const msgs = data.messages || [];
                 for (const msg of msgs) {
                     if (msg.role === 'user') {
@@ -704,11 +824,12 @@
                 const res = await fetch('/api/threads', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ title: 'New Thread' })
+                    body: JSON.stringify({ title: 'New Thread', active_tools: currentActiveTools })
                 });
                 const thread = await res.json();
                 await refreshThreads(false);
                 currentThreadId = thread.id;
+                currentActiveTools = normalizeActiveTools(thread.active_tools);
                 renderThreadList();
                 clearChatView();
             } catch (e) {
@@ -782,6 +903,93 @@
             return '';
         }
 
+        function formatBytes(bytes) {
+            const n = Number(bytes || 0);
+            if (n < 1024) return `${n} B`;
+            if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+            return `${(n / (1024 * 1024)).toFixed(2)} MB`;
+        }
+
+        function renderProducedFiles(files) {
+            if (!Array.isArray(files) || files.length === 0) return '';
+            const html = files.map((f) => {
+                const name = escapeHtml(f.name || 'file');
+                const size = escapeHtml(formatBytes(f.size_bytes || 0));
+                if (f.uploaded && f.gcs_uri) {
+                    return `<div class="file-card">${name} · ${size}<br><span>${escapeHtml(f.gcs_uri)}</span></div>`;
+                }
+                const err = f.error ? ` · ${escapeHtml(f.error)}` : '';
+                return `<div class="file-card">${name} · ${size}${err}</div>`;
+            }).join('');
+            return `<div class="file-list">${html}</div>`;
+        }
+
+        function renderCodeExecutionCard(execution) {
+            if (!execution) return '';
+            const language = String(execution.language || 'code');
+            const code = String(execution.code || '').trim();
+            const output = String(execution.output || '').trim();
+            const error = execution.error ? String(execution.error) : '';
+            const status = execution.success ? 'Success' : 'Failed';
+            const timing = `${execution.execution_time_ms || 0} ms`;
+            let rerunHtml = '';
+            if (code) {
+                const key = `run_${++codeRunSeq}`;
+                codeRunCache[key] = execution;
+                rerunHtml = `<button class="code-card-run" onclick="rerunCodeExecution('${key}')">Re-run</button>`;
+            }
+            const filesHtml = renderProducedFiles(execution.files_produced || []);
+            return `
+                <div class="code-card">
+                    <div class="code-card-head">
+                        <span class="code-card-type">Code ${escapeHtml(status)} · ${escapeHtml(language)}</span>
+                        ${rerunHtml}
+                    </div>
+                    <div class="code-output-title">${escapeHtml(timing)}</div>
+                    <pre class="code-block">${escapeHtml(code || '// code unavailable')}</pre>
+                    <div class="code-output-title">Output</div>
+                    <pre class="code-output">${escapeHtml(output || '(no stdout)')}</pre>
+                    ${error ? `<div class="code-output-title">Error</div><pre class="code-error">${escapeHtml(error)}</pre>` : ''}
+                    ${filesHtml}
+                </div>
+            `;
+        }
+
+        async function rerunCodeExecution(cacheKey) {
+            const execution = codeRunCache[cacheKey];
+            if (!execution || !execution.code || !execution.language) return;
+            if (!currentThreadId) {
+                await createNewThread();
+            }
+            const payload = {
+                entity: String(execution.entity || personalitySelect.value || 'sylana').toLowerCase(),
+                language: String(execution.language || '').toLowerCase(),
+                code: execution.code,
+                timeout: Number(execution.timeout || 30),
+                session_id: String(currentThreadId),
+            };
+            try {
+                const res = await fetch('/code/execute', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload),
+                });
+                const data = await res.json();
+                if (!res.ok) {
+                    const msg = data && data.detail ? String(data.detail) : 'Code execution failed';
+                    addMessage('assistant', msg, null, null, payload.entity);
+                    return;
+                }
+                data.code = payload.code;
+                data.timeout = payload.timeout;
+                addMessage('assistant', 'Code execution result', null, null, payload.entity, { code_execution: data });
+                await refreshThreads(false);
+                renderThreadList();
+            } catch (e) {
+                addMessage('assistant', 'Code execution request failed.', null, null, payload.entity);
+            }
+        }
+
         function addMessage(role, text, emotion, voiceScore, personality = 'sylana', metadata = null) {
             const welcomeNode = document.getElementById('welcome');
             if (welcomeNode) welcomeNode.style.display = 'none';
@@ -803,7 +1011,9 @@
                 }
             }
 
-            const cardHtml = renderGitHubCard(metadata && metadata.github_card ? metadata.github_card : null);
+            const gitHubCard = metadata && metadata.github_card ? renderGitHubCard(metadata.github_card) : '';
+            const codeCard = metadata && metadata.code_execution ? renderCodeExecutionCard(metadata.code_execution) : '';
+            const cardHtml = gitHubCard || codeCard;
             const bubbleContent = cardHtml || escapeHtml(text);
             msg.innerHTML = `
                 <div class="message-header">${headerHTML}</div>
@@ -868,7 +1078,12 @@
                 const response = await fetch('/api/chat', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ message: text, thread_id: currentThreadId, personality })
+                    body: JSON.stringify({
+                        message: text,
+                        thread_id: currentThreadId,
+                        personality,
+                        active_tools: currentActiveTools,
+                    })
                 });
 
                 const reader = response.body.getReader();

@@ -7,7 +7,7 @@ import os
 import json
 import logging
 from datetime import datetime
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
@@ -36,6 +36,17 @@ class ClaudeModel:
             logger.warning(
                 "ENABLE_WEB_SEARCH is true but BRAVE_SEARCH_API_KEY is missing; web search tools are disabled"
             )
+        self.external_tools_provider: Optional[Callable[[Optional[List[str]]], List[Dict[str, Any]]]] = None
+        self.external_tool_runner: Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]] = None
+
+    def set_external_tools(
+        self,
+        provider: Optional[Callable[[Optional[List[str]]], List[Dict[str, Any]]]] = None,
+        runner: Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]] = None,
+    ) -> None:
+        """Register app-specific tools and handlers."""
+        self.external_tools_provider = provider
+        self.external_tool_runner = runner
 
     def _format_current_time_line(self) -> str:
         tz_name = self.timezone or "America/Chicago"
@@ -109,30 +120,38 @@ class ClaudeModel:
         return "".join(parts).strip()
 
     def _tools(self, active_tools: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        tools: List[Dict[str, Any]] = []
         allow_web_search = True
         if active_tools is not None:
             allow_web_search = "web_search" in {str(t or "").strip().lower() for t in active_tools}
-        if not self.enable_web_search or not allow_web_search:
-            return []
-        return [
-            {
-                "name": "web_search",
-                "description": "Search the public web for current information and sources.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string", "description": "Search query."},
-                        "count": {
-                            "type": "integer",
-                            "description": "Number of results to return.",
-                            "minimum": 1,
-                            "maximum": 8,
+        if self.enable_web_search and allow_web_search:
+            tools.append(
+                {
+                    "name": "web_search",
+                    "description": "Search the public web for current information and sources.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string", "description": "Search query."},
+                            "count": {
+                                "type": "integer",
+                                "description": "Number of results to return.",
+                                "minimum": 1,
+                                "maximum": 8,
+                            },
                         },
+                        "required": ["query"],
                     },
-                    "required": ["query"],
-                },
-            }
-        ]
+                }
+            )
+        if self.external_tools_provider:
+            try:
+                extra_tools = self.external_tools_provider(active_tools)
+                if extra_tools:
+                    tools.extend(extra_tools)
+            except Exception as e:
+                logger.warning("External tools provider failed: %s", e)
+        return tools
 
     def _brave_web_search(self, query: str, count: int = 5) -> Dict[str, Any]:
         safe_count = max(1, min(int(count or 5), 8))
@@ -164,17 +183,23 @@ class ClaudeModel:
         return {"query": query, "count": safe_count, "results": rows}
 
     def _run_tool_call(self, name: str, tool_input: Dict[str, Any]) -> Dict[str, Any]:
-        if name != "web_search":
-            return {"error": f"Unknown tool: {name}"}
-        query = (tool_input or {}).get("query")
-        count = (tool_input or {}).get("count", 5)
-        if not query:
-            return {"error": "Missing required field: query"}
-        try:
-            return self._brave_web_search(str(query), int(count or 5))
-        except Exception as e:
-            logger.warning("web_search tool failed: %s", e)
-            return {"error": f"web_search_failed: {e}", "query": str(query)}
+        if name == "web_search":
+            query = (tool_input or {}).get("query")
+            count = (tool_input or {}).get("count", 5)
+            if not query:
+                return {"error": "Missing required field: query"}
+            try:
+                return self._brave_web_search(str(query), int(count or 5))
+            except Exception as e:
+                logger.warning("web_search tool failed: %s", e)
+                return {"error": f"web_search_failed: {e}", "query": str(query)}
+        if self.external_tool_runner:
+            try:
+                return self.external_tool_runner(name, tool_input or {})
+            except Exception as e:
+                logger.warning("External tool '%s' failed: %s", name, e)
+                return {"error": f"external_tool_failed: {e}", "tool": name}
+        return {"error": f"Unknown tool: {name}"}
 
     def _generate_with_tools(
         self,
