@@ -3468,6 +3468,7 @@ sessions_router = APIRouter(prefix="/sessions", tags=["sessions"])
 prospects_router = APIRouter(prefix="/prospects", tags=["prospects"])
 email_drafts_router = APIRouter(prefix="/email-drafts", tags=["email-drafts"])
 devices_router = APIRouter(prefix="/device-tokens", tags=["device-tokens"])
+tracking_router = APIRouter(tags=["tracking"])
 
 
 def _normalized_entity(value: str) -> str:
@@ -4228,7 +4229,7 @@ async def send_approved_drafts_batch(payload: EmailDraftBatchSendRequest):
     return JSONResponse(content={"success": True, "sent": len(sent), "results": sent, "skipped": skipped})
 
 
-@app.get("/track/open/{tracking_id}")
+@tracking_router.get("/track/open/{tracking_id}")
 async def track_open(tracking_id: str):
     conn = get_connection()
     cur = conn.cursor()
@@ -4272,7 +4273,7 @@ async def track_open(tracking_id: str):
     return Response(content=_transparent_gif_bytes(), media_type="image/gif")
 
 
-@app.get("/track/click/{tracking_id}")
+@tracking_router.get("/track/click/{tracking_id}")
 async def track_click(tracking_id: str, url: str):
     conn = get_connection()
     cur = conn.cursor()
@@ -4770,6 +4771,7 @@ app.include_router(sessions_router)
 app.include_router(prospects_router)
 app.include_router(email_drafts_router)
 app.include_router(devices_router)
+app.include_router(tracking_router)
 
 # Cross-origin support for mobile/web clients hitting deployed API domains.
 app.add_middleware(
