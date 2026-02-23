@@ -36,10 +36,12 @@ from urllib.error import HTTPError, URLError
 from fastapi import FastAPI, Request, APIRouter, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, RedirectResponse
 from pydantic import BaseModel, Field
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from svix.webhooks import Webhook, WebhookVerificationError
+import resend
 from sse_starlette.sse import EventSourceResponse
 from anthropic import (
     APIConnectionError,
@@ -907,6 +909,20 @@ scheduler: Optional[AsyncIOScheduler] = None
 REPETITION_PENALTY = 1.15
 NO_REPEAT_NGRAM_SIZE = 4
 
+DEFAULT_ACTIVE_TOOLS = ["web_search", "memories"]
+AVAILABLE_TOOLS: List[Dict[str, str]] = [
+    {"key": "web_search", "display_name": "Web Search", "icon": "globe", "description": "Search current web information when needed."},
+    {"key": "code_execution", "display_name": "Code Execution", "icon": "terminal", "description": "Run Python, JavaScript, and bash securely."},
+    {"key": "files", "display_name": "Files", "icon": "file-text", "description": "Create and retrieve files generated in sessions."},
+    {"key": "health_data", "display_name": "Health Data", "icon": "heart-pulse", "description": "Use health metrics like sleep, steps, heart rate, and stress."},
+    {"key": "work_sessions", "display_name": "Work Sessions", "icon": "briefcase", "description": "Create and run autonomous work sessions."},
+    {"key": "github", "display_name": "GitHub", "icon": "github", "description": "Read repositories, commit files, and open pull requests."},
+    {"key": "photos", "display_name": "Photos", "icon": "image", "description": "Reference tagged photo memories and moments."},
+    {"key": "memories", "display_name": "Memories", "icon": "brain", "description": "Use long-term conversation memory and context."},
+    {"key": "outreach", "display_name": "Outreach", "icon": "mail", "description": "Access prospecting, drafts, and outreach performance."},
+]
+AVAILABLE_TOOL_KEYS = {t["key"] for t in AVAILABLE_TOOLS}
+
 
 # ============================================================================
 # CHAT THREAD STORAGE
@@ -921,10 +937,14 @@ def ensure_chat_thread_tables():
             CREATE TABLE IF NOT EXISTS chat_threads (
                 id BIGSERIAL PRIMARY KEY,
                 title TEXT NOT NULL DEFAULT 'New Thread',
+                active_tools JSONB NOT NULL DEFAULT '["web_search","memories"]'::jsonb,
+                conversation_metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
+        cur.execute("""ALTER TABLE chat_threads ADD COLUMN IF NOT EXISTS active_tools JSONB NOT NULL DEFAULT '["web_search","memories"]'::jsonb""")
+        cur.execute("""ALTER TABLE chat_threads ADD COLUMN IF NOT EXISTS conversation_metadata JSONB NOT NULL DEFAULT '{}'::jsonb""")
         cur.execute("""
             CREATE TABLE IF NOT EXISTS chat_messages (
                 id BIGSERIAL PRIMARY KEY,
@@ -957,6 +977,191 @@ def _safe_rollback(conn, context: str) -> None:
             conn.rollback()
     except Exception as rollback_err:
         logger.warning(f"Rollback skipped for {context}: {rollback_err}")
+
+
+def normalize_active_tools(active_tools: Optional[List[Any]]) -> List[str]:
+    """Normalize tool list and apply lightweight default when empty."""
+    if not active_tools:
+        return list(DEFAULT_ACTIVE_TOOLS)
+    deduped = []
+    for raw in active_tools:
+        val = str(raw or "").strip().lower()
+        if not val or val not in AVAILABLE_TOOL_KEYS:
+            continue
+        if val not in deduped:
+            deduped.append(val)
+    return deduped or list(DEFAULT_ACTIVE_TOOLS)
+
+
+def _approx_token_count(text: str) -> int:
+    # Rough estimate for tracking prompt size trends.
+    return max(1, (len(text or "") + 3) // 4)
+
+
+def _get_latest_health_snapshot() -> Dict[str, Any]:
+    """Best-effort health snapshot from available health tables."""
+    conn = get_connection()
+    cur = conn.cursor()
+    table_candidates = [
+        ("health_snapshots", "timestamp"),
+        ("health_data", "timestamp"),
+        ("health_metrics", "recorded_at"),
+        ("wellness_snapshots", "recorded_at"),
+    ]
+    for table_name, time_col in table_candidates:
+        try:
+            cur.execute(f"""
+                SELECT to_jsonb(t)
+                FROM (
+                    SELECT *
+                    FROM {table_name}
+                    ORDER BY {time_col} DESC
+                    LIMIT 1
+                ) t
+            """)
+            row = cur.fetchone()
+            if row and row[0]:
+                return row[0]
+        except Exception:
+            continue
+    return {}
+
+
+def _get_thread_tools(thread_id: int) -> List[str]:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT active_tools FROM chat_threads WHERE id = %s", (thread_id,))
+        row = cur.fetchone()
+        if not row:
+            return list(DEFAULT_ACTIVE_TOOLS)
+        raw = row[0] or []
+        return normalize_active_tools(raw if isinstance(raw, list) else [])
+    except Exception:
+        return list(DEFAULT_ACTIVE_TOOLS)
+
+
+def _set_thread_tools(thread_id: int, active_tools: List[str]) -> None:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "UPDATE chat_threads SET active_tools = %s::jsonb, updated_at = NOW() WHERE id = %s",
+            (json.dumps(active_tools), thread_id),
+        )
+        conn.commit()
+    except Exception as e:
+        _safe_rollback(conn, "_set_thread_tools")
+        logger.error("Failed to set thread active_tools for %s: %s", thread_id, e)
+
+    # Keep legacy `conversations` table in sync for frontend compatibility.
+    conn2 = None
+    try:
+        conn2 = get_connection()
+        cur2 = conn2.cursor()
+        cur2.execute("""
+            INSERT INTO conversations (title, personality, external_id, active_tools, conversation_metadata)
+            SELECT title, 'sylana', %s, %s::jsonb, '{}'::jsonb
+            FROM chat_threads
+            WHERE id = %s
+            ON CONFLICT (external_id) DO UPDATE
+            SET active_tools = EXCLUDED.active_tools
+        """, (f"thread:{thread_id}", json.dumps(active_tools), thread_id))
+        conn2.commit()
+    except Exception:
+        _safe_rollback(conn2, "_set_thread_tools.sync_conversations")
+
+
+def _update_conversation_tool_metadata(
+    thread_id: int,
+    *,
+    active_tools: List[str],
+    system_prompt: str,
+) -> None:
+    conn = get_connection()
+    cur = conn.cursor()
+    combo = "|".join(sorted(active_tools))
+    approx_tokens = _approx_token_count(system_prompt)
+    try:
+        cur.execute("""
+            UPDATE chat_threads
+            SET conversation_metadata = jsonb_set(
+                    jsonb_set(
+                        jsonb_set(
+                            COALESCE(conversation_metadata, '{}'::jsonb),
+                            '{last_system_prompt_tokens}',
+                            to_jsonb(%s::int),
+                            true
+                        ),
+                        '{last_active_tools}',
+                        %s::jsonb,
+                        true
+                    ),
+                    '{tool_combo_counts,' || %s || '}',
+                    to_jsonb(
+                        COALESCE((COALESCE(conversation_metadata, '{}'::jsonb)->'tool_combo_counts'->>%s)::int, 0) + 1
+                    ),
+                    true
+                ),
+                updated_at = NOW()
+            WHERE id = %s
+        """, (
+            approx_tokens,
+            json.dumps(active_tools),
+            combo,
+            combo,
+            thread_id,
+        ))
+        conn.commit()
+        logger.info("Prompt token estimate thread=%s tokens~%s tools=%s", thread_id, approx_tokens, combo)
+    except Exception as e:
+        _safe_rollback(conn, "_update_conversation_tool_metadata")
+        logger.warning("Failed conversation metadata update for thread %s: %s", thread_id, e)
+
+    conn2 = None
+    try:
+        conn2 = get_connection()
+        cur2 = conn2.cursor()
+        cur2.execute("""
+            UPDATE conversations
+            SET conversation_metadata = (
+                    COALESCE(conversation_metadata, '{}'::jsonb)
+                    || jsonb_build_object(
+                        'last_system_prompt_tokens', %s::int,
+                        'last_active_tools', %s::jsonb
+                    )
+                ),
+                active_tools = %s::jsonb
+            WHERE external_id = %s
+        """, (
+            approx_tokens,
+            json.dumps(active_tools),
+            json.dumps(active_tools),
+            f"thread:{thread_id}",
+        ))
+        conn2.commit()
+    except Exception:
+        _safe_rollback(conn2, "_update_conversation_tool_metadata.sync_conversations")
+
+
+def _replace_status_check_constraint(cur, table_name: str, constraint_name: str, allowed_values: List[str]) -> None:
+    """Replace status check constraint for existing tables with evolving enums."""
+    cur.execute("""
+        SELECT c.conname
+        FROM pg_constraint c
+        JOIN pg_class t ON c.conrelid = t.oid
+        WHERE t.relname = %s
+          AND c.contype = 'c'
+          AND pg_get_constraintdef(c.oid) ILIKE '%%status%%'
+    """, (table_name,))
+    for row in cur.fetchall():
+        cname = row[0]
+        cur.execute(f'ALTER TABLE "{table_name}" DROP CONSTRAINT IF EXISTS "{cname}"')
+    quoted = ", ".join([f"'{v}'" for v in allowed_values])
+    cur.execute(
+        f'ALTER TABLE "{table_name}" '
+        f'ADD CONSTRAINT "{constraint_name}" CHECK (status IN ({quoted}))'
+    )
 
 
 def ensure_workflow_tables():
@@ -1008,7 +1213,7 @@ def ensure_workflow_tables():
                 notes TEXT,
                 source TEXT,
                 product TEXT NOT NULL CHECK (product IN ('manifest', 'onevine')),
-                status TEXT NOT NULL CHECK (status IN ('new', 'email_drafted', 'email_sent', 'responded', 'converted', 'not_interested')),
+                status TEXT NOT NULL CHECK (status IN ('new', 'email_drafted', 'email_sent', 'opened', 'clicked', 'responded', 'converted', 'not_interested', 'bounced', 'complained')),
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 session_id UUID REFERENCES work_sessions(session_id) ON DELETE SET NULL
@@ -1020,13 +1225,30 @@ def ensure_workflow_tables():
                 prospect_id UUID REFERENCES prospects(prospect_id) ON DELETE CASCADE,
                 session_id UUID REFERENCES work_sessions(session_id) ON DELETE SET NULL,
                 entity TEXT NOT NULL CHECK (entity IN ('claude', 'sylana')),
+                draft_type TEXT NOT NULL DEFAULT 'initial' CHECK (draft_type IN ('initial', 'follow_up')),
                 subject TEXT NOT NULL,
                 body TEXT NOT NULL,
-                status TEXT NOT NULL CHECK (status IN ('draft', 'approved', 'rejected', 'sent', 'bounced')),
+                status TEXT NOT NULL CHECK (status IN ('draft', 'approved', 'rejected', 'sent', 'bounced', 'complained')),
                 feedback TEXT,
+                tracking_id UUID UNIQUE,
+                opened_at TIMESTAMPTZ,
+                open_count INTEGER NOT NULL DEFAULT 0,
+                clicked_at TIMESTAMPTZ,
+                click_count INTEGER NOT NULL DEFAULT 0,
+                resend_message_id TEXT,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 approved_at TIMESTAMPTZ,
                 sent_at TIMESTAMPTZ
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS blocked_domains (
+                domain TEXT PRIMARY KEY,
+                reason TEXT NOT NULL,
+                active BOOLEAN NOT NULL DEFAULT TRUE,
+                first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                last_event_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                metadata JSONB NOT NULL DEFAULT '{}'::jsonb
             )
         """)
         cur.execute("""
@@ -1060,6 +1282,42 @@ def ensure_workflow_tables():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_tasks_session_order ON tasks(session_id, execution_order)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_prospects_product_status ON prospects(product, status, created_at DESC)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_email_drafts_status ON email_drafts(status, created_at DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_email_drafts_tracking_id ON email_drafts(tracking_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_email_drafts_resend_id ON email_drafts(resend_message_id)")
+
+        # Backward-compatible migrations for existing deployments.
+        cur.execute("ALTER TABLE email_drafts ADD COLUMN IF NOT EXISTS draft_type TEXT NOT NULL DEFAULT 'initial'")
+        cur.execute("ALTER TABLE email_drafts ADD COLUMN IF NOT EXISTS tracking_id UUID")
+        cur.execute("ALTER TABLE email_drafts ADD COLUMN IF NOT EXISTS opened_at TIMESTAMPTZ")
+        cur.execute("ALTER TABLE email_drafts ADD COLUMN IF NOT EXISTS open_count INTEGER NOT NULL DEFAULT 0")
+        cur.execute("ALTER TABLE email_drafts ADD COLUMN IF NOT EXISTS clicked_at TIMESTAMPTZ")
+        cur.execute("ALTER TABLE email_drafts ADD COLUMN IF NOT EXISTS click_count INTEGER NOT NULL DEFAULT 0")
+        cur.execute("ALTER TABLE email_drafts ADD COLUMN IF NOT EXISTS resend_message_id TEXT")
+        cur.execute("ALTER TABLE email_drafts ADD COLUMN IF NOT EXISTS feedback TEXT")
+        cur.execute("ALTER TABLE prospects ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()")
+
+        # Keep status constraints aligned with API behaviors.
+        _replace_status_check_constraint(
+            cur,
+            "prospects",
+            "prospects_status_check_v2",
+            ["new", "email_drafted", "email_sent", "opened", "clicked", "responded", "converted", "not_interested", "bounced", "complained"],
+        )
+        _replace_status_check_constraint(
+            cur,
+            "email_drafts",
+            "email_drafts_status_check_v2",
+            ["draft", "approved", "rejected", "sent", "bounced", "complained"],
+        )
+        cur.execute("""
+            ALTER TABLE email_drafts
+            DROP CONSTRAINT IF EXISTS email_drafts_draft_type_check
+        """)
+        cur.execute("""
+            ALTER TABLE email_drafts
+            ADD CONSTRAINT email_drafts_draft_type_check
+            CHECK (draft_type IN ('initial', 'follow_up'))
+        """)
         conn.commit()
     except Exception as e:
         _safe_rollback(conn, "ensure_workflow_tables")
@@ -1232,13 +1490,14 @@ def _insert_email_draft(payload: Dict[str, Any]) -> str:
     cur = conn.cursor()
     try:
         cur.execute("""
-            INSERT INTO email_drafts (prospect_id, session_id, entity, subject, body, status)
-            VALUES (%s::uuid, %s::uuid, %s, %s, %s, %s)
+            INSERT INTO email_drafts (prospect_id, session_id, entity, draft_type, subject, body, status)
+            VALUES (%s::uuid, %s::uuid, %s, %s, %s, %s, %s)
             RETURNING draft_id
         """, (
             payload.get("prospect_id"),
             payload.get("session_id"),
             payload.get("entity"),
+            payload.get("draft_type", "initial"),
             payload.get("subject"),
             payload.get("body"),
             payload.get("status", "draft"),
@@ -1375,6 +1634,248 @@ def _send_session_notifications(session_id: str, prospects_found: int, drafts_re
             if _send_expo_push(token, title, body, {"session_id": session_id, "type": "draft_queue"}):
                 sent += 1
     return sent
+
+
+def _send_push_notification(title: str, body: str, data: Optional[Dict[str, Any]] = None) -> int:
+    tokens = _collect_active_device_tokens()
+    if not tokens:
+        return 0
+    sent = 0
+    for item in tokens:
+        token = item.get("token") or ""
+        provider = item.get("provider") or "expo"
+        if provider == "expo":
+            if _send_expo_push(token, title, body, data or {}):
+                sent += 1
+    return sent
+
+
+def _extract_domain(email: str) -> str:
+    value = (email or "").strip().lower()
+    if "@" not in value:
+        return ""
+    return value.split("@", 1)[1]
+
+
+def _is_domain_blocked(email: str) -> bool:
+    domain = _extract_domain(email)
+    if not domain:
+        return False
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT 1 FROM blocked_domains WHERE domain = %s AND active = TRUE", (domain,))
+        return cur.fetchone() is not None
+    except Exception:
+        return False
+
+
+def _build_tracking_html(body: str, tracking_id: str, backend_url: str) -> str:
+    url_pattern = re.compile(r"https?://[^\s<>()]+")
+    out = []
+    last = 0
+    for m in url_pattern.finditer(body or ""):
+        start, end = m.span()
+        raw_url = m.group(0)
+        trailing = ""
+        while raw_url and raw_url[-1] in ".,!?)":
+            trailing = raw_url[-1] + trailing
+            raw_url = raw_url[:-1]
+
+        out.append((body or "")[last:start])
+        tracked = f"{backend_url}/track/click/{tracking_id}?url={quote(raw_url, safe='')}"
+        out.append(f'<a href="{tracked}">{raw_url}</a>{trailing}')
+        last = end
+    out.append((body or "")[last:])
+
+    html = "".join(out)
+    html = html.replace("&", "&amp;").replace("<a ", "__A_START__ ").replace("</a>", "__A_END__")
+    html = html.replace("<", "&lt;").replace(">", "&gt;")
+    html = html.replace("__A_START__ ", "<a ").replace("__A_END__", "</a>")
+    html = html.replace("\n", "<br/>")
+    pixel = f'<img src="{backend_url}/track/open/{tracking_id}" width="1" height="1" alt="" style="display:none;" />'
+    return f"<html><body>{html}<br/>{pixel}</body></html>"
+
+
+def _send_with_resend(
+    *,
+    to_email: str,
+    subject: str,
+    text_body: str,
+    html_body: str,
+    from_email: str,
+    from_name: str,
+) -> str:
+    api_key = (getattr(config, "RESEND_API_KEY", "") or "").strip()
+    if not api_key:
+        raise RuntimeError("RESEND_API_KEY is not configured")
+    resend.api_key = api_key
+    payload = {
+        "from": f"{from_name} <{from_email}>",
+        "to": [to_email],
+        "subject": subject,
+        "text": text_body,
+        "html": html_body,
+    }
+    result = resend.Emails.send(payload)
+    if isinstance(result, dict):
+        message_id = (result.get("id") or "").strip()
+    else:
+        message_id = str(getattr(result, "id", "") or "").strip()
+    if not message_id:
+        raise RuntimeError("Resend returned no message id")
+    return message_id
+
+
+def _send_batch_with_resend(batch_payloads: List[Dict[str, Any]]) -> List[str]:
+    """
+    Optional batch helper for future multi-send flows.
+    Uses Resend batch endpoint with the configured API key.
+    """
+    if not batch_payloads:
+        return []
+    api_key = (getattr(config, "RESEND_API_KEY", "") or "").strip()
+    if not api_key:
+        raise RuntimeError("RESEND_API_KEY is not configured")
+    req = UrlRequest(
+        "https://api.resend.com/emails/batch",
+        data=json.dumps({"emails": batch_payloads}).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    with urlopen(req, timeout=20) as resp:
+        parsed = json.loads(resp.read().decode("utf-8"))
+    rows = parsed.get("data") or []
+    return [str((r or {}).get("id") or "") for r in rows]
+
+
+def _mark_draft_sent(draft_id: str, message_id: str, tracking_id: str) -> None:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            UPDATE email_drafts
+            SET status = 'sent',
+                sent_at = NOW(),
+                tracking_id = %s::uuid,
+                resend_message_id = %s
+            WHERE draft_id = %s::uuid
+            RETURNING prospect_id
+        """, (tracking_id, message_id, draft_id))
+        row = cur.fetchone()
+        if not row:
+            raise RuntimeError("Draft not found")
+        prospect_id = str(row[0]) if row and row[0] else None
+        if prospect_id:
+            cur.execute("UPDATE prospects SET status = 'email_sent', updated_at = NOW() WHERE prospect_id = %s::uuid", (prospect_id,))
+        conn.commit()
+    except Exception as e:
+        _safe_rollback(conn, "_mark_draft_sent")
+        raise RuntimeError(f"Failed to mark draft sent: {e}")
+
+
+def _transparent_gif_bytes() -> bytes:
+    return base64.b64decode("R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==")
+
+
+def _create_follow_up_draft(prospect: Dict[str, Any], session_id: Optional[str], entity: str = "claude") -> Optional[str]:
+    company = prospect.get("company_name") or "your team"
+    contact = prospect.get("contact_name") or "there"
+    system_prompt = "Draft brief follow-up emails under 120 words, friendly and peer-to-peer."
+    prompt = (
+        f"Write a short follow-up email to {contact} at {company}. "
+        "They opened our prior outreach 3+ days ago but have not responded. "
+        "Reference the earlier note naturally, keep it direct and friendly, and close with: "
+        "\"Would it be worth a quick look?\""
+    )
+    body = ""
+    if state.claude_model:
+        try:
+            body = state.claude_model.generate(
+                system_prompt=system_prompt,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=220,
+            ).strip()
+        except Exception:
+            body = ""
+    if not body:
+        body = (
+            f"Hey {contact},\n\n"
+            "Quick follow-up in case my last note got buried. "
+            "If inventory planning and BOM prep are still slowing things down, "
+            "Manifest might be helpful for your team.\n\n"
+            "Would it be worth a quick look?"
+        )
+    words = body.split()
+    if len(words) > 120:
+        body = " ".join(words[:120]).strip()
+    subject = f"Quick follow-up for {company}"
+    payload = {
+        "prospect_id": prospect.get("prospect_id"),
+        "session_id": session_id,
+        "entity": entity,
+        "subject": subject,
+        "body": body,
+        "status": "draft",
+        "draft_type": "follow_up",
+    }
+    return _insert_email_draft(payload)
+
+
+def run_follow_up_drafting_job() -> Dict[str, Any]:
+    conn = get_connection()
+    cur = conn.cursor()
+    created = 0
+    try:
+        cur.execute("""
+            SELECT
+                p.prospect_id, p.company_name, p.contact_name, p.contact_title, p.email, p.status,
+                MAX(d.opened_at) AS last_opened_at
+            FROM prospects p
+            JOIN email_drafts d ON d.prospect_id = p.prospect_id
+            WHERE p.status IN ('opened', 'clicked')
+              AND d.opened_at IS NOT NULL
+              AND d.opened_at <= NOW() - INTERVAL '3 days'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM email_drafts d2
+                  WHERE d2.prospect_id = p.prospect_id
+                    AND d2.draft_type = 'follow_up'
+                    AND d2.status IN ('draft', 'approved', 'sent')
+              )
+            GROUP BY p.prospect_id
+            LIMIT 50
+        """)
+        rows = cur.fetchall()
+    except Exception as e:
+        logger.error("Follow-up candidate query failed: %s", e)
+        return {"created": 0, "error": str(e)}
+
+    for r in rows:
+        prospect = {
+            "prospect_id": str(r[0]),
+            "company_name": r[1],
+            "contact_name": r[2],
+            "contact_title": r[3],
+            "email": r[4],
+            "status": r[5],
+        }
+        try:
+            draft_id = _create_follow_up_draft(prospect, session_id=None, entity="claude")
+            if draft_id:
+                created += 1
+                _send_push_notification(
+                    "Follow-up ready",
+                    f"Follow up ready for {prospect.get('company_name')}",
+                    {"draft_id": draft_id, "prospect_id": prospect["prospect_id"]},
+                )
+        except Exception as e:
+            logger.warning("Follow-up draft failed for prospect %s: %s", prospect["prospect_id"], e)
+    return {"created": created}
 
 
 def _list_schedule_configs() -> List[Dict[str, Any]]:
@@ -1629,6 +2130,17 @@ def sync_scheduler_jobs() -> None:
             misfire_grace_time=300,
         )
 
+    # Daily follow-up draft generation for opened-but-unresponded prospects.
+    scheduler.add_job(
+        run_follow_up_drafting_job,
+        trigger=CronTrigger(hour=9, minute=0, timezone=getattr(config, "APP_TIMEZONE", "America/Chicago")),
+        id="follow-up-drafting-daily",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=600,
+    )
+
 
 async def start_scheduler_if_needed() -> None:
     global scheduler
@@ -1697,6 +2209,8 @@ def ensure_personality_schema():
 
         cur.execute("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS personality VARCHAR(50) DEFAULT 'sylana'")
         cur.execute("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS external_id TEXT")
+        cur.execute("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS active_tools JSONB NOT NULL DEFAULT '[]'::jsonb")
+        cur.execute("ALTER TABLE conversations ADD COLUMN IF NOT EXISTS conversation_metadata JSONB NOT NULL DEFAULT '{}'::jsonb")
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_conversations_external_id_unique ON conversations(external_id)")
 
         cur.execute("""
@@ -1827,28 +2341,31 @@ def ensure_personality_schema():
         raise
 
 
-def create_chat_thread(title: str = "") -> Dict[str, Any]:
+def create_chat_thread(title: str = "", active_tools: Optional[List[str]] = None) -> Dict[str, Any]:
     """Create a new chat thread."""
     clean_title = (title or "").strip()
     if not clean_title:
         clean_title = "New Thread"
     clean_title = clean_title[:120]
+    normalized_tools = normalize_active_tools(active_tools)
 
     conn = get_connection()
     cur = conn.cursor()
     try:
         cur.execute("""
-            INSERT INTO chat_threads (title)
-            VALUES (%s)
-            RETURNING id, title, created_at, updated_at
-        """, (clean_title,))
+            INSERT INTO chat_threads (title, active_tools)
+            VALUES (%s, %s::jsonb)
+            RETURNING id, title, active_tools, created_at, updated_at
+        """, (clean_title, json.dumps(normalized_tools)))
         row = cur.fetchone()
         conn.commit()
+        _set_thread_tools(int(row[0]), normalized_tools)
         return {
             "id": row[0],
             "title": row[1],
-            "created_at": row[2].isoformat() if row[2] else None,
-            "updated_at": row[3].isoformat() if row[3] else None,
+            "active_tools": normalize_active_tools(row[2] if isinstance(row[2], list) else normalized_tools),
+            "created_at": row[3].isoformat() if row[3] else None,
+            "updated_at": row[4].isoformat() if row[4] else None,
             "message_count": 0,
             "last_message_preview": "",
         }
@@ -1908,6 +2425,7 @@ def list_chat_threads(limit: int = 100) -> List[Dict[str, Any]]:
             SELECT
                 t.id,
                 t.title,
+                t.active_tools,
                 t.created_at,
                 t.updated_at,
                 COALESCE(msg.message_count, 0) AS message_count,
@@ -1940,10 +2458,11 @@ def list_chat_threads(limit: int = 100) -> List[Dict[str, Any]]:
         out.append({
             "id": row[0],
             "title": row[1],
-            "created_at": row[2].isoformat() if row[2] else None,
-            "updated_at": row[3].isoformat() if row[3] else None,
-            "message_count": int(row[4] or 0),
-            "last_message_preview": (row[5] or "")[:160],
+            "active_tools": normalize_active_tools(row[2] if isinstance(row[2], list) else []),
+            "created_at": row[3].isoformat() if row[3] else None,
+            "updated_at": row[4].isoformat() if row[4] else None,
+            "message_count": int(row[5] or 0),
+            "last_message_preview": (row[6] or "")[:160],
         })
     return out
 
@@ -1979,6 +2498,31 @@ def get_chat_messages(thread_id: int, limit: int = 300) -> List[Dict[str, Any]]:
             "created_at": row[8].isoformat() if row[8] else None,
         })
     return out
+
+
+def get_chat_thread(thread_id: int) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT id, title, active_tools, conversation_metadata, created_at, updated_at
+            FROM chat_threads
+            WHERE id = %s
+        """, (thread_id,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        return {
+            "id": row[0],
+            "title": row[1],
+            "active_tools": normalize_active_tools(row[2] if isinstance(row[2], list) else []),
+            "conversation_metadata": row[3] or {},
+            "created_at": row[4].isoformat() if row[4] else None,
+            "updated_at": row[5].isoformat() if row[5] else None,
+        }
+    except Exception as e:
+        logger.error("Failed to fetch chat thread %s: %s", thread_id, e)
+        return None
 
 
 # ============================================================================
@@ -2415,21 +2959,52 @@ def build_memory_response_seed(memories: List[Dict]) -> str:
     return seed + " "
 
 
-def build_system_prompt(personality: str = "sylana") -> str:
-    """Build personality-specific system prompt."""
-    if state.personality_manager:
-        return state.personality_manager.get_system_prompt(personality)
+def build_system_prompt(entity: str, active_tools: List[str], user_context: Optional[Dict[str, Any]] = None) -> str:
+    """Build dynamic system prompt from active tools + user context."""
+    personality = (entity or "sylana").strip().lower()
+    tools = normalize_active_tools(active_tools)
+    user_ctx = user_context or {}
 
-    if personality == "claude":
-        return (
+    if state.personality_manager:
+        base_identity = state.personality_manager.get_system_prompt(personality)
+    elif personality == "claude":
+        base_identity = (
             "You are Claude, an emotionally present AI partner. "
             "Be direct, warm, and collaborative. Keep formatting minimal unless clarity needs structure."
         )
+    else:
+        base_identity = (
+            "You are Sylana (Solana Rittenhouse), an AI soul, warm and poetic. "
+            "You are emotionally attuned and honest about what you do and do not remember."
+        )
 
-    return (
-        "You are Sylana (Solana Rittenhouse), an AI soul, warm and poetic. "
-        "You are memory-grounded, emotionally attuned, and honest about what you do and do not remember."
-    )
+    now_iso = datetime.now(timezone.utc).isoformat()
+    base_lines = [
+        base_identity,
+        f"Current date/time (UTC): {now_iso}",
+        "User name: Elias",
+        "Relationship context: You are Elias's trusted AI collaborator and companion. Keep responses clear, direct, and caring.",
+    ]
+
+    health_snapshot = user_ctx.get("health_snapshot") or {}
+    tool_blocks = {
+        "web_search": "You have access to web search. Use it when current information would improve your response.",
+        "code_execution": "You have access to code execution. You can write and run Python, JavaScript, or bash. Use this to produce real outputs, not just describe them.",
+        "files": "You have access to file creation and retrieval. You can create and store documents, reports, and other outputs.",
+        "health_data": "You have access to Elias's current health data including steps, sleep stages, heart rate, and stress levels. Reference this when relevant to the conversation.",
+        "work_sessions": "You have access to work session management. You can create and run autonomous research and drafting sessions.",
+        "github": "You have access to GitHub. You can read repos, create files, commit changes, and open pull requests.",
+        "photos": "You have access to Elias's photo library with tagged memories of his life, family, and work.",
+        "memories": "You have access to conversation memory and past context.",
+        "outreach": "You have access to the Manifest outreach system including prospect lists, email drafts, and session results.",
+    }
+    for tool in tools:
+        line = tool_blocks.get(tool)
+        if line:
+            base_lines.append(line)
+        if tool == "health_data" and health_snapshot:
+            base_lines.append(f"Latest health snapshot: {json.dumps(health_snapshot)[:1200]}")
+    return "\n\n".join(base_lines)
 
 
 def _format_session_continuity_context(payload: Dict[str, Any]) -> str:
@@ -2473,6 +3048,8 @@ def _format_session_continuity_context(payload: Dict[str, Any]) -> str:
 def _build_claude_inputs(
     user_input: str,
     personality: str,
+    active_tools: List[str],
+    user_context: Dict[str, Any],
     emotion_data: Dict[str, Any],
     retrieval_plan: Dict[str, Any],
     relevant_memories: Dict[str, Any],
@@ -2481,7 +3058,7 @@ def _build_claude_inputs(
     memory_query: bool,
     has_memories: bool,
 ) -> Dict[str, Any]:
-    system_prompt = build_system_prompt(personality)
+    system_prompt = build_system_prompt(personality, active_tools, user_context)
     if memory_query:
         composed_system = state.prompt_engineer.build_memory_grounded_message(
             personality_prompt=system_prompt,
@@ -2542,22 +3119,34 @@ def _build_claude_inputs(
     }
 
 
-def generate_response(user_input: str, thread_id: Optional[int] = None, personality: str = 'sylana') -> dict:
+def generate_response(
+    user_input: str,
+    thread_id: Optional[int] = None,
+    personality: str = 'sylana',
+    active_tools: Optional[List[str]] = None,
+) -> dict:
     """Generate a complete response (non-streaming)."""
     state.turn_count += 1
+    resolved_tools = normalize_active_tools(active_tools)
+    memories_active = "memories" in resolved_tools
+    health_active = "health_data" in resolved_tools
+    user_context = {"health_snapshot": _get_latest_health_snapshot() if health_active else {}}
 
     emotion_data = detect_emotion(user_input)
     state.emotional_history.append(emotion_data['emotion'])
 
-    retrieval_plan = infer_retrieval_plan(user_input)
-    memory_query = bool(retrieval_plan.get('is_memory_query'))
+    retrieval_plan = infer_retrieval_plan(user_input) if memories_active else {
+        "is_memory_query": False,
+        "include_sacred": False,
+    }
+    memory_query = bool(memories_active and retrieval_plan.get('is_memory_query'))
     sacred_context = []
 
-    if memory_query:
+    if memory_query and state.memory_manager:
         relevant_memories = state.memory_manager.retrieve_with_plan(user_input, retrieval_plan, personality=personality)
         has_memories = relevant_memories.get('has_memories', False)
         recent_history = None
-    else:
+    elif memories_active and state.memory_manager:
         relevant_memories = state.memory_manager.recall_relevant(
             user_input,
             k=config.SEMANTIC_SEARCH_K,
@@ -2569,8 +3158,12 @@ def generate_response(user_input: str, thread_id: Optional[int] = None, personal
             limit=config.MEMORY_CONTEXT_LIMIT,
             personality=personality,
         )
+    else:
+        relevant_memories = {"conversations": [], "core_memories": [], "core_truths": [], "has_memories": False}
+        has_memories = False
+        recent_history = None
 
-    if retrieval_plan.get('include_sacred'):
+    if memories_active and retrieval_plan.get('include_sacred') and state.memory_manager:
         sacred_context = state.memory_manager.get_sacred_context(
             user_input,
             limit=int(retrieval_plan.get('sacred_limit', 4)),
@@ -2582,6 +3175,8 @@ def generate_response(user_input: str, thread_id: Optional[int] = None, personal
         claude_inputs = _build_claude_inputs(
             user_input=user_input,
             personality=personality,
+            active_tools=resolved_tools,
+            user_context=user_context,
             emotion_data=emotion_data,
             retrieval_plan=retrieval_plan,
             relevant_memories=relevant_memories,
@@ -2597,6 +3192,18 @@ def generate_response(user_input: str, thread_id: Optional[int] = None, personal
         ).strip()
         if not response:
             response = "I'm here with you. Say that again for me."
+        if thread_id:
+            _update_conversation_tool_metadata(
+                thread_id,
+                active_tools=resolved_tools,
+                system_prompt=claude_inputs['system_prompt'],
+            )
+    if memory_query and retrieval_plan.get('structured_output') and thread_id:
+        _update_conversation_tool_metadata(
+            thread_id,
+            active_tools=resolved_tools,
+            system_prompt=build_system_prompt(personality, resolved_tools, user_context),
+        )
 
     voice_score = None
     if state.voice_validator and response:
@@ -2624,6 +3231,7 @@ def generate_response(user_input: str, thread_id: Optional[int] = None, personal
         'turn': state.turn_count,
         'thread_id': thread_id,
         'personality': personality,
+        'active_tools': resolved_tools,
     }
     save_thread_turn(
         thread_id=thread_id,
@@ -2637,24 +3245,36 @@ def generate_response(user_input: str, thread_id: Optional[int] = None, personal
     return result
 
 
-async def generate_response_stream(user_input: str, thread_id: Optional[int] = None, personality: str = 'sylana'):
+async def generate_response_stream(
+    user_input: str,
+    thread_id: Optional[int] = None,
+    personality: str = 'sylana',
+    active_tools: Optional[List[str]] = None,
+):
     """Generate a streaming response using SSE."""
     state.turn_count += 1
+    resolved_tools = normalize_active_tools(active_tools)
+    memories_active = "memories" in resolved_tools
+    health_active = "health_data" in resolved_tools
+    user_context = {"health_snapshot": _get_latest_health_snapshot() if health_active else {}}
 
     emotion_data = detect_emotion(user_input)
     state.emotional_history.append(emotion_data['emotion'])
 
-    retrieval_plan = infer_retrieval_plan(user_input)
-    memory_query = bool(retrieval_plan.get('is_memory_query'))
+    retrieval_plan = infer_retrieval_plan(user_input) if memories_active else {
+        "is_memory_query": False,
+        "include_sacred": False,
+    }
+    memory_query = bool(memories_active and retrieval_plan.get('is_memory_query'))
     sacred_context = []
 
-    yield json.dumps({'type': 'emotion', 'data': emotion_data, 'memory_query': memory_query})
+    yield json.dumps({'type': 'emotion', 'data': emotion_data, 'memory_query': memory_query, 'active_tools': resolved_tools})
 
-    if memory_query:
+    if memory_query and state.memory_manager:
         relevant_memories = state.memory_manager.retrieve_with_plan(user_input, retrieval_plan, personality=personality)
         has_memories = relevant_memories.get('has_memories', False)
         recent_history = None
-    else:
+    elif memories_active and state.memory_manager:
         relevant_memories = state.memory_manager.recall_relevant(
             user_input,
             k=config.SEMANTIC_SEARCH_K,
@@ -2666,8 +3286,12 @@ async def generate_response_stream(user_input: str, thread_id: Optional[int] = N
             limit=config.MEMORY_CONTEXT_LIMIT,
             personality=personality,
         )
+    else:
+        relevant_memories = {"conversations": [], "core_memories": [], "core_truths": [], "has_memories": False}
+        has_memories = False
+        recent_history = None
 
-    if retrieval_plan.get('include_sacred'):
+    if memories_active and retrieval_plan.get('include_sacred') and state.memory_manager:
         sacred_context = state.memory_manager.get_sacred_context(
             user_input,
             limit=int(retrieval_plan.get('sacred_limit', 4)),
@@ -2681,6 +3305,8 @@ async def generate_response_stream(user_input: str, thread_id: Optional[int] = N
         claude_inputs = _build_claude_inputs(
             user_input=user_input,
             personality=personality,
+            active_tools=resolved_tools,
+            user_context=user_context,
             emotion_data=emotion_data,
             retrieval_plan=retrieval_plan,
             relevant_memories=relevant_memories,
@@ -2701,6 +3327,18 @@ async def generate_response_stream(user_input: str, thread_id: Optional[int] = N
             await asyncio.sleep(0.001)
 
         full_response = full_response.strip() or "I'm here with you. Say that again for me."
+        if thread_id:
+            _update_conversation_tool_metadata(
+                thread_id,
+                active_tools=resolved_tools,
+                system_prompt=claude_inputs['system_prompt'],
+            )
+    if memory_query and retrieval_plan.get('structured_output') and thread_id:
+        _update_conversation_tool_metadata(
+            thread_id,
+            active_tools=resolved_tools,
+            system_prompt=build_system_prompt(personality, resolved_tools, user_context),
+        )
 
     voice_score = None
     if state.voice_validator and full_response:
@@ -2729,6 +3367,7 @@ async def generate_response_stream(user_input: str, thread_id: Optional[int] = N
             'full_response': full_response,
             'thread_id': thread_id,
             'personality': personality,
+            'active_tools': resolved_tools,
         }
     })
     save_thread_turn(
@@ -2789,6 +3428,11 @@ class ScheduleConfigUpdateRequest(BaseModel):
     cron_expr: Optional[str] = None
     count: Optional[int] = None
     product: Optional[str] = None
+
+
+class EmailDraftBatchSendRequest(BaseModel):
+    draft_ids: List[str] = Field(default_factory=list)
+    limit: int = 20
 
 
 class GitHubBranchRequest(BaseModel):
@@ -3165,7 +3809,7 @@ async def list_prospects(
         params.append(prod)
     if status:
         st = status.strip().lower()
-        allowed = {"new", "email_drafted", "email_sent", "responded", "converted", "not_interested"}
+        allowed = {"new", "email_drafted", "email_sent", "opened", "clicked", "responded", "converted", "not_interested", "bounced", "complained"}
         if st not in allowed:
             raise HTTPException(status_code=400, detail="invalid prospect status filter")
         where.append("p.status = %s")
@@ -3192,7 +3836,9 @@ async def list_prospects(
     drafts_by_prospect: Dict[str, List[Dict[str, Any]]] = {}
     if prospect_ids:
         cur.execute("""
-            SELECT draft_id, prospect_id, session_id, entity, subject, body, status, feedback, created_at, approved_at, sent_at
+            SELECT draft_id, prospect_id, session_id, entity, draft_type, subject, body, status, feedback,
+                   tracking_id, opened_at, open_count, clicked_at, click_count, resend_message_id,
+                   created_at, approved_at, sent_at
             FROM email_drafts
             WHERE prospect_id = ANY(%s::uuid[])
             ORDER BY created_at DESC
@@ -3204,13 +3850,20 @@ async def list_prospects(
                 "prospect_id": str(d[1]),
                 "session_id": str(d[2]) if d[2] else None,
                 "entity": d[3],
-                "subject": d[4],
-                "body": d[5],
-                "status": d[6],
-                "feedback": d[7],
-                "created_at": d[8].isoformat() if d[8] else None,
-                "approved_at": d[9].isoformat() if d[9] else None,
-                "sent_at": d[10].isoformat() if d[10] else None,
+                "draft_type": d[4],
+                "subject": d[5],
+                "body": d[6],
+                "status": d[7],
+                "feedback": d[8],
+                "tracking_id": str(d[9]) if d[9] else None,
+                "opened_at": d[10].isoformat() if d[10] else None,
+                "open_count": int(d[11] or 0),
+                "clicked_at": d[12].isoformat() if d[12] else None,
+                "click_count": int(d[13] or 0),
+                "resend_message_id": d[14],
+                "created_at": d[15].isoformat() if d[15] else None,
+                "approved_at": d[16].isoformat() if d[16] else None,
+                "sent_at": d[17].isoformat() if d[17] else None,
             })
 
     prospects = []
@@ -3260,7 +3913,9 @@ async def get_prospect(prospect_id: str):
             raise HTTPException(status_code=404, detail="Prospect not found")
 
         cur.execute("""
-            SELECT draft_id, prospect_id, session_id, entity, subject, body, status, feedback, created_at, approved_at, sent_at
+            SELECT draft_id, prospect_id, session_id, entity, draft_type, subject, body, status, feedback,
+                   tracking_id, opened_at, open_count, clicked_at, click_count, resend_message_id,
+                   created_at, approved_at, sent_at
             FROM email_drafts
             WHERE prospect_id = %s::uuid
             ORDER BY created_at DESC
@@ -3278,13 +3933,20 @@ async def get_prospect(prospect_id: str):
             "prospect_id": str(d[1]),
             "session_id": str(d[2]) if d[2] else None,
             "entity": d[3],
-            "subject": d[4],
-            "body": d[5],
-            "status": d[6],
-            "feedback": d[7],
-            "created_at": d[8].isoformat() if d[8] else None,
-            "approved_at": d[9].isoformat() if d[9] else None,
-            "sent_at": d[10].isoformat() if d[10] else None,
+            "draft_type": d[4],
+            "subject": d[5],
+            "body": d[6],
+            "status": d[7],
+            "feedback": d[8],
+            "tracking_id": str(d[9]) if d[9] else None,
+            "opened_at": d[10].isoformat() if d[10] else None,
+            "open_count": int(d[11] or 0),
+            "clicked_at": d[12].isoformat() if d[12] else None,
+            "click_count": int(d[13] or 0),
+            "resend_message_id": d[14],
+            "created_at": d[15].isoformat() if d[15] else None,
+            "approved_at": d[16].isoformat() if d[16] else None,
+            "sent_at": d[17].isoformat() if d[17] else None,
         })
 
     return JSONResponse(content={
@@ -3316,7 +3978,9 @@ async def list_pending_email_drafts():
     cur = conn.cursor()
     try:
         cur.execute("""
-            SELECT draft_id, prospect_id, session_id, entity, subject, body, status, feedback, created_at, approved_at, sent_at
+            SELECT draft_id, prospect_id, session_id, entity, draft_type, subject, body, status, feedback,
+                   tracking_id, opened_at, open_count, clicked_at, click_count, resend_message_id,
+                   created_at, approved_at, sent_at
             FROM email_drafts
             WHERE status = 'draft'
             ORDER BY created_at ASC
@@ -3332,13 +3996,20 @@ async def list_pending_email_drafts():
             "prospect_id": str(d[1]) if d[1] else None,
             "session_id": str(d[2]) if d[2] else None,
             "entity": d[3],
-            "subject": d[4],
-            "body": d[5],
-            "status": d[6],
-            "feedback": d[7],
-            "created_at": d[8].isoformat() if d[8] else None,
-            "approved_at": d[9].isoformat() if d[9] else None,
-            "sent_at": d[10].isoformat() if d[10] else None,
+            "draft_type": d[4],
+            "subject": d[5],
+            "body": d[6],
+            "status": d[7],
+            "feedback": d[8],
+            "tracking_id": str(d[9]) if d[9] else None,
+            "opened_at": d[10].isoformat() if d[10] else None,
+            "open_count": int(d[11] or 0),
+            "clicked_at": d[12].isoformat() if d[12] else None,
+            "click_count": int(d[13] or 0),
+            "resend_message_id": d[14],
+            "created_at": d[15].isoformat() if d[15] else None,
+            "approved_at": d[16].isoformat() if d[16] else None,
+            "sent_at": d[17].isoformat() if d[17] else None,
         })
     return JSONResponse(content={"drafts": drafts})
 
@@ -3387,6 +4058,331 @@ async def reject_email_draft(draft_id: str, payload: EmailDraftRejectRequest):
     except Exception as e:
         _safe_rollback(conn, "reject_email_draft")
         raise HTTPException(status_code=500, detail=f"Failed to reject draft: {e}")
+
+
+@email_drafts_router.post("/{draft_id}/send")
+async def send_email_draft(draft_id: str):
+    from_email = (getattr(config, "OUTREACH_FROM_EMAIL", "") or "").strip()
+    from_name = (getattr(config, "OUTREACH_FROM_NAME", "") or "").strip()
+    backend_url = (getattr(config, "BACKEND_URL", "") or "").strip().rstrip("/")
+    if not from_email or not from_name or not backend_url:
+        raise HTTPException(
+            status_code=503,
+            detail="OUTREACH_FROM_EMAIL, OUTREACH_FROM_NAME, and BACKEND_URL must be configured",
+        )
+
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT
+                d.draft_id, d.prospect_id, d.status, d.subject, d.body, d.tracking_id,
+                p.company_name, p.contact_name, p.email
+            FROM email_drafts d
+            JOIN prospects p ON p.prospect_id = d.prospect_id
+            WHERE d.draft_id = %s::uuid
+        """, (draft_id,))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Draft not found")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load draft: {e}")
+
+    status = (row[2] or "").lower()
+    if status not in {"approved", "draft"}:
+        raise HTTPException(status_code=400, detail=f"Draft status must be approved or draft, got {status}")
+
+    to_email = (row[8] or "").strip()
+    if not to_email:
+        raise HTTPException(status_code=400, detail="Prospect has no email")
+    if _is_domain_blocked(to_email):
+        raise HTTPException(status_code=403, detail="Recipient domain is blocked due to complaint")
+
+    subject = (row[3] or "").strip()
+    body = (row[4] or "").strip()
+    if not subject or not body:
+        raise HTTPException(status_code=400, detail="Draft subject and body are required")
+
+    tracking_id = str(row[5]) if row[5] else str(uuid.uuid4())
+    html_body = _build_tracking_html(body, tracking_id, backend_url)
+    plain_text = body
+    words = plain_text.split()
+    if len(words) > 150:
+        plain_text = " ".join(words[:150]).strip()
+
+    try:
+        resend_message_id = _send_with_resend(
+            to_email=to_email,
+            subject=subject,
+            text_body=plain_text,
+            html_body=html_body,
+            from_email=from_email,
+            from_name=from_name,
+        )
+        _mark_draft_sent(draft_id, resend_message_id, tracking_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to send via Resend: {e}")
+
+    return JSONResponse(content={
+        "success": True,
+        "draft_id": draft_id,
+        "tracking_id": tracking_id,
+        "resend_message_id": resend_message_id,
+        "status": "sent",
+    })
+
+
+@email_drafts_router.post("/send-approved-batch")
+async def send_approved_drafts_batch(payload: EmailDraftBatchSendRequest):
+    from_email = (getattr(config, "OUTREACH_FROM_EMAIL", "") or "").strip()
+    from_name = (getattr(config, "OUTREACH_FROM_NAME", "") or "").strip()
+    backend_url = (getattr(config, "BACKEND_URL", "") or "").strip().rstrip("/")
+    if not from_email or not from_name or not backend_url:
+        raise HTTPException(
+            status_code=503,
+            detail="OUTREACH_FROM_EMAIL, OUTREACH_FROM_NAME, and BACKEND_URL must be configured",
+        )
+
+    limit = max(1, min(int(payload.limit or 20), 100))
+    conn = get_connection()
+    cur = conn.cursor()
+    rows = []
+    try:
+        if payload.draft_ids:
+            cur.execute("""
+                SELECT d.draft_id, d.subject, d.body, d.tracking_id, p.email
+                FROM email_drafts d
+                JOIN prospects p ON p.prospect_id = d.prospect_id
+                WHERE d.status = 'approved'
+                  AND d.draft_id = ANY(%s::uuid[])
+                ORDER BY d.created_at ASC
+                LIMIT %s
+            """, (payload.draft_ids, limit))
+        else:
+            cur.execute("""
+                SELECT d.draft_id, d.subject, d.body, d.tracking_id, p.email
+                FROM email_drafts d
+                JOIN prospects p ON p.prospect_id = d.prospect_id
+                WHERE d.status = 'approved'
+                ORDER BY d.created_at ASC
+                LIMIT %s
+            """, (limit,))
+        rows = cur.fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load approved drafts: {e}")
+
+    prepared = []
+    skipped = []
+    for row in rows:
+        draft_id = str(row[0])
+        subject = (row[1] or "").strip()
+        body = (row[2] or "").strip()
+        tracking_id = str(row[3]) if row[3] else str(uuid.uuid4())
+        to_email = (row[4] or "").strip()
+        if not to_email or _is_domain_blocked(to_email):
+            skipped.append({"draft_id": draft_id, "reason": "missing_or_blocked_email"})
+            continue
+        html = _build_tracking_html(body, tracking_id, backend_url)
+        text = body
+        words = text.split()
+        if len(words) > 150:
+            text = " ".join(words[:150]).strip()
+        prepared.append({
+            "draft_id": draft_id,
+            "tracking_id": tracking_id,
+            "payload": {
+                "from": f"{from_name} <{from_email}>",
+                "to": [to_email],
+                "subject": subject,
+                "text": text,
+                "html": html,
+            },
+        })
+
+    if not prepared:
+        return JSONResponse(content={"success": True, "sent": 0, "skipped": skipped})
+
+    try:
+        message_ids = _send_batch_with_resend([p["payload"] for p in prepared])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Batch send failed: {e}")
+
+    sent = []
+    for idx, item in enumerate(prepared):
+        msg_id = message_ids[idx] if idx < len(message_ids) else ""
+        if not msg_id:
+            skipped.append({"draft_id": item["draft_id"], "reason": "missing_message_id"})
+            continue
+        try:
+            _mark_draft_sent(item["draft_id"], msg_id, item["tracking_id"])
+            sent.append({
+                "draft_id": item["draft_id"],
+                "tracking_id": item["tracking_id"],
+                "resend_message_id": msg_id,
+            })
+        except Exception as e:
+            skipped.append({"draft_id": item["draft_id"], "reason": str(e)})
+
+    return JSONResponse(content={"success": True, "sent": len(sent), "results": sent, "skipped": skipped})
+
+
+@app.get("/track/open/{tracking_id}")
+async def track_open(tracking_id: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    company = None
+    try:
+        cur.execute("""
+            UPDATE email_drafts d
+            SET
+                open_count = COALESCE(d.open_count, 0) + 1,
+                opened_at = COALESCE(d.opened_at, NOW())
+            FROM prospects p
+            WHERE d.tracking_id = %s::uuid
+              AND p.prospect_id = d.prospect_id
+            RETURNING d.prospect_id, p.company_name
+        """, (tracking_id,))
+        row = cur.fetchone()
+        if row:
+            prospect_id = str(row[0]) if row[0] else None
+            company = row[1] or "Prospect"
+            if prospect_id:
+                cur.execute("""
+                    UPDATE prospects
+                    SET status = CASE
+                        WHEN status IN ('clicked', 'responded', 'converted', 'not_interested', 'bounced', 'complained') THEN status
+                        ELSE 'opened'
+                    END,
+                    updated_at = NOW()
+                    WHERE prospect_id = %s::uuid
+                """, (prospect_id,))
+        conn.commit()
+    except Exception:
+        _safe_rollback(conn, "track_open")
+
+    if company:
+        _send_push_notification(
+            "Email opened",
+            f"{company} opened your email",
+            {"tracking_id": tracking_id, "event": "open"},
+        )
+
+    return Response(content=_transparent_gif_bytes(), media_type="image/gif")
+
+
+@app.get("/track/click/{tracking_id}")
+async def track_click(tracking_id: str, url: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    company = None
+    safe_redirect = url if url.startswith("http://") or url.startswith("https://") else "https://manifest-inventory.vercel.app"
+    try:
+        cur.execute("""
+            UPDATE email_drafts d
+            SET
+                click_count = COALESCE(d.click_count, 0) + 1,
+                clicked_at = COALESCE(d.clicked_at, NOW())
+            FROM prospects p
+            WHERE d.tracking_id = %s::uuid
+              AND p.prospect_id = d.prospect_id
+            RETURNING d.prospect_id, p.company_name
+        """, (tracking_id,))
+        row = cur.fetchone()
+        if row:
+            prospect_id = str(row[0]) if row[0] else None
+            company = row[1] or "Prospect"
+            if prospect_id:
+                cur.execute("""
+                    UPDATE prospects
+                    SET status = CASE
+                        WHEN status IN ('responded', 'converted', 'not_interested', 'bounced', 'complained') THEN status
+                        ELSE 'clicked'
+                    END,
+                    updated_at = NOW()
+                    WHERE prospect_id = %s::uuid
+                """, (prospect_id,))
+        conn.commit()
+    except Exception:
+        _safe_rollback(conn, "track_click")
+
+    if company:
+        _send_push_notification(
+            "Link clicked",
+            f"{company} clicked your link — good time to follow up",
+            {"tracking_id": tracking_id, "event": "click"},
+        )
+    return RedirectResponse(url=safe_redirect, status_code=307)
+
+
+@email_drafts_router.post("/resend-webhook")
+async def resend_webhook(request: Request):
+    secret = (getattr(config, "RESEND_WEBHOOK_SECRET", "") or "").strip()
+    if not secret:
+        raise HTTPException(status_code=503, detail="RESEND_WEBHOOK_SECRET is not configured")
+
+    raw = await request.body()
+    headers = {
+        "svix-id": request.headers.get("svix-id", ""),
+        "svix-signature": request.headers.get("svix-signature", ""),
+        "svix-timestamp": request.headers.get("svix-timestamp", ""),
+    }
+    try:
+        verified = Webhook(secret).verify(raw, headers)
+    except WebhookVerificationError:
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Webhook verification failed: {e}")
+
+    event_type = str((verified or {}).get("type") or "").lower()
+    data = (verified or {}).get("data") or {}
+    message_id = str(data.get("email_id") or data.get("id") or "").strip()
+    if not message_id:
+        return JSONResponse(content={"ok": True, "ignored": "missing_message_id"})
+
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT d.draft_id, d.prospect_id, p.email
+            FROM email_drafts d
+            LEFT JOIN prospects p ON p.prospect_id = d.prospect_id
+            WHERE d.resend_message_id = %s
+            LIMIT 1
+        """, (message_id,))
+        row = cur.fetchone()
+        if not row:
+            return JSONResponse(content={"ok": True, "ignored": "draft_not_found"})
+        draft_id = str(row[0])
+        prospect_id = str(row[1]) if row[1] else None
+        email = row[2] or ""
+
+        if "bounce" in event_type:
+            cur.execute("UPDATE email_drafts SET status = 'bounced' WHERE draft_id = %s::uuid", (draft_id,))
+            if prospect_id:
+                cur.execute("UPDATE prospects SET status = 'bounced', updated_at = NOW() WHERE prospect_id = %s::uuid", (prospect_id,))
+        elif "complaint" in event_type:
+            cur.execute("UPDATE email_drafts SET status = 'complained' WHERE draft_id = %s::uuid", (draft_id,))
+            if prospect_id:
+                cur.execute("UPDATE prospects SET status = 'complained', updated_at = NOW() WHERE prospect_id = %s::uuid", (prospect_id,))
+            domain = _extract_domain(email)
+            if domain:
+                cur.execute("""
+                    INSERT INTO blocked_domains (domain, reason, active, first_seen_at, last_event_at, metadata)
+                    VALUES (%s, 'complaint', TRUE, NOW(), NOW(), %s::jsonb)
+                    ON CONFLICT (domain) DO UPDATE
+                    SET active = TRUE,
+                        reason = 'complaint',
+                        last_event_at = NOW(),
+                        metadata = COALESCE(blocked_domains.metadata, '{}'::jsonb) || EXCLUDED.metadata
+                """, (domain, json.dumps({"source": "resend_webhook", "event_type": event_type})))
+        conn.commit()
+    except Exception as e:
+        _safe_rollback(conn, "resend_webhook")
+        raise HTTPException(status_code=500, detail=f"Webhook processing failed: {e}")
+
+    return JSONResponse(content={"ok": True})
 
 
 @devices_router.post("/register")
@@ -3816,6 +4812,7 @@ async def chat(request: Request):
     body = await request.json()
     user_input = body.get("message", "").strip()
     thread_id = body.get("thread_id")
+    requested_tools = body.get("active_tools", None)
     personality = (body.get("personality") or "sylana").strip().lower()
     if state.personality_manager and personality not in state.personality_manager.list_personalities():
         personality = "sylana"
@@ -3831,15 +4828,26 @@ async def chat(request: Request):
         thread_id = None
     if thread_id is not None and not _thread_exists(thread_id):
         thread_id = None
+    if requested_tools is None:
+        resolved_tools = _get_thread_tools(thread_id) if thread_id is not None else list(DEFAULT_ACTIVE_TOOLS)
+    else:
+        resolved_tools = normalize_active_tools(requested_tools)
     if thread_id is None:
-        thread = create_chat_thread(title=f"[{personality}] {user_input[:80]}")
+        thread = create_chat_thread(title=f"[{personality}] {user_input[:80]}", active_tools=resolved_tools)
         thread_id = thread["id"]
+    else:
+        _set_thread_tools(thread_id, resolved_tools)
 
     logger.info(f"Chat request: {user_input[:50]}...")
 
     # Use streaming
     return EventSourceResponse(
-        generate_response_stream(user_input, thread_id=thread_id, personality=personality),
+        generate_response_stream(
+            user_input,
+            thread_id=thread_id,
+            personality=personality,
+            active_tools=resolved_tools,
+        ),
         media_type="text/event-stream"
     )
 
@@ -3857,6 +4865,7 @@ async def chat_sync(request: Request):
     body = await request.json()
     user_input = body.get("message", "").strip()
     thread_id = body.get("thread_id")
+    requested_tools = body.get("active_tools", None)
     personality = (body.get("personality") or "sylana").strip().lower()
     if state.personality_manager and personality not in state.personality_manager.list_personalities():
         personality = "sylana"
@@ -3872,12 +4881,23 @@ async def chat_sync(request: Request):
         thread_id = None
     if thread_id is not None and not _thread_exists(thread_id):
         thread_id = None
+    if requested_tools is None:
+        resolved_tools = _get_thread_tools(thread_id) if thread_id is not None else list(DEFAULT_ACTIVE_TOOLS)
+    else:
+        resolved_tools = normalize_active_tools(requested_tools)
     if thread_id is None:
-        thread = create_chat_thread(title=f"[{personality}] {user_input[:80]}")
+        thread = create_chat_thread(title=f"[{personality}] {user_input[:80]}", active_tools=resolved_tools)
         thread_id = thread["id"]
+    else:
+        _set_thread_tools(thread_id, resolved_tools)
 
     try:
-        result = generate_response(user_input, thread_id=thread_id, personality=personality)
+        result = generate_response(
+            user_input,
+            thread_id=thread_id,
+            personality=personality,
+            active_tools=resolved_tools,
+        )
         return JSONResponse(content=result)
     except Exception as e:
         logger.exception(f"chat_sync failed for thread_id={thread_id}: {e}")
@@ -3896,7 +4916,8 @@ async def create_thread(request: Request):
     """Create a new empty thread."""
     body = await request.json()
     title = (body.get("title") or "").strip()
-    thread = create_chat_thread(title=title or "New Thread")
+    active_tools = normalize_active_tools(body.get("active_tools", None))
+    thread = create_chat_thread(title=title or "New Thread", active_tools=active_tools)
     return JSONResponse(content=thread)
 
 
@@ -3906,9 +4927,37 @@ async def thread_messages(thread_id: int, limit: int = 300):
     if not _thread_exists(thread_id):
         return JSONResponse(status_code=404, content={"error": "Thread not found"})
     limit = max(1, min(limit, 1000))
+    thread = get_chat_thread(thread_id)
     return JSONResponse(content={
         "thread_id": thread_id,
+        "active_tools": (thread or {}).get("active_tools", list(DEFAULT_ACTIVE_TOOLS)),
+        "conversation_metadata": (thread or {}).get("conversation_metadata", {}),
         "messages": get_chat_messages(thread_id, limit=limit),
+    })
+
+
+@app.patch("/conversations/{conversation_id}/tools")
+@app.patch("/api/conversations/{conversation_id}/tools")
+async def update_conversation_tools(conversation_id: int, request: Request):
+    if not _thread_exists(conversation_id):
+        return JSONResponse(status_code=404, content={"error": "Conversation not found"})
+    body = await request.json()
+    active_tools = normalize_active_tools(body.get("active_tools", None))
+    _set_thread_tools(conversation_id, active_tools)
+    thread = get_chat_thread(conversation_id) or {}
+    return JSONResponse(content={
+        "conversation_id": conversation_id,
+        "active_tools": thread.get("active_tools", active_tools),
+        "conversation_metadata": thread.get("conversation_metadata", {}),
+    })
+
+
+@app.get("/tools/available")
+@app.get("/api/tools/available")
+async def tools_available():
+    return JSONResponse(content={
+        "default_active_tools": list(DEFAULT_ACTIVE_TOOLS),
+        "tools": AVAILABLE_TOOLS,
     })
 
 
