@@ -18,17 +18,32 @@ import logging
 import asyncio
 import re
 import importlib
+import base64
+import uuid
 from collections import Counter
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
+from urllib.parse import quote
+from urllib.request import Request as UrlRequest, urlopen
+from urllib.error import HTTPError, URLError
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, APIRouter, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse
+from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
+from anthropic import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    AuthenticationError,
+    BadRequestError,
+    NotFoundError,
+    RateLimitError,
+)
 
 # Core components
 from core.config_loader import config
@@ -59,6 +74,424 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _safe_error_details(err: Exception, max_len: int = 240) -> str:
+    """Bound response details and avoid leaking internals/secrets."""
+    raw = (str(err) or err.__class__.__name__).replace("\n", " ").strip()
+    return raw[:max_len]
+
+
+def _chat_sync_error_response(err: Exception, thread_id: Optional[int]) -> JSONResponse:
+    """
+    Convert upstream provider errors into actionable HTTP responses.
+    Keeps the API stable while exposing enough detail for mobile troubleshooting.
+    """
+    details = _safe_error_details(err)
+
+    if isinstance(err, (BadRequestError, NotFoundError)):
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": "Upstream model request rejected.",
+                "details": details,
+                "hint": f"Verify CLAUDE_MODEL is valid: {config.CLAUDE_MODEL}",
+                "thread_id": thread_id,
+            },
+        )
+    if isinstance(err, AuthenticationError):
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": "Upstream model authentication failed.",
+                "details": details,
+                "hint": "Check ANTHROPIC_API_KEY secret in Cloud Run.",
+                "thread_id": thread_id,
+            },
+        )
+    if isinstance(err, RateLimitError):
+        return JSONResponse(
+            status_code=429,
+            content={
+                "error": "Upstream model rate limited.",
+                "details": details,
+                "thread_id": thread_id,
+            },
+        )
+    if isinstance(err, (APITimeoutError, APIConnectionError)):
+        return JSONResponse(
+            status_code=504,
+            content={
+                "error": "Upstream model timed out or was unreachable.",
+                "details": details,
+                "thread_id": thread_id,
+            },
+        )
+    if isinstance(err, APIStatusError):
+        status_code = getattr(err, "status_code", 503) or 503
+        if status_code >= 500:
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": "Upstream model service unavailable. Please retry.",
+                    "details": details,
+                    "thread_id": thread_id,
+                },
+            )
+
+    return JSONResponse(
+        status_code=503,
+        content={
+            "error": "Upstream model service unavailable. Please retry.",
+            "details": details,
+            "thread_id": thread_id,
+        },
+    )
+
+
+class GitHubError(Exception):
+    """Error raised for GitHub API request failures."""
+
+    def __init__(self, status_code: int, message: str):
+        self.status_code = int(status_code)
+        self.message = message
+        super().__init__(message)
+
+
+class GitHubClient:
+    """Minimal GitHub REST API client using stdlib HTTP APIs."""
+
+    def __init__(self, token: str):
+        self.token = (token or "").strip()
+        if not self.token:
+            raise RuntimeError("GITHUB_TOKEN is required for GitHub integration")
+        self.base_url = "https://api.github.com"
+        self.default_headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "User-Agent": "sylana-vessel",
+        }
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        query: Optional[str] = None,
+        payload: Optional[Dict[str, Any]] = None,
+        expected: Optional[set] = None,
+    ) -> Dict[str, Any]:
+        expected_codes = expected or {200}
+        url = f"{self.base_url}{path}"
+        if query:
+            url = f"{url}?{query}"
+
+        data = None
+        headers = dict(self.default_headers)
+        if payload is not None:
+            data = json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+
+        req = UrlRequest(url=url, data=data, headers=headers, method=method.upper())
+        try:
+            with urlopen(req, timeout=25) as resp:
+                status = int(resp.status)
+                body = resp.read().decode("utf-8") if resp else ""
+        except HTTPError as e:
+            body = ""
+            try:
+                body = e.read().decode("utf-8")
+            except Exception:
+                body = ""
+            message = f"GitHub API error ({e.code})"
+            if body:
+                try:
+                    parsed = json.loads(body)
+                    message = parsed.get("message") or message
+                except Exception:
+                    message = body[:200]
+            raise GitHubError(e.code, message)
+        except URLError as e:
+            raise GitHubError(503, f"GitHub API unreachable: {e.reason}")
+        except Exception as e:
+            raise GitHubError(500, f"GitHub API request failed: {e}")
+
+        if status not in expected_codes:
+            raise GitHubError(status, f"Unexpected GitHub status {status}")
+
+        if not body:
+            return {}
+        try:
+            return json.loads(body)
+        except Exception:
+            raise GitHubError(502, "GitHub API returned non-JSON response")
+
+    def get_repo(self, repo: str) -> Dict[str, Any]:
+        return self._request("GET", f"/repos/{repo}", expected={200})
+
+    def get_branch_ref(self, repo: str, branch: str) -> Dict[str, Any]:
+        safe_branch = quote(branch, safe="")
+        return self._request("GET", f"/repos/{repo}/git/ref/heads/{safe_branch}", expected={200})
+
+    def create_branch(self, repo: str, branch_name: str, from_branch: str) -> Dict[str, Any]:
+        source_ref = self.get_branch_ref(repo, from_branch)
+        source_sha = (((source_ref or {}).get("object") or {}).get("sha") or "").strip()
+        if not source_sha:
+            raise GitHubError(502, f"Failed to resolve source branch '{from_branch}'")
+        return self._request(
+            "POST",
+            f"/repos/{repo}/git/refs",
+            payload={"ref": f"refs/heads/{branch_name}", "sha": source_sha},
+            expected={201},
+        )
+
+    def list_repos(self) -> List[Dict[str, Any]]:
+        return self._request("GET", "/user/repos", query="per_page=100&sort=updated&type=all", expected={200})
+
+    def get_repo_tree(self, repo: str, branch: str) -> Dict[str, Any]:
+        safe_branch = quote(branch, safe="")
+        try:
+            return self._request(
+                "GET",
+                f"/repos/{repo}/git/trees/{safe_branch}",
+                query="recursive=1",
+                expected={200},
+            )
+        except GitHubError:
+            branch_ref = self.get_branch_ref(repo, branch)
+            commit_sha = (((branch_ref or {}).get("object") or {}).get("sha") or "").strip()
+            if not commit_sha:
+                raise
+            commit_obj = self._request("GET", f"/repos/{repo}/git/commits/{commit_sha}", expected={200})
+            tree_sha = (((commit_obj or {}).get("tree") or {}).get("sha") or "").strip()
+            if not tree_sha:
+                raise GitHubError(502, "Failed to resolve tree SHA for branch")
+            return self._request(
+                "GET",
+                f"/repos/{repo}/git/trees/{tree_sha}",
+                query="recursive=1",
+                expected={200},
+            )
+
+    def get_file(self, repo: str, file_path: str, branch: str) -> Dict[str, Any]:
+        safe_path = quote(file_path.strip("/"), safe="/")
+        safe_branch = quote(branch, safe="")
+        return self._request(
+            "GET",
+            f"/repos/{repo}/contents/{safe_path}",
+            query=f"ref={safe_branch}",
+            expected={200},
+        )
+
+    def commit_file(
+        self,
+        repo: str,
+        branch: str,
+        file_path: str,
+        content: str,
+        commit_message: str,
+    ) -> Dict[str, Any]:
+        safe_path = quote(file_path.strip("/"), safe="/")
+        encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
+        existing_sha = None
+
+        try:
+            existing = self.get_file(repo, file_path, branch)
+            existing_sha = (existing or {}).get("sha")
+        except GitHubError as e:
+            if e.status_code != 404:
+                raise
+
+        payload = {
+            "message": commit_message,
+            "content": encoded,
+            "branch": branch,
+        }
+        if existing_sha:
+            payload["sha"] = existing_sha
+
+        return self._request(
+            "PUT",
+            f"/repos/{repo}/contents/{safe_path}",
+            payload=payload,
+            expected={200, 201},
+        )
+
+    def create_pull_request(
+        self,
+        repo: str,
+        title: str,
+        body: str,
+        head_branch: str,
+        base_branch: str,
+    ) -> Dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/repos/{repo}/pulls",
+            payload={
+                "title": title,
+                "body": body,
+                "head": head_branch,
+                "base": base_branch,
+            },
+            expected={201},
+        )
+
+    def create_issue(self, repo: str, title: str, body: str, labels: List[str]) -> Dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/repos/{repo}/issues",
+            payload={"title": title, "body": body, "labels": labels},
+            expected={201},
+        )
+
+
+def _validate_repo_name(repo: str) -> str:
+    value = (repo or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", value):
+        raise HTTPException(status_code=400, detail="repo must be in owner/repo format")
+    return value
+
+
+def _get_github_client() -> GitHubClient:
+    token = (getattr(config, "GITHUB_TOKEN", "") or "").strip()
+    if not token:
+        raise HTTPException(status_code=503, detail="GitHub integration is not configured")
+    return GitHubClient(token=token)
+
+
+def _repo_code_write_access(repo_obj: Dict[str, Any]) -> bool:
+    perms = (repo_obj or {}).get("permissions") or {}
+    if not isinstance(perms, dict):
+        return False
+    return bool(perms.get("push") or perms.get("admin") or perms.get("maintain"))
+
+
+def _repo_issue_write_access(repo_obj: Dict[str, Any]) -> bool:
+    perms = (repo_obj or {}).get("permissions") or {}
+    if not isinstance(perms, dict):
+        return False
+    return bool(
+        perms.get("push")
+        or perms.get("admin")
+        or perms.get("maintain")
+        or perms.get("triage")
+    )
+
+
+def _require_repo_access(client: GitHubClient, repo: str, access: str = "read") -> Dict[str, Any]:
+    try:
+        repo_obj = client.get_repo(repo)
+    except GitHubError as e:
+        raise HTTPException(status_code=e.status_code, detail=f"Repo access failed: {e.message}")
+    if access == "code_write" and not _repo_code_write_access(repo_obj):
+        raise HTTPException(status_code=403, detail="Token does not have code write access to this repo")
+    if access == "issue_write" and not _repo_issue_write_access(repo_obj):
+        raise HTTPException(status_code=403, detail="Token does not have issue write access to this repo")
+    return repo_obj
+
+
+def ensure_github_actions_table():
+    """Create table for persistent GitHub action audit records."""
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS github_actions (
+                action_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                entity TEXT NOT NULL CHECK (entity IN ('claude', 'sylana', 'system')),
+                action_type TEXT NOT NULL CHECK (action_type IN ('commit', 'pr', 'branch', 'issue')),
+                repo TEXT NOT NULL,
+                details JSONB NOT NULL DEFAULT '{}'::jsonb,
+                timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                session_id TEXT
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_github_actions_timestamp ON github_actions(timestamp DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_github_actions_session ON github_actions(session_id)")
+        conn.commit()
+    except Exception as e:
+        _safe_rollback(conn, "ensure_github_actions_table")
+        logger.error(f"Failed to ensure github_actions table: {e}")
+        raise
+
+
+def _log_github_action(
+    *,
+    entity: str,
+    action_type: str,
+    repo: str,
+    details: Dict[str, Any],
+    session_id: Optional[str] = None,
+) -> str:
+    conn = get_connection()
+    cur = conn.cursor()
+    action_id = str(uuid.uuid4())
+    try:
+        cur.execute("""
+            INSERT INTO github_actions (action_id, entity, action_type, repo, details, session_id)
+            VALUES (%s::uuid, %s, %s, %s, %s::jsonb, %s)
+        """, (
+            action_id,
+            entity,
+            action_type,
+            repo,
+            json.dumps(details or {}),
+            session_id,
+        ))
+        conn.commit()
+        return action_id
+    except Exception as e:
+        _safe_rollback(conn, "_log_github_action")
+        logger.error(f"Failed to log github action: {e}")
+        raise
+
+
+def _save_github_card_message(
+    *,
+    thread_id: int,
+    personality: str,
+    title: str,
+    card: Dict[str, Any],
+) -> None:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO chat_messages (thread_id, role, content, personality, emotion, turn, metadata)
+            VALUES (%s, 'assistant', %s, %s, '{}'::jsonb, NULL, %s::jsonb)
+        """, (
+            thread_id,
+            title,
+            personality,
+            json.dumps({"github_card": card}),
+        ))
+        cur.execute("UPDATE chat_threads SET updated_at = NOW() WHERE id = %s", (thread_id,))
+        conn.commit()
+    except Exception as e:
+        _safe_rollback(conn, "_save_github_card_message")
+        logger.error(f"Failed to persist GitHub action card for thread {thread_id}: {e}")
+
+
+def _maybe_attach_card_to_thread(
+    *,
+    session_id: Optional[str],
+    entity: str,
+    title: str,
+    card: Dict[str, Any],
+) -> None:
+    if not session_id:
+        return
+    try:
+        thread_id = int(session_id)
+    except Exception:
+        return
+    if not _thread_exists(thread_id):
+        return
+    persona = "claude" if entity == "claude" else "sylana"
+    _save_github_card_message(thread_id=thread_id, personality=persona, title=title, card=card)
+
+
 # ============================================================================
 # GLOBAL STATE
 # ============================================================================
@@ -75,6 +508,7 @@ class SylanaState:
         self.voice_validator = None
         self.relationship_db = None
         self.relationship_context = None
+        self.session_continuity = {}
         self.emotional_history = []
         self.turn_count = 0
         self.ready = False
@@ -113,11 +547,13 @@ def ensure_chat_thread_tables():
                 content TEXT NOT NULL,
                 personality TEXT NOT NULL DEFAULT 'sylana',
                 emotion JSONB,
+                metadata JSONB,
                 voice_score REAL,
                 turn INTEGER,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
+        cur.execute("ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS metadata JSONB")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_chat_messages_thread_created ON chat_messages(thread_id, created_at)")
         conn.commit()
     except Exception as e:
@@ -144,6 +580,7 @@ def ensure_personality_schema():
     cur = conn.cursor()
     try:
         cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        cur.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto")
         cur.execute(f"""
             CREATE TABLE IF NOT EXISTS memories (
                 id BIGSERIAL PRIMARY KEY,
@@ -173,6 +610,14 @@ def ensure_personality_schema():
         cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS personality VARCHAR(50) DEFAULT 'sylana'")
         cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS privacy_level VARCHAR(20) DEFAULT 'private'")
         cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS thread_id BIGINT")
+        cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS memory_type VARCHAR(32) DEFAULT 'contextual'")
+        cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS feeling_weight REAL DEFAULT 0.5")
+        cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS energy_shift REAL DEFAULT 0.0")
+        cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS comfort_level REAL DEFAULT 0.5")
+        cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS significance_score REAL DEFAULT 0.5")
+        cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS secure_payload BYTEA")
+        cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS access_count INTEGER DEFAULT 0")
+        cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS last_accessed_at TIMESTAMPTZ DEFAULT NOW()")
 
         cur.execute("""
             CREATE TABLE IF NOT EXISTS conversations (
@@ -201,6 +646,18 @@ def ensure_personality_schema():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_memories_personality ON memories(personality)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_memories_thread_id ON memories(thread_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_memories_conversation_id ON memories(conversation_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(memory_type)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_memories_significance ON memories(significance_score DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_memories_last_accessed ON memories(last_accessed_at DESC)")
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS session_continuity_state (
+                personality VARCHAR(50) PRIMARY KEY,
+                encrypted_state BYTEA NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
 
         # Backfill canonical conversation rows from imported memory metadata.
         cur.execute("""
@@ -430,7 +887,7 @@ def get_chat_messages(thread_id: int, limit: int = 300) -> List[Dict[str, Any]]:
     cur = conn.cursor()
     try:
         cur.execute("""
-            SELECT id, role, content, personality, emotion, voice_score, turn, created_at
+            SELECT id, role, content, personality, emotion, metadata, voice_score, turn, created_at
             FROM chat_messages
             WHERE thread_id = %s
             ORDER BY created_at ASC, id ASC
@@ -449,9 +906,10 @@ def get_chat_messages(thread_id: int, limit: int = 300) -> List[Dict[str, Any]]:
             "content": row[2],
             "personality": row[3] or "sylana",
             "emotion": row[4] or {},
-            "voice_score": row[5],
-            "turn": row[6],
-            "created_at": row[7].isoformat() if row[7] else None,
+            "metadata": row[5] or {},
+            "voice_score": row[6],
+            "turn": row[7],
+            "created_at": row[8].isoformat() if row[8] else None,
         })
     return out
 
@@ -536,7 +994,14 @@ def load_models():
     state.memory_manager = MemoryManager()
     logger.info("Memory system ready")
     ensure_chat_thread_tables()
+    ensure_github_actions_table()
     ensure_personality_schema()
+    try:
+        state.session_continuity = state.memory_manager.load_startup_continuity()
+        logger.info("Loaded startup continuity state for %s personas", len(state.session_continuity))
+    except Exception as e:
+        state.session_continuity = {}
+        logger.warning("Continuity startup load failed: %s", e)
     logger.info("Chat thread storage ready")
 
     # 5. Load voice validator
@@ -896,6 +1361,45 @@ def build_system_prompt(personality: str = "sylana") -> str:
         "You are memory-grounded, emotionally attuned, and honest about what you do and do not remember."
     )
 
+
+def _format_session_continuity_context(payload: Dict[str, Any]) -> str:
+    """Compress continuity state into compact system context."""
+    if not payload:
+        return ""
+
+    last_emotion = payload.get("last_emotion", "neutral")
+    baseline = payload.get("emotional_baseline", "steady")
+    trust_level = payload.get("relationship_trust_level", 0.5)
+    momentum = payload.get("conversation_momentum", "steady")
+    patterns = payload.get("communication_patterns", [])
+    active_projects = payload.get("active_projects", [])
+    preference_signals = payload.get("preference_signals", [])
+    weighted_memories = payload.get("recent_weighted_memories", [])
+
+    lines = [
+        "SESSION CONTINUITY:",
+        f"- Last emotional tone: {last_emotion}",
+        f"- Emotional baseline: {baseline}",
+        f"- Relationship trust level: {trust_level}",
+        f"- Momentum trend: {momentum}",
+    ]
+    if patterns:
+        lines.append(f"- Communication patterns: {', '.join(str(p) for p in patterns[:4])}")
+    if active_projects:
+        lines.append(f"- Active projects: {', '.join(str(p) for p in active_projects[:4])}")
+    if preference_signals:
+        lines.append(f"- Preference signals: {', '.join(str(p) for p in preference_signals[:4])}")
+    if weighted_memories:
+        lines.append("- Weighted recent moments:")
+        for item in weighted_memories[:2]:
+            mtype = item.get("memory_type", "contextual")
+            emo = item.get("emotion", "neutral")
+            sig = item.get("significance_score", 0.5)
+            user_excerpt = (item.get("user_input") or "").replace("\n", " ").strip()[:80]
+            lines.append(f"  * [{mtype}] emotion={emo} sig={sig}: \"{user_excerpt}\"")
+
+    return "\n".join(lines)
+
 def _build_claude_inputs(
     user_input: str,
     personality: str,
@@ -928,6 +1432,16 @@ def _build_claude_inputs(
             core_truths=relevant_memories.get('core_truths', []),
             sacred_context=sacred_context,
         )
+
+    continuity_payload = {}
+    if state.memory_manager:
+        try:
+            continuity_payload = state.memory_manager.get_session_continuity(personality=personality)
+        except Exception as e:
+            logger.warning("Failed continuity fetch for %s: %s", personality, e)
+    continuity_text = _format_session_continuity_context(continuity_payload)
+    if continuity_text:
+        composed_system = f"{composed_system}\n\n{continuity_text}"
 
     messages = []
     if recent_history:
@@ -1025,6 +1539,7 @@ def generate_response(user_input: str, thread_id: Optional[int] = None, personal
             user_input=user_input,
             sylana_response=response,
             emotion=emotion_data['category'],
+            emotion_data=emotion_data,
             personality=personality,
             thread_id=thread_id,
         )
@@ -1128,6 +1643,7 @@ async def generate_response_stream(user_input: str, thread_id: Optional[int] = N
             user_input=user_input,
             sylana_response=full_response,
             emotion=emotion_data['category'],
+            emotion_data=emotion_data,
             personality=personality,
             thread_id=thread_id,
         )
@@ -1154,6 +1670,369 @@ async def generate_response_stream(user_input: str, thread_id: Optional[int] = N
         voice_score=voice_score,
         turn=state.turn_count,
     )
+
+
+class GitHubCommitRequest(BaseModel):
+    repo: str
+    branch: str
+    file_path: str
+    content: str
+    commit_message: str
+    entity: str = "sylana"
+    session_id: Optional[str] = None
+
+
+class GitHubBranchRequest(BaseModel):
+    repo: str
+    branch_name: str
+    from_branch: str = "main"
+    entity: str = "system"
+    session_id: Optional[str] = None
+
+
+class GitHubPullRequestRequest(BaseModel):
+    repo: str
+    title: str
+    body: str = ""
+    head_branch: str
+    base_branch: str = "main"
+    entity: str = "sylana"
+    session_id: Optional[str] = None
+
+
+class GitHubIssueRequest(BaseModel):
+    repo: str
+    title: str
+    body: str = ""
+    labels: List[str] = Field(default_factory=list)
+    entity: str = "sylana"
+    session_id: Optional[str] = None
+
+
+github_router = APIRouter(prefix="/github", tags=["github"])
+
+
+def _normalized_entity(value: str) -> str:
+    entity = (value or "").strip().lower()
+    if entity not in {"claude", "sylana", "system"}:
+        raise HTTPException(status_code=400, detail="entity must be claude|sylana|system")
+    return entity
+
+
+@github_router.post("/commit")
+async def github_commit(payload: GitHubCommitRequest):
+    repo = _validate_repo_name(payload.repo)
+    file_path = (payload.file_path or "").strip().lstrip("/")
+    branch = (payload.branch or "").strip()
+    if not file_path:
+        raise HTTPException(status_code=400, detail="file_path is required")
+    if not branch:
+        raise HTTPException(status_code=400, detail="branch is required")
+    if not payload.commit_message.strip():
+        raise HTTPException(status_code=400, detail="commit_message is required")
+    entity = _normalized_entity(payload.entity)
+
+    client = _get_github_client()
+    _require_repo_access(client, repo, access="code_write")
+    try:
+        commit_data = client.commit_file(
+            repo=repo,
+            branch=branch,
+            file_path=file_path,
+            content=payload.content,
+            commit_message=payload.commit_message.strip(),
+        )
+    except GitHubError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message)
+
+    commit_obj = commit_data.get("commit") or {}
+    commit_sha = (commit_obj.get("sha") or "").strip()
+    commit_url = (commit_obj.get("html_url") or "").strip()
+    details = {
+        "repo": repo,
+        "branch": branch,
+        "file_path": file_path,
+        "commit_message": payload.commit_message.strip(),
+        "commit_sha": commit_sha,
+        "commit_url": commit_url,
+    }
+    action_id = _log_github_action(
+        entity=entity,
+        action_type="commit",
+        repo=repo,
+        details=details,
+        session_id=payload.session_id,
+    )
+    card = {
+        "type": "commit",
+        "filename": file_path,
+        "message": payload.commit_message.strip(),
+        "branch": branch,
+        "url": commit_url,
+        "sha": commit_sha,
+    }
+    _maybe_attach_card_to_thread(
+        session_id=payload.session_id,
+        entity=entity,
+        title=f"Committed {file_path}",
+        card=card,
+    )
+    return JSONResponse(content={
+        "success": True,
+        "commit_sha": commit_sha,
+        "url": commit_url,
+        "action_id": action_id,
+        "chat_card": card,
+    })
+
+
+@github_router.post("/branch")
+async def github_branch(payload: GitHubBranchRequest):
+    repo = _validate_repo_name(payload.repo)
+    branch_name = (payload.branch_name or "").strip()
+    from_branch = (payload.from_branch or "main").strip()
+    if not branch_name:
+        raise HTTPException(status_code=400, detail="branch_name is required")
+    if not from_branch:
+        raise HTTPException(status_code=400, detail="from_branch is required")
+    entity = _normalized_entity(payload.entity)
+
+    client = _get_github_client()
+    _require_repo_access(client, repo, access="code_write")
+    try:
+        branch_obj = client.create_branch(repo=repo, branch_name=branch_name, from_branch=from_branch)
+    except GitHubError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message)
+
+    branch_ref = (branch_obj.get("ref") or "").strip()
+    details = {
+        "repo": repo,
+        "branch_name": branch_name,
+        "from_branch": from_branch,
+        "ref": branch_ref,
+    }
+    action_id = _log_github_action(
+        entity=entity,
+        action_type="branch",
+        repo=repo,
+        details=details,
+        session_id=payload.session_id,
+    )
+    return JSONResponse(content={
+        "success": True,
+        "branch_name": branch_name,
+        "ref": branch_ref,
+        "action_id": action_id,
+    })
+
+
+@github_router.post("/pull-request")
+async def github_pull_request(payload: GitHubPullRequestRequest):
+    repo = _validate_repo_name(payload.repo)
+    title = (payload.title or "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="title is required")
+    head_branch = (payload.head_branch or "").strip()
+    base_branch = (payload.base_branch or "main").strip()
+    if not head_branch:
+        raise HTTPException(status_code=400, detail="head_branch is required")
+    if not base_branch:
+        raise HTTPException(status_code=400, detail="base_branch is required")
+    entity = _normalized_entity(payload.entity)
+
+    client = _get_github_client()
+    _require_repo_access(client, repo, access="code_write")
+    try:
+        pr = client.create_pull_request(
+            repo=repo,
+            title=title,
+            body=(payload.body or "").strip(),
+            head_branch=head_branch,
+            base_branch=base_branch,
+        )
+    except GitHubError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message)
+
+    number = pr.get("number")
+    pr_url = (pr.get("html_url") or "").strip()
+    status = (pr.get("state") or "").strip()
+    details = {
+        "repo": repo,
+        "title": title,
+        "head_branch": head_branch,
+        "base_branch": base_branch,
+        "number": number,
+        "url": pr_url,
+        "status": status,
+    }
+    action_id = _log_github_action(
+        entity=entity,
+        action_type="pr",
+        repo=repo,
+        details=details,
+        session_id=payload.session_id,
+    )
+    card = {
+        "type": "pr",
+        "title": title,
+        "branch": f"{head_branch}->{base_branch}",
+        "url": pr_url,
+    }
+    _maybe_attach_card_to_thread(
+        session_id=payload.session_id,
+        entity=entity,
+        title=f"Opened PR: {title}",
+        card=card,
+    )
+    return JSONResponse(content={
+        "success": True,
+        "number": number,
+        "url": pr_url,
+        "status": status,
+        "action_id": action_id,
+        "chat_card": card,
+    })
+
+
+@github_router.get("/repos")
+async def github_repos():
+    client = _get_github_client()
+    try:
+        repos = client.list_repos()
+    except GitHubError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message)
+
+    items = []
+    for repo in repos:
+        items.append({
+            "name": repo.get("full_name") or repo.get("name"),
+            "description": repo.get("description") or "",
+            "default_branch": repo.get("default_branch") or "main",
+            "last_updated": repo.get("updated_at"),
+        })
+    return JSONResponse(content={"repos": items})
+
+
+@github_router.get("/repo/tree")
+async def github_repo_tree(repo: str, branch: str = "main"):
+    repo_name = _validate_repo_name(repo)
+    branch_name = (branch or "main").strip()
+
+    client = _get_github_client()
+    _require_repo_access(client, repo_name, access="read")
+    try:
+        tree = client.get_repo_tree(repo=repo_name, branch=branch_name)
+    except GitHubError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message)
+
+    entries = tree.get("tree") or []
+    return JSONResponse(content={
+        "repo": repo_name,
+        "branch": branch_name,
+        "entries": [
+            {
+                "path": e.get("path"),
+                "type": e.get("type"),
+                "size": e.get("size"),
+                "sha": e.get("sha"),
+                "url": e.get("url"),
+            }
+            for e in entries
+        ],
+    })
+
+
+@github_router.get("/file")
+async def github_file(repo: str, file_path: str, branch: str = "main"):
+    repo_name = _validate_repo_name(repo)
+    path = (file_path or "").strip().lstrip("/")
+    branch_name = (branch or "main").strip()
+    if not path:
+        raise HTTPException(status_code=400, detail="file_path is required")
+
+    client = _get_github_client()
+    _require_repo_access(client, repo_name, access="read")
+    try:
+        file_obj = client.get_file(repo=repo_name, file_path=path, branch=branch_name)
+    except GitHubError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message)
+
+    raw_content = file_obj.get("content") or ""
+    encoding = (file_obj.get("encoding") or "").lower()
+    decoded = ""
+    if encoding == "base64" and raw_content:
+        try:
+            decoded = base64.b64decode(raw_content).decode("utf-8")
+        except Exception:
+            decoded = ""
+
+    return JSONResponse(content={
+        "repo": repo_name,
+        "branch": branch_name,
+        "file_path": path,
+        "sha": file_obj.get("sha"),
+        "content": decoded,
+    })
+
+
+@github_router.post("/issue")
+async def github_issue(payload: GitHubIssueRequest):
+    repo = _validate_repo_name(payload.repo)
+    title = (payload.title or "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="title is required")
+    entity = _normalized_entity(payload.entity)
+    labels = [str(lbl).strip() for lbl in payload.labels if str(lbl).strip()]
+
+    client = _get_github_client()
+    _require_repo_access(client, repo, access="issue_write")
+    try:
+        issue = client.create_issue(
+            repo=repo,
+            title=title,
+            body=(payload.body or "").strip(),
+            labels=labels,
+        )
+    except GitHubError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.message)
+
+    number = issue.get("number")
+    issue_url = (issue.get("html_url") or "").strip()
+    details = {
+        "repo": repo,
+        "title": title,
+        "number": number,
+        "labels": labels,
+        "url": issue_url,
+        "status": issue.get("state"),
+    }
+    action_id = _log_github_action(
+        entity=entity,
+        action_type="issue",
+        repo=repo,
+        details=details,
+        session_id=payload.session_id,
+    )
+    card = {
+        "type": "issue",
+        "title": title,
+        "url": issue_url,
+    }
+    _maybe_attach_card_to_thread(
+        session_id=payload.session_id,
+        entity=entity,
+        title=f"Opened Issue: {title}",
+        card=card,
+    )
+    return JSONResponse(content={
+        "success": True,
+        "number": number,
+        "url": issue_url,
+        "status": issue.get("state"),
+        "action_id": action_id,
+        "chat_card": card,
+    })
+
 # ============================================================================
 # FASTAPI APPLICATION
 # ============================================================================
@@ -1185,6 +2064,7 @@ app = FastAPI(
     version="1.0",
     lifespan=lifespan
 )
+app.include_router(github_router)
 
 # Cross-origin support for mobile/web clients hitting deployed API domains.
 app.add_middleware(
@@ -1292,13 +2172,7 @@ async def chat_sync(request: Request):
         return JSONResponse(content=result)
     except Exception as e:
         logger.exception(f"chat_sync failed for thread_id={thread_id}: {e}")
-        return JSONResponse(
-            status_code=503,
-            content={
-                "error": "Upstream model service unavailable. Please retry.",
-                "thread_id": thread_id,
-            },
-        )
+        return _chat_sync_error_response(e, thread_id=thread_id)
 
 
 @app.get("/api/threads")
@@ -1332,6 +2206,10 @@ async def thread_messages(thread_id: int, limit: int = 300):
 @app.get("/api/status")
 async def status():
     """System status"""
+    web_search_available = bool(
+        state.claude_model
+        and getattr(state.claude_model, "enable_web_search", False)
+    )
     info = {
         "ready": state.ready,
         "model": config.CLAUDE_MODEL,
@@ -1343,6 +2221,10 @@ async def status():
         "voice_validator": state.voice_validator is not None,
         "relationship_memory": state.relationship_db is not None,
         "emotion_model": f"API ({getattr(config, 'EMOTION_MODEL', 'gpt-4o-mini')})" if state.emotion_detector else "neutral-fallback",
+        "web_search_enabled": web_search_available,
+        "web_search_provider": "brave" if web_search_available else "disabled",
+        "continuity_enabled": state.memory_manager is not None,
+        "memory_encryption_enabled": bool(getattr(config, "MEMORY_ENCRYPTION_KEY", "")),
         "turns_this_session": state.turn_count
     }
 
@@ -1393,6 +2275,80 @@ async def search_memories(q: str, k: int = 5, personality: str = "sylana"):
         "conversations": results.get('conversations', []),
         "core_memories": results.get('core_memories', [])
     })
+
+
+@app.post("/api/memories/privacy")
+async def set_memory_privacy(request: Request):
+    """Update privacy level for a memory row."""
+    body = await request.json()
+    memory_id = body.get("memory_id")
+    privacy_level = (body.get("privacy_level") or "").strip().lower()
+    if privacy_level not in {"private", "shared", "public"}:
+        return JSONResponse(status_code=400, content={"error": "privacy_level must be private|shared|public"})
+    try:
+        memory_id = int(memory_id)
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "memory_id must be an integer"})
+
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "UPDATE memories SET privacy_level = %s WHERE id = %s RETURNING id",
+            (privacy_level, memory_id),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        if not row:
+            return JSONResponse(status_code=404, content={"error": "Memory not found"})
+        return JSONResponse(content={"ok": True, "memory_id": memory_id, "privacy_level": privacy_level})
+    except Exception as e:
+        _safe_rollback(conn, "set_memory_privacy")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.delete("/api/memories/{memory_id}")
+async def delete_memory(memory_id: int):
+    """Delete a memory row for privacy lifecycle control."""
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("DELETE FROM memories WHERE id = %s RETURNING id", (memory_id,))
+        row = cur.fetchone()
+        conn.commit()
+        if not row:
+            return JSONResponse(status_code=404, content={"error": "Memory not found"})
+        return JSONResponse(content={"ok": True, "deleted_memory_id": memory_id})
+    except Exception as e:
+        _safe_rollback(conn, "delete_memory")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.post("/api/memories/backup")
+async def backup_memories(request: Request):
+    """Write a memory integrity snapshot to local disk."""
+    if not state.memory_manager:
+        return JSONResponse(status_code=503, content={"error": "Memory system not ready"})
+    body = await request.json()
+    out_path = (body.get("path") or "data/memory_snapshot.json").strip()
+    result = state.memory_manager.backup_memory_integrity(out_path)
+    code = 200 if result.get("ok") else 500
+    return JSONResponse(status_code=code, content=result)
+
+
+@app.post("/api/memories/recover")
+async def recover_memories(request: Request):
+    """Recover memory rows from a snapshot file."""
+    if not state.memory_manager:
+        return JSONResponse(status_code=503, content={"error": "Memory system not ready"})
+    body = await request.json()
+    in_path = (body.get("path") or "").strip()
+    personality = (body.get("personality") or "sylana").strip().lower()
+    if not in_path:
+        return JSONResponse(status_code=400, content={"error": "path is required"})
+    result = state.memory_manager.recover_memory_integrity(in_path, personality=personality)
+    code = 200 if result.get("ok") else 500
+    return JSONResponse(status_code=code, content=result)
 
 
 @app.get("/api/health")

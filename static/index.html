@@ -274,6 +274,51 @@
             max-width: 500px;
         }
 
+        .github-card {
+            background: linear-gradient(160deg, #152233, #121622);
+            border: 1px solid #28405f;
+            border-radius: 14px;
+            padding: 12px 14px;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+
+        .github-card-type {
+            display: inline-flex;
+            width: fit-content;
+            font-size: 10px;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+            color: #93c5fd;
+            background: rgba(59, 130, 246, 0.12);
+            border: 1px solid rgba(59, 130, 246, 0.35);
+            border-radius: 999px;
+            padding: 3px 8px;
+        }
+
+        .github-card-title {
+            font-size: 13px;
+            font-weight: 600;
+            color: var(--text);
+            line-height: 1.4;
+        }
+
+        .github-card-meta {
+            font-size: 12px;
+            color: var(--text-dim);
+        }
+
+        .github-card-link {
+            font-size: 12px;
+            color: #60a5fa;
+            text-decoration: none;
+        }
+
+        .github-card-link:hover {
+            text-decoration: underline;
+        }
+
         .typing-indicator {
             display: inline-flex;
             gap: 4px;
@@ -628,7 +673,7 @@
                     if (msg.role === 'user') {
                         addMessage('user', msg.content);
                     } else {
-                        addMessage('assistant', msg.content, msg.emotion, msg.voice_score, msg.personality || 'sylana');
+                        addMessage('assistant', msg.content, msg.emotion, msg.voice_score, msg.personality || 'sylana', msg.metadata || null);
                     }
                 }
             } catch (e) {
@@ -701,7 +746,43 @@
         }
         checkReady();
 
-        function addMessage(role, text, emotion, voiceScore, personality = 'sylana') {
+        function renderGitHubCard(card) {
+            if (!card || !card.type) return '';
+            const type = String(card.type || '').toUpperCase();
+            const url = card.url ? `<a class="github-card-link" href="${escapeHtml(card.url)}" target="_blank" rel="noopener noreferrer">Open on GitHub</a>` : '';
+            if (card.type === 'commit') {
+                return `
+                    <div class="github-card">
+                        <span class="github-card-type">${type}</span>
+                        <div class="github-card-title">${escapeHtml(card.filename || 'File updated')}</div>
+                        <div class="github-card-meta">${escapeHtml(card.message || '')}</div>
+                        ${url}
+                    </div>
+                `;
+            }
+            if (card.type === 'pr') {
+                return `
+                    <div class="github-card">
+                        <span class="github-card-type">${type}</span>
+                        <div class="github-card-title">${escapeHtml(card.title || 'Pull request opened')}</div>
+                        <div class="github-card-meta">${escapeHtml(card.branch || '')}</div>
+                        ${url}
+                    </div>
+                `;
+            }
+            if (card.type === 'issue') {
+                return `
+                    <div class="github-card">
+                        <span class="github-card-type">${type}</span>
+                        <div class="github-card-title">${escapeHtml(card.title || 'Issue opened')}</div>
+                        ${url}
+                    </div>
+                `;
+            }
+            return '';
+        }
+
+        function addMessage(role, text, emotion, voiceScore, personality = 'sylana', metadata = null) {
             const welcomeNode = document.getElementById('welcome');
             if (welcomeNode) welcomeNode.style.display = 'none';
 
@@ -722,9 +803,11 @@
                 }
             }
 
+            const cardHtml = renderGitHubCard(metadata && metadata.github_card ? metadata.github_card : null);
+            const bubbleContent = cardHtml || escapeHtml(text);
             msg.innerHTML = `
                 <div class="message-header">${headerHTML}</div>
-                <div class="message-bubble ${role === 'user' ? 'user' : 'sylana'}">${escapeHtml(text)}</div>
+                <div class="message-bubble ${role === 'user' ? 'user' : 'sylana'}">${bubbleContent}</div>
             `;
 
             chatContainer.appendChild(msg);

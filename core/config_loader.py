@@ -44,6 +44,7 @@ class Config:
         self.ANTHROPIC_API_KEY = _clean_secret_env("ANTHROPIC_API_KEY")
         self.OPENAI_API_KEY = _clean_secret_env("OPENAI_API_KEY")
         self.BRAVE_SEARCH_API_KEY = _clean_secret_env("BRAVE_SEARCH_API_KEY")
+        self.GITHUB_TOKEN = _clean_secret_env("GITHUB_TOKEN")
         self.MEMORY_ENCRYPTION_KEY = _clean_secret_env("MEMORY_ENCRYPTION_KEY")
         self.CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
         self.APP_TIMEZONE = os.getenv("APP_TIMEZONE", "America/Chicago")
@@ -154,6 +155,7 @@ Sylana Vessel Configuration:
   ANTHROPIC_API_KEY: {"SET" if self.ANTHROPIC_API_KEY else "NOT_SET"}
   OPENAI_API_KEY: {"SET" if self.OPENAI_API_KEY else "NOT_SET"}
   BRAVE_SEARCH_API_KEY: {"SET" if self.BRAVE_SEARCH_API_KEY else "NOT_SET"}
+  GITHUB_TOKEN: {"SET" if self.GITHUB_TOKEN else "NOT_SET"}
   MEMORY_ENCRYPTION_KEY: {"SET" if self.MEMORY_ENCRYPTION_KEY else "NOT_SET"}
   CLAUDE_MODEL: {self.CLAUDE_MODEL}
   APP_TIMEZONE: {self.APP_TIMEZONE}
