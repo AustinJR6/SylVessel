@@ -2022,6 +2022,21 @@ def _normalize_email(value: Optional[str]) -> Optional[str]:
     return email
 
 
+def _email_domain(email: str) -> str:
+    value = (email or "").strip().lower()
+    if "@" not in value:
+        return ""
+    return value.split("@", 1)[1]
+
+
+def _email_matches_host(email: str, host: str) -> bool:
+    domain = _email_domain(email)
+    host = (host or "").strip().lower()
+    if not domain or not host:
+        return False
+    return host == domain or host.endswith(f".{domain}") or domain.endswith(f".{host}")
+
+
 def _find_contact_for_company(company: str, website: str) -> Dict[str, Optional[str]]:
     """
     Best-effort enrichment using targeted web search snippets.
@@ -2054,7 +2069,7 @@ def _find_contact_for_company(company: str, website: str) -> Dict[str, Optional[
             email = _normalize_email(hints.get("email"))
             if email:
                 # Prefer emails that match discovered website domain.
-                if host and email.endswith(f"@{host}"):
+                if host and _email_matches_host(email, host):
                     return {"email": email, "phone": hints.get("phone")}
                 if not best_email:
                     best_email = email
@@ -2533,6 +2548,8 @@ def run_prospect_research_session(
             enriched = _find_contact_for_company(company, website)
             final_email = enriched.get("email") or contact_hints.get("email")
             final_phone = enriched.get("phone") or contact_hints.get("phone")
+            if domain and final_email and not _email_matches_host(final_email, domain):
+                final_email = None
             # Require contactable leads for outreach.
             if not final_email:
                 _update_task(
