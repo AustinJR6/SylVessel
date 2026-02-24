@@ -2014,9 +2014,24 @@ def _is_blocked_lead_result(result: Dict[str, Any]) -> bool:
 def _likely_business_result(result: Dict[str, Any]) -> bool:
     if _is_blocked_lead_result(result):
         return False
+    url = (result.get("url") or "").lower()
     title = (result.get("title") or "").lower()
     snippet = (result.get("snippet") or "").lower()
     text = f"{title} {snippet}"
+    low_intent_patterns = [
+        "near me",
+        "best solar",
+        "top solar",
+        "solar reviews",
+        "compare solar",
+        "solar quotes",
+        "directory",
+        "forum",
+    ]
+    if any(p in text for p in low_intent_patterns):
+        return False
+    if any(seg in url for seg in ["/blog/", "/news/", "/forum/"]):
+        return False
     solar_hits = sum(1 for kw in ["solar", "installer", "installation", "energy", "roof"] if kw in text)
     return solar_hits >= 1
 
@@ -2106,12 +2121,19 @@ def _find_contact_for_company(company: str, website: str) -> Dict[str, Optional[
 
 def _parse_company_from_result(result: Dict[str, Any]) -> str:
     title = (result.get("title") or "").strip()
+    url_host = _hostname_from_url(result.get("url") or "")
     if not title:
-        return "Unknown Solar Installer"
+        base = _registrable_domain(url_host)
+        return (base.split(".")[0].replace("-", " ").title() if base else "Unknown Solar Installer")
     for sep in ["|", "-", "—", "–", ":"]:
         if sep in title:
             title = title.split(sep, 1)[0].strip()
             break
+    generic = {"contact us", "home", "about us", "find solar installers near me"}
+    if title.strip().lower() in generic:
+        base = _registrable_domain(url_host)
+        if base:
+            return base.split(".")[0].replace("-", " ").title()[:140]
     return title[:140] or "Unknown Solar Installer"
 
 
