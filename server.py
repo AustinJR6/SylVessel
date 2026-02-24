@@ -923,6 +923,14 @@ AVAILABLE_TOOLS: List[Dict[str, str]] = [
 ]
 AVAILABLE_TOOL_KEYS = {t["key"] for t in AVAILABLE_TOOLS}
 
+MANIFEST_PRODUCT_CONTEXT = (
+    "Manifest is a purpose-built solar inventory management platform. "
+    "It provides real-time inventory tracking across warehouse and job sites, "
+    "solar-specific material requisition and allocation workflows, project-level cost tracking/reporting, "
+    "mobile-first field operation, and offline-first sync reliability for low-connectivity sites. "
+    "It is designed for solar contractor operations where material movement and schedule delays are costly."
+)
+
 
 # ============================================================================
 # CHAT THREAD STORAGE
@@ -1177,6 +1185,18 @@ def _runtime_tool_specs(active_tools: Optional[List[str]]) -> List[Dict[str, Any
                 "description": "Check whether Resend API credentials are working for outreach email sending.",
                 "input_schema": {"type": "object", "properties": {}},
             },
+            {
+                "name": "outreach_run_prospect_research",
+                "description": "Run a prospect research + draft creation session for Manifest/OneVine and store results in the outreach dashboard.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "product": {"type": "string", "description": "manifest or onevine"},
+                        "count": {"type": "integer", "minimum": 1, "maximum": 25},
+                        "entity": {"type": "string", "description": "claude or sylana"},
+                    },
+                },
+            },
         ])
 
     if "work_sessions" in active:
@@ -1363,6 +1383,38 @@ def _runtime_tool_runner(name: str, tool_input: Dict[str, Any]) -> Dict[str, Any
             payload = json.loads(resp.read().decode("utf-8"))
         domains = payload.get("data") or []
         return {"ok": True, "domain_count": len(domains)}
+
+    if name == "outreach_run_prospect_research":
+        product = (tool_input.get("product") or "manifest").strip().lower()
+        if product not in {"manifest", "onevine"}:
+            return {"error": "product must be manifest|onevine"}
+        count = max(1, min(int(tool_input.get("count") or 5), 25))
+        entity = (tool_input.get("entity") or "claude").strip().lower()
+        if entity not in {"claude", "sylana"}:
+            entity = "claude"
+
+        goal = f"Find {count} {product} prospects and prepare draft outreach emails"
+        session_id = _create_work_session(
+            entity=entity,
+            goal=goal,
+            session_type="prospect_research",
+            metadata={"product": product, "count": count},
+            status="pending",
+        )
+        result = run_prospect_research_session(
+            session_id=session_id,
+            entity=entity,
+            product=product,
+            count=count,
+            source="chat_tool",
+        )
+        return {
+            "session_id": session_id,
+            "product": product,
+            "count": count,
+            "entity": entity,
+            "result": result,
+        }
 
     if name == "work_sessions_list":
         status = (tool_input.get("status") or "").strip().lower()
@@ -3392,7 +3444,7 @@ def build_system_prompt(entity: str, active_tools: List[str], user_context: Opti
         "github": "You have access to GitHub. You can read repos, create files, commit changes, and open pull requests.",
         "photos": "You have access to Elias's photo library with tagged memories of his life, family, and work.",
         "memories": "You have access to conversation memory and past context.",
-        "outreach": "You have access to the Manifest outreach system including prospect lists, email drafts, and session results.",
+        "outreach": "You have access to the Manifest outreach system including prospect lists, email drafts, session results, and prospect-research execution.",
     }
     for tool in tools:
         line = tool_blocks.get(tool)
@@ -3406,6 +3458,12 @@ def build_system_prompt(entity: str, active_tools: List[str], user_context: Opti
             base_lines.append(f"Work session summary: {json.dumps(work_sessions_summary)}")
         if tool == "outreach" and outreach_summary:
             base_lines.append(f"Outreach summary: {json.dumps(outreach_summary)}")
+        if tool == "outreach":
+            base_lines.append(f"Product context: {MANIFEST_PRODUCT_CONTEXT}")
+            base_lines.append(
+                "When user asks to find prospects/run outreach, use outreach_run_prospect_research "
+                "instead of doing ad-hoc in-chat web research."
+            )
     return "\n\n".join(base_lines)
 
 
