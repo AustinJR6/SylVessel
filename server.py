@@ -29,7 +29,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 from urllib.request import Request as UrlRequest, urlopen
 from urllib.error import HTTPError, URLError
 
@@ -1947,6 +1947,123 @@ def _run_web_search(query: str, count: int = 8) -> Dict[str, Any]:
     return {"query": query, "count": count, "results": []}
 
 
+LEAD_BLOCKED_DOMAINS = {
+    "reddit.com",
+    "www.reddit.com",
+    "x.com",
+    "www.x.com",
+    "twitter.com",
+    "www.twitter.com",
+    "facebook.com",
+    "www.facebook.com",
+    "instagram.com",
+    "www.instagram.com",
+    "youtube.com",
+    "www.youtube.com",
+    "tiktok.com",
+    "www.tiktok.com",
+    "linkedin.com",
+    "www.linkedin.com",
+    "news.google.com",
+    "wikipedia.org",
+    "www.wikipedia.org",
+}
+
+BUSINESS_EMAIL_BLOCKED_DOMAINS = {
+    "gmail.com",
+    "yahoo.com",
+    "hotmail.com",
+    "outlook.com",
+    "icloud.com",
+    "aol.com",
+    "proton.me",
+    "protonmail.com",
+}
+
+
+def _hostname_from_url(url: str) -> str:
+    try:
+        host = (urlparse((url or "").strip()).hostname or "").lower()
+    except Exception:
+        return ""
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def _is_blocked_lead_result(result: Dict[str, Any]) -> bool:
+    host = _hostname_from_url(result.get("url") or "")
+    if not host:
+        return True
+    if host in LEAD_BLOCKED_DOMAINS:
+        return True
+    return any(host == d or host.endswith(f".{d}") for d in LEAD_BLOCKED_DOMAINS)
+
+
+def _likely_business_result(result: Dict[str, Any]) -> bool:
+    if _is_blocked_lead_result(result):
+        return False
+    title = (result.get("title") or "").lower()
+    snippet = (result.get("snippet") or "").lower()
+    text = f"{title} {snippet}"
+    solar_hits = sum(1 for kw in ["solar", "installer", "installation", "energy", "roof"] if kw in text)
+    return solar_hits >= 1
+
+
+def _normalize_email(value: Optional[str]) -> Optional[str]:
+    email = (value or "").strip().lower()
+    if not email or "@" not in email:
+        return None
+    local, domain = email.split("@", 1)
+    if not local or not domain:
+        return None
+    if domain in BUSINESS_EMAIL_BLOCKED_DOMAINS:
+        return None
+    return email
+
+
+def _find_contact_for_company(company: str, website: str) -> Dict[str, Optional[str]]:
+    """
+    Best-effort enrichment using targeted web search snippets.
+    This intentionally avoids page crawling to keep runtime bounded.
+    """
+    host = _hostname_from_url(website)
+    domain_query = f"site:{host} contact email" if host else ""
+    queries = [
+        q for q in [
+            domain_query,
+            f"\"{company}\" solar installer contact email",
+            f"\"{company}\" \"@\" \"solar\"",
+            f"\"{company}\" \"contact us\"",
+        ] if q
+    ]
+
+    best_email: Optional[str] = None
+    best_phone: Optional[str] = None
+
+    for query in queries:
+        try:
+            payload = _run_web_search(query, count=6)
+            rows = (payload or {}).get("results") or []
+        except Exception:
+            rows = []
+        for row in rows:
+            if _is_blocked_lead_result(row):
+                continue
+            hints = _extract_contact_hints(row)
+            email = _normalize_email(hints.get("email"))
+            if email:
+                # Prefer emails that match discovered website domain.
+                if host and email.endswith(f"@{host}"):
+                    return {"email": email, "phone": hints.get("phone")}
+                if not best_email:
+                    best_email = email
+            if not best_phone and hints.get("phone"):
+                best_phone = hints.get("phone")
+
+    return {"email": best_email, "phone": best_phone}
+
+
 def _parse_company_from_result(result: Dict[str, Any]) -> str:
     title = (result.get("title") or "").strip()
     if not title:
@@ -1963,7 +2080,7 @@ def _extract_contact_hints(result: Dict[str, Any]) -> Dict[str, Any]:
     email_match = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", snippet)
     phone_match = re.search(r"(?:\+?1[\s\-.]?)?\(?\d{3}\)?[\s\-.]?\d{3}[\s\-.]?\d{4}", snippet)
     return {
-        "email": email_match.group(0) if email_match else None,
+        "email": _normalize_email(email_match.group(0) if email_match else None),
         "phone": phone_match.group(0) if phone_match else None,
     }
 
@@ -2345,39 +2462,62 @@ def run_prospect_research_session(
     failures = 0
 
     _update_work_session(session_id, status="running", metadata={"source": source, "product": product, "target_count": max_count})
-    base_query = (
-        "solar installation companies without inventory software"
+    search_queries = (
+        [
+            "solar installation company contact us -reddit -linkedin -facebook -instagram",
+            "residential solar installer about us contact email -reddit -linkedin",
+            "commercial solar contractor website contact -reddit -social",
+        ]
         if product == "manifest"
-        else "solar installation companies growing operations"
+        else [
+            "solar installation company operations growth contact us -reddit -linkedin",
+            "solar contractor teams contact email -reddit -social",
+        ]
     )
 
-    search_task_id = _create_task(
-        session_id=session_id,
-        task_type="web_search",
-        execution_order=order,
-        input_payload={"query": base_query, "count": max_count * 3},
-        status="running",
-    )
-    order += 1
+    raw_results: List[Dict[str, Any]] = []
+    for query in search_queries:
+        search_task_id = _create_task(
+            session_id=session_id,
+            task_type="web_search",
+            execution_order=order,
+            input_payload={"query": query, "count": max_count * 4},
+            status="running",
+        )
+        order += 1
+        try:
+            search_results = _run_web_search(query, count=max_count * 4)
+            rows = (search_results or {}).get("results") or []
+            raw_results.extend(rows)
+            _update_task(search_task_id, status="completed", output_payload={"query": query, "result_count": len(rows)})
+        except Exception as e:
+            failures += 1
+            _update_task(search_task_id, status="failed", error=str(e))
 
-    try:
-        search_results = _run_web_search(base_query, count=max_count * 3)
-        _update_task(search_task_id, status="completed", output_payload=search_results)
-    except Exception as e:
-        _update_task(search_task_id, status="failed", error=str(e))
-        _update_work_session(session_id, status="failed", summary=f"Initial search failed: {e}")
+    if not raw_results:
+        _update_work_session(session_id, status="failed", summary="No search results returned")
         return {"session_id": session_id, "prospects_created": 0, "drafts_created": 0, "status": "failed"}
 
-    raw_results = (search_results or {}).get("results") or []
     seen_companies = set()
+    seen_domains = set()
 
     for result in raw_results:
         if prospects_created >= max_count:
             break
+        if not _likely_business_result(result):
+            continue
+
+        website = (result.get("url") or "").strip()
+        domain = _hostname_from_url(website)
+        if domain and domain in seen_domains:
+            continue
+
         company = _parse_company_from_result(result)
         if company.lower() in seen_companies:
             continue
         seen_companies.add(company.lower())
+        if domain:
+            seen_domains.add(domain)
 
         research_task_id = _create_task(
             session_id=session_id,
@@ -2390,18 +2530,30 @@ def run_prospect_research_session(
 
         try:
             contact_hints = _extract_contact_hints(result)
-            website = (result.get("url") or "").strip()
+            enriched = _find_contact_for_company(company, website)
+            final_email = enriched.get("email") or contact_hints.get("email")
+            final_phone = enriched.get("phone") or contact_hints.get("phone")
+            # Require contactable leads for outreach.
+            if not final_email:
+                _update_task(
+                    research_task_id,
+                    status="failed",
+                    error="no_business_email_found",
+                    output_payload={"company_name": company, "website": website},
+                )
+                failures += 1
+                continue
             profile = {
                 "company_name": company,
                 "contact_name": "",
                 "contact_title": "",
-                "email": contact_hints.get("email"),
-                "phone": contact_hints.get("phone"),
+                "email": final_email,
+                "phone": final_phone,
                 "website": website,
                 "location": "",
                 "company_size": "",
                 "notes": (result.get("snippet") or "")[:500],
-                "source": f"web_search:{base_query}",
+                "source": f"web_search:{domain or 'unknown'}",
                 "product": product,
                 "status": "new",
                 "session_id": session_id,
