@@ -1980,6 +1980,17 @@ BUSINESS_EMAIL_BLOCKED_DOMAINS = {
     "protonmail.com",
 }
 
+COMMON_PUBLIC_SUFFIXES = {
+    "co.uk",
+    "org.uk",
+    "gov.uk",
+    "ac.uk",
+    "com.au",
+    "net.au",
+    "org.au",
+    "co.nz",
+}
+
 
 def _hostname_from_url(url: str) -> str:
     try:
@@ -2029,12 +2040,25 @@ def _email_domain(email: str) -> str:
     return value.split("@", 1)[1]
 
 
+def _registrable_domain(host_or_domain: str) -> str:
+    value = (host_or_domain or "").strip().lower().strip(".")
+    if not value:
+        return ""
+    parts = [p for p in value.split(".") if p]
+    if len(parts) < 2:
+        return value
+    suffix2 = ".".join(parts[-2:])
+    suffix3 = ".".join(parts[-3:]) if len(parts) >= 3 else ""
+    if suffix2 in COMMON_PUBLIC_SUFFIXES and suffix3:
+        return suffix3
+    return suffix2
+
+
 def _email_matches_host(email: str, host: str) -> bool:
     domain = _email_domain(email)
-    host = (host or "").strip().lower()
     if not domain or not host:
         return False
-    return host == domain or host.endswith(f".{domain}") or domain.endswith(f".{host}")
+    return _registrable_domain(domain) == _registrable_domain(host)
 
 
 def _find_contact_for_company(company: str, website: str) -> Dict[str, Optional[str]]:
@@ -2043,6 +2067,7 @@ def _find_contact_for_company(company: str, website: str) -> Dict[str, Optional[
     This intentionally avoids page crawling to keep runtime bounded.
     """
     host = _hostname_from_url(website)
+    target_domain = _registrable_domain(host)
     domain_query = f"site:{host} contact email" if host else ""
     queries = [
         q for q in [
@@ -2068,10 +2093,10 @@ def _find_contact_for_company(company: str, website: str) -> Dict[str, Optional[
             hints = _extract_contact_hints(row)
             email = _normalize_email(hints.get("email"))
             if email:
-                # Prefer emails that match discovered website domain.
-                if host and _email_matches_host(email, host):
+                # Prefer and require same-business emails when website domain is known.
+                if target_domain and _email_matches_host(email, target_domain):
                     return {"email": email, "phone": hints.get("phone")}
-                if not best_email:
+                if not target_domain and not best_email:
                     best_email = email
             if not best_phone and hints.get("phone"):
                 best_phone = hints.get("phone")
@@ -2524,15 +2549,17 @@ def run_prospect_research_session(
 
         website = (result.get("url") or "").strip()
         domain = _hostname_from_url(website)
-        if domain and domain in seen_domains:
+        target_domain = _registrable_domain(domain)
+        domain_key = target_domain or domain
+        if domain_key and domain_key in seen_domains:
             continue
 
         company = _parse_company_from_result(result)
         if company.lower() in seen_companies:
             continue
         seen_companies.add(company.lower())
-        if domain:
-            seen_domains.add(domain)
+        if domain_key:
+            seen_domains.add(domain_key)
 
         research_task_id = _create_task(
             session_id=session_id,
@@ -2548,7 +2575,7 @@ def run_prospect_research_session(
             enriched = _find_contact_for_company(company, website)
             final_email = enriched.get("email") or contact_hints.get("email")
             final_phone = enriched.get("phone") or contact_hints.get("phone")
-            if domain and final_email and not _email_matches_host(final_email, domain):
+            if target_domain and final_email and not _email_matches_host(final_email, target_domain):
                 final_email = None
             # Require contactable leads for outreach.
             if not final_email:
