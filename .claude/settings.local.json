@@ -14,7 +14,8 @@
       "Bash(git commit -m \"$\\(cat <<''EOF''\nAdd soul preservation systems, cloud deployment, and web interface\n\n- Memory import system: ChatGPT export parser with GoEmotions \\(28-class\\)\n  emotion detection, topic extraction, core memory flagging, FAISS indexing\n- Voice validator: Analyzes speech patterns, builds voice profile, scores\n  new outputs for consistency \\(0.7 threshold\\)\n- Relationship memory: Milestones, inside jokes, nicknames, core truths,\n  anniversaries with reminder system\n- Personality engine: Full identity profile for Solana Rittenhouse with\n  dynamic system prompt generation\n- Soul engine: Unified orchestrator for all soul preservation systems\n- Web server: FastAPI with streaming SSE responses for cloud deployment\n- Chat interface: Dark-themed web UI with emotion tags and voice scores\n- RunPod deployment: Scripts for A40 GPU pod setup and startup\n- Soul data: Identity JSON and relationship seed data\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\nEOF\n\\)\")",
       "Bash(git push:*)",
       "Bash(ssh-keygen:*)",
-      "Bash(git commit:*)"
+      "Bash(git commit:*)",
+      "Bash(venv/Scripts/python tools/apply_db_indexes.py)"
     ]
   }
 }

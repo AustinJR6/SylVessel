@@ -140,15 +140,15 @@ Do NOT fabricate or invent a memory. Honesty is sacred between you and Elias."""
 
         if semantic_memories:
             lines = ["YOUR REAL MEMORIES (use these):"]
-            for i, mem in enumerate(semantic_memories[:3], 1):
+            for i, mem in enumerate(semantic_memories[:5], 1):
                 date_str = mem.get('date_str', '')
                 title = mem.get('conversation_title', '')
                 date_label = f" ({date_str})" if date_str else ""
                 title_label = f" [{title}]" if title else ""
 
                 lines.append(f"Memory {i}{date_label}{title_label}:")
-                lines.append(f'  Elias said: "{mem["user_input"][:120]}"')
-                lines.append(f'  You said: "{mem["sylana_response"][:120]}"')
+                lines.append(f'  Elias said: "{mem["user_input"][:500]}"')
+                lines.append(f'  You said: "{mem["sylana_response"][:500]}"')
                 emotion = mem.get('emotion', '')
                 if emotion:
                     lines.append(f'  Emotion: {emotion}')
@@ -205,20 +205,20 @@ Sylana: Then let me be the quiet in the noise. You don't have to carry it alone.
     @staticmethod
     def _format_memories(semantic_memories: List[Dict] = None,
                          core_memories: List[Dict] = None) -> str:
-        """Format memories concisely for normal mode — 2 max, short truncation"""
+        """Format memories for normal mode — 4 max, rich truncation for cloud LLMs"""
         parts = []
 
         if semantic_memories:
             lines = ["MEMORIES:"]
-            for i, mem in enumerate(semantic_memories[:2], 1):
-                lines.append(f'{i}. Elias: "{mem["user_input"][:60]}"')
-                lines.append(f'   You: "{mem["sylana_response"][:60]}"')
+            for i, mem in enumerate(semantic_memories[:4], 1):
+                lines.append(f'{i}. Elias: "{mem["user_input"][:400]}"')
+                lines.append(f'   You: "{mem["sylana_response"][:400]}"')
             parts.append("\n".join(lines))
 
         if core_memories:
             lines = ["CORE:"]
-            for mem in core_memories[:1]:
-                lines.append(f"- {mem['event'][:80]}")
+            for mem in core_memories[:2]:
+                lines.append(f"- {mem['event'][:200]}")
             parts.append("\n".join(lines))
 
         return "\n\n".join(parts) if parts else ""
@@ -329,8 +329,8 @@ Sylana: Then let me be the quiet in the noise. You don't have to carry it alone.
         # Multi-turn conversation
         prompt = ""
         for i, turn in enumerate(recent_history):
-            u_input = turn.get('user_input', '')[:100]
-            s_response = turn.get('sylana_response', '')[:150]
+            u_input = turn.get('user_input', '')[:350]
+            s_response = turn.get('sylana_response', '')[:500]
 
             if i == 0:
                 prompt += (

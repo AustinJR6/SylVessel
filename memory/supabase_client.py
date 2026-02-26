@@ -7,16 +7,19 @@ All modules import get_connection() from here instead of using sqlite3.
 import os
 import logging
 import time
+from contextlib import contextmanager
 from urllib.parse import urlparse
 
 import psycopg2
 import psycopg2.extras
+from psycopg2 import pool
 from psycopg2 import extensions
 from pgvector.psycopg2 import register_vector
 
 logger = logging.getLogger(__name__)
 
 _connection = None
+_pool = None
 
 
 def _discard_connection(reason: str = "") -> None:
@@ -33,6 +36,104 @@ def _discard_connection(reason: str = "") -> None:
         _connection = None
     if reason:
         logger.warning("Discarded Supabase connection: %s", reason)
+
+
+def _connection_kwargs(db_url: str) -> dict:
+    return {
+        "dsn": db_url,
+        "connect_timeout": 10,
+        "keepalives": 1,
+        "keepalives_idle": 30,
+        "keepalives_interval": 10,
+        "keepalives_count": 3,
+        "application_name": "sylana-vessel",
+    }
+
+
+def init_connection_pool(minconn: int = 1, maxconn: int = 8):
+    """Initialize pooled Supabase connections for concurrent requests."""
+    global _pool
+    if _pool is not None:
+        return _pool
+
+    db_url = _get_sanitized_db_url()
+    _log_connection_target(db_url)
+    env_min = int(os.getenv("DB_POOL_MIN", str(minconn or 1)))
+    env_max = int(os.getenv("DB_POOL_MAX", str(maxconn or 8)))
+    minconn = max(1, env_min)
+    maxconn = max(minconn, env_max)
+
+    try:
+        _pool = pool.ThreadedConnectionPool(minconn, maxconn, **_connection_kwargs(db_url))
+        logger.info("Initialized Supabase connection pool (min=%s max=%s)", minconn, maxconn)
+        return _pool
+    except Exception as e:
+        logger.warning("Failed to initialize connection pool; falling back to singleton connection: %s", e)
+        _pool = None
+        return None
+
+
+def get_pooled_connection():
+    """
+    Borrow a connection from the pool.
+    Falls back to singleton connection when pool is unavailable.
+    """
+    global _pool
+    if _pool is None:
+        init_connection_pool()
+    if _pool is None:
+        return get_connection()
+
+    conn = _pool.getconn()
+    conn.autocommit = False
+    register_vector(conn)
+    return conn
+
+
+def release_pooled_connection(conn):
+    """Return pooled connection to pool; close if pool is unavailable."""
+    global _pool
+    if conn is None:
+        return
+    if _pool is None:
+        try:
+            if not conn.closed:
+                conn.close()
+        except Exception:
+            pass
+        return
+    try:
+        if conn.get_transaction_status() == extensions.TRANSACTION_STATUS_INERROR:
+            conn.rollback()
+    except Exception:
+        pass
+    _pool.putconn(conn)
+
+
+@contextmanager
+def pooled_cursor(commit: bool = False):
+    """
+    Context-managed cursor on a pooled connection.
+    Use this in modular codepaths to avoid shared-connection contention.
+    """
+    conn = get_pooled_connection()
+    cur = conn.cursor()
+    try:
+        yield cur
+        if commit:
+            conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            cur.close()
+        except Exception:
+            pass
+        release_pooled_connection(conn)
 
 
 def _get_sanitized_db_url() -> str:
@@ -107,15 +208,7 @@ def get_connection():
     # Retry up to 3 times for transient network issues
     for attempt in range(3):
         try:
-            _connection = psycopg2.connect(
-                db_url,
-                connect_timeout=10,
-                keepalives=1,
-                keepalives_idle=30,
-                keepalives_interval=10,
-                keepalives_count=3,
-                application_name="sylana-vessel",
-            )
+            _connection = psycopg2.connect(**_connection_kwargs(db_url))
             _connection.autocommit = False
             register_vector(_connection)
             logger.info("Connected to Supabase PostgreSQL")
@@ -132,9 +225,15 @@ def get_connection():
 
 
 def close_connection():
-    """Close the persistent connection."""
-    global _connection
+    """Close singleton connection and pool connections."""
+    global _connection, _pool
     if _connection and not _connection.closed:
         _connection.close()
         _connection = None
         logger.info("Supabase connection closed")
+    if _pool is not None:
+        try:
+            _pool.closeall()
+            logger.info("Supabase connection pool closed")
+        finally:
+            _pool = None

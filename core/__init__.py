@@ -1,9 +1,11 @@
-"""
+﻿"""
 Sylana Vessel - Core Module
 Core AI engine, configuration, and model management
 """
 
 from .config_loader import config
+from .brain import Brain
+from .logging_config import configure_logging
 
 # Import new soul preservation components
 try:
@@ -28,6 +30,8 @@ except ImportError:
 
 __all__ = [
     'config',
+    'Brain',
+    'configure_logging',
     'VoiceValidator',
     'VoiceProfile',
     'VoiceProfileManager',

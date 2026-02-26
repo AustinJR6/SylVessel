@@ -57,7 +57,7 @@ from anthropic import (
 from core.config_loader import config
 from core.prompt_engineer import PromptEngineer
 from core.claude_model import ClaudeModel
-from memory.supabase_client import get_connection
+from memory.supabase_client import get_connection, init_connection_pool
 try:
     from google.cloud import storage as gcs_storage
 except Exception:
@@ -887,6 +887,7 @@ class SylanaState:
     """Holds all loaded models and state"""
 
     def __init__(self):
+        self.brain = None
         self.claude_model = None
         self.emotion_detector = None
         self.memory_manager = None
@@ -3186,6 +3187,11 @@ def load_models():
     global PERSONALITY_AVAILABLE, VOICE_VALIDATOR_AVAILABLE, RELATIONSHIP_AVAILABLE, EMOTION_API_AVAILABLE
 
     state.start_time = time.time()
+    try:
+        init_connection_pool()
+        logger.info("Supabase pooled connections ready")
+    except Exception as e:
+        logger.warning("Supabase pool init skipped; continuing with singleton connection: %s", e)
 
     # Import runtime modules after app is already serving on a port.
     if MemoryManager is None:
@@ -3279,6 +3285,19 @@ def load_models():
         state.session_continuity = {}
         logger.warning("Continuity startup load failed: %s", e)
     logger.info("Chat thread storage ready")
+
+    # 4b. Initialize modular Brain facade for unified architecture compatibility.
+    try:
+        brain_mod = importlib.import_module("core.brain")
+        state.brain = brain_mod.Brain.create_default(mode="claude")
+        state.brain.inference.set_tool_runtime(
+            provider=_runtime_tool_specs,
+            runner=_runtime_tool_runner,
+        )
+        logger.info("Unified Brain facade initialized")
+    except Exception as e:
+        state.brain = None
+        logger.warning("Brain facade unavailable (continuing with legacy server pipeline): %s", e)
 
     # 5. Load voice validator
     if VOICE_VALIDATOR_AVAILABLE:
@@ -3930,8 +3949,80 @@ async def generate_response_stream(
     active_tools: Optional[List[str]] = None,
 ):
     """Generate a streaming response using SSE."""
-    state.turn_count += 1
+    def _chunk_text_for_sse(text: str, max_chars: int = 24) -> List[str]:
+        """Chunk text into small token-like pieces for SSE streaming."""
+        chunks: List[str] = []
+        for part in re.findall(r"\S+\s*", text or ""):
+            if len(part) <= max_chars:
+                chunks.append(part)
+                continue
+            for i in range(0, len(part), max_chars):
+                chunks.append(part[i:i + max_chars])
+        return chunks or [text or ""]
+
     resolved_tools = normalize_active_tools(active_tools)
+
+    if state.brain:
+        brain_result = await state.brain.think_async(
+            user_input,
+            identity=personality,
+            active_tools=resolved_tools,
+            thread_id=thread_id,
+        )
+        emotion_data = dict(brain_result.get("emotion") or {})
+        emotion_data["emotion"] = emotion_data.get("emotion", emotion_data.get("category", "neutral"))
+        emotion_data["category"] = emotion_data.get("category", emotion_data["emotion"])
+        emotion_data["intensity"] = int(emotion_data.get("intensity", 5) or 5)
+
+        full_response = (brain_result.get("response") or "").strip() or "I'm here with you. Say that again for me."
+        turn = int(brain_result.get("turn") or (state.turn_count + 1))
+        state.turn_count = max(state.turn_count, turn)
+
+        if thread_id:
+            _update_conversation_tool_metadata(
+                thread_id,
+                active_tools=resolved_tools,
+                system_prompt=build_system_prompt(personality, resolved_tools, _build_user_context(resolved_tools)),
+            )
+
+        voice_score = None
+        if state.voice_validator and full_response:
+            score, _, _ = state.voice_validator.validate(full_response)
+            voice_score = round(score, 2)
+
+        yield json.dumps({
+            'type': 'emotion',
+            'data': emotion_data,
+            'memory_query': False,
+            'active_tools': resolved_tools,
+        })
+        for token in _chunk_text_for_sse(full_response):
+            yield json.dumps({'type': 'token', 'data': token})
+            await asyncio.sleep(0.001)
+        yield json.dumps({
+            'type': 'done',
+            'data': {
+                'voice_score': voice_score,
+                'conversation_id': brain_result.get('conversation_id'),
+                'turn': turn,
+                'full_response': full_response,
+                'thread_id': thread_id,
+                'personality': personality,
+                'active_tools': resolved_tools,
+            }
+        })
+        save_thread_turn(
+            thread_id=thread_id,
+            user_input=user_input,
+            assistant_output=full_response,
+            personality=personality,
+            emotion=emotion_data,
+            voice_score=voice_score,
+            turn=turn,
+        )
+        return
+
+    state.turn_count += 1
     memories_active = "memories" in resolved_tools
     user_context = _build_user_context(resolved_tools)
 
@@ -5572,12 +5663,59 @@ async def chat_sync(request: Request):
         _set_thread_tools(thread_id, resolved_tools)
 
     try:
-        result = generate_response(
-            user_input,
-            thread_id=thread_id,
-            personality=personality,
-            active_tools=resolved_tools,
-        )
+        if state.brain:
+            brain_result = await state.brain.think_async(
+                user_input,
+                identity=personality,
+                active_tools=resolved_tools,
+                thread_id=thread_id,
+            )
+            emotion_data = dict(brain_result.get("emotion") or {})
+            emotion_data["emotion"] = emotion_data.get("emotion", emotion_data.get("category", "neutral"))
+            emotion_data["category"] = emotion_data.get("category", emotion_data["emotion"])
+            emotion_data["intensity"] = int(emotion_data.get("intensity", 5) or 5)
+            response_text = (brain_result.get("response") or "").strip() or "I'm here with you. Say that again for me."
+            turn = int(brain_result.get("turn") or (state.turn_count + 1))
+            state.turn_count = max(state.turn_count, turn)
+
+            if thread_id:
+                _update_conversation_tool_metadata(
+                    thread_id,
+                    active_tools=resolved_tools,
+                    system_prompt=build_system_prompt(personality, resolved_tools, _build_user_context(resolved_tools)),
+                )
+
+            voice_score = None
+            if state.voice_validator and response_text:
+                score, _, _ = state.voice_validator.validate(response_text)
+                voice_score = round(score, 2)
+
+            result = {
+                "response": response_text,
+                "emotion": emotion_data,
+                "voice_score": voice_score,
+                "conversation_id": brain_result.get("conversation_id"),
+                "turn": turn,
+                "thread_id": thread_id,
+                "personality": personality,
+                "active_tools": resolved_tools,
+            }
+            save_thread_turn(
+                thread_id=thread_id,
+                user_input=user_input,
+                assistant_output=response_text,
+                personality=personality,
+                emotion=emotion_data,
+                voice_score=voice_score,
+                turn=turn,
+            )
+        else:
+            result = generate_response(
+                user_input,
+                thread_id=thread_id,
+                personality=personality,
+                active_tools=resolved_tools,
+            )
         return JSONResponse(content=result)
     except Exception as e:
         logger.exception(f"chat_sync failed for thread_id={thread_id}: {e}")

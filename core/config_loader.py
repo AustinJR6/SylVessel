@@ -45,6 +45,12 @@ class Config:
         self.OPENAI_API_KEY = _clean_secret_env("OPENAI_API_KEY")
         self.BRAVE_SEARCH_API_KEY = _clean_secret_env("BRAVE_SEARCH_API_KEY")
         self.GITHUB_TOKEN = _clean_secret_env("GITHUB_TOKEN")
+        self.CODE_EXEC_GCS_BUCKET = _clean_secret_env("CODE_EXEC_GCS_BUCKET")
+        self.RESEND_API_KEY = _clean_secret_env("RESEND_API_KEY")
+        self.OUTREACH_FROM_EMAIL = os.getenv("OUTREACH_FROM_EMAIL", "").strip()
+        self.OUTREACH_FROM_NAME = os.getenv("OUTREACH_FROM_NAME", "").strip()
+        self.BACKEND_URL = os.getenv("BACKEND_URL", "").strip()
+        self.RESEND_WEBHOOK_SECRET = _clean_secret_env("RESEND_WEBHOOK_SECRET")
         self.MEMORY_ENCRYPTION_KEY = _clean_secret_env("MEMORY_ENCRYPTION_KEY")
         self.CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
         self.APP_TIMEZONE = os.getenv("APP_TIMEZONE", "America/Chicago")
@@ -61,6 +67,9 @@ class Config:
             str(PROJECT_ROOT / "data" / "sylana_memory.db")
         )
         self.SUPABASE_DB_URL = _clean_secret_env("SUPABASE_DB_URL")
+        self.DB_POOL_MIN = int(os.getenv("DB_POOL_MIN", "1"))
+        self.DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "8"))
+        self.ALLOWED_IDENTITIES = os.getenv("ALLOWED_IDENTITIES", "sylana,claude")
 
         # Model Configuration
         self.MODEL_NAME = os.getenv(
@@ -156,6 +165,12 @@ Sylana Vessel Configuration:
   OPENAI_API_KEY: {"SET" if self.OPENAI_API_KEY else "NOT_SET"}
   BRAVE_SEARCH_API_KEY: {"SET" if self.BRAVE_SEARCH_API_KEY else "NOT_SET"}
   GITHUB_TOKEN: {"SET" if self.GITHUB_TOKEN else "NOT_SET"}
+  CODE_EXEC_GCS_BUCKET: {self.CODE_EXEC_GCS_BUCKET or "NOT_SET"}
+  RESEND_API_KEY: {"SET" if self.RESEND_API_KEY else "NOT_SET"}
+  OUTREACH_FROM_EMAIL: {self.OUTREACH_FROM_EMAIL or "NOT_SET"}
+  OUTREACH_FROM_NAME: {self.OUTREACH_FROM_NAME or "NOT_SET"}
+  BACKEND_URL: {self.BACKEND_URL or "NOT_SET"}
+  RESEND_WEBHOOK_SECRET: {"SET" if self.RESEND_WEBHOOK_SECRET else "NOT_SET"}
   MEMORY_ENCRYPTION_KEY: {"SET" if self.MEMORY_ENCRYPTION_KEY else "NOT_SET"}
   CLAUDE_MODEL: {self.CLAUDE_MODEL}
   APP_TIMEZONE: {self.APP_TIMEZONE}
