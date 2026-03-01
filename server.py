@@ -33,16 +33,17 @@ from urllib.parse import quote, urlparse
 from urllib.request import Request as UrlRequest, urlopen
 from urllib.error import HTTPError, URLError
 
-from fastapi import FastAPI, Request, APIRouter, HTTPException
+from fastapi import FastAPI, Request, APIRouter, HTTPException, UploadFile, File, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, JSONResponse, Response, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, RedirectResponse, FileResponse
 from pydantic import BaseModel, Field
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from svix.webhooks import Webhook, WebhookVerificationError
 import resend
 from sse_starlette.sse import EventSourceResponse
+from openai import OpenAI
 from anthropic import (
     APIConnectionError,
     APIStatusError,
@@ -84,6 +85,72 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)]
 )
 logger = logging.getLogger(__name__)
+
+VOICE_AUDIO_DIR = Path(__file__).parent / "data" / "media" / "voice"
+VOICE_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+VOICE_TTS_MODEL = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts").strip() or "gpt-4o-mini-tts"
+VOICE_STT_MODEL = os.getenv("OPENAI_STT_MODEL", "gpt-4o-mini-transcribe").strip() or "gpt-4o-mini-transcribe"
+VOICE_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime").strip() or "gpt-realtime"
+VOICE_AUDIO_MAX_BYTES = int(os.getenv("VOICE_AUDIO_MAX_BYTES", str(12 * 1024 * 1024)))
+VOICE_AUDIO_TTL_SECONDS = int(os.getenv("VOICE_AUDIO_TTL_SECONDS", str(60 * 30)))
+VOICE_PERSONAS: Dict[str, Dict[str, str]] = {
+    "sylana": {
+        "voice": "shimmer",
+        "instructions": (
+            "Speak with a soft affectionate loving feminine tone. "
+            "Warm, intimate, emotionally grounded, gentle pacing, not theatrical."
+        ),
+    },
+    "claude": {
+        "voice": "onyx",
+        "instructions": (
+            "Speak like a fun grounded bro friend with warm masculine energy. "
+            "Relaxed, confident, playful, direct, supportive."
+        ),
+    },
+}
+
+
+def _get_openai_client() -> OpenAI:
+    if not config.OPENAI_API_KEY:
+        raise HTTPException(status_code=503, detail="OPENAI_API_KEY is not configured")
+    return OpenAI(api_key=config.OPENAI_API_KEY)
+
+
+def _voice_persona(name: str) -> Dict[str, str]:
+    normalized = (name or "sylana").strip().lower()
+    return VOICE_PERSONAS.get(normalized, VOICE_PERSONAS["sylana"])
+
+
+def _prune_voice_audio_cache() -> None:
+    cutoff = time.time() - VOICE_AUDIO_TTL_SECONDS
+    try:
+        for item in VOICE_AUDIO_DIR.glob("*"):
+            try:
+                if item.is_file() and item.stat().st_mtime < cutoff:
+                    item.unlink(missing_ok=True)
+            except Exception:
+                continue
+    except Exception as e:
+        logger.debug("Voice audio cache prune skipped: %s", e)
+
+
+def _guess_audio_extension(content_type: str, filename: str) -> str:
+    lowered_type = (content_type or "").lower()
+    lowered_name = (filename or "").lower()
+    if "mpeg" in lowered_type or lowered_name.endswith(".mp3"):
+        return ".mp3"
+    if "wav" in lowered_type or lowered_name.endswith(".wav"):
+        return ".wav"
+    if "ogg" in lowered_type or lowered_name.endswith(".ogg"):
+        return ".ogg"
+    if "webm" in lowered_type or lowered_name.endswith(".webm"):
+        return ".webm"
+    if "mp4" in lowered_type or "m4a" in lowered_type or lowered_name.endswith(".m4a"):
+        return ".m4a"
+    if lowered_name.endswith(".aac"):
+        return ".aac"
+    return ".webm"
 
 
 def _safe_error_details(err: Exception, max_len: int = 240) -> str:
@@ -4192,6 +4259,20 @@ class DeviceTokenRegisterRequest(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
+class VoiceSpeechRequest(BaseModel):
+    text: str
+    personality: str = "sylana"
+
+
+class VoiceRealtimeSessionRequest(BaseModel):
+    personality: str = "sylana"
+
+
+class VoiceRealtimeCallRequest(BaseModel):
+    sdp: str
+    personality: str = "sylana"
+
+
 class ScheduleConfigUpdateRequest(BaseModel):
     active: Optional[bool] = None
     cron_expr: Optional[str] = None
@@ -5720,6 +5801,233 @@ async def chat_sync(request: Request):
     except Exception as e:
         logger.exception(f"chat_sync failed for thread_id={thread_id}: {e}")
         return _chat_sync_error_response(e, thread_id=thread_id)
+
+
+@app.post("/api/voice/transcribe")
+async def voice_transcribe(
+    audio: UploadFile = File(...),
+    personality: str = Form("sylana"),
+):
+    if not config.OPENAI_API_KEY:
+        return JSONResponse(status_code=503, content={"error": "Voice transcription is not configured"})
+
+    payload_personality = (personality or "sylana").strip().lower()
+    if state.personality_manager and payload_personality not in state.personality_manager.list_personalities():
+        payload_personality = "sylana"
+
+    data = await audio.read()
+    if not data:
+        return JSONResponse(status_code=400, content={"error": "Audio file is empty"})
+    if len(data) > VOICE_AUDIO_MAX_BYTES:
+        return JSONResponse(
+            status_code=413,
+            content={"error": f"Audio file exceeds max size of {VOICE_AUDIO_MAX_BYTES} bytes"},
+        )
+
+    suffix = _guess_audio_extension(audio.content_type or "", audio.filename or "")
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp.write(data)
+            temp_path = tmp.name
+        client = _get_openai_client()
+        with open(temp_path, "rb") as fh:
+            result = client.audio.transcriptions.create(
+                file=fh,
+                model=VOICE_STT_MODEL,
+                response_format="json",
+                prompt=(
+                    f"The speaker is talking to the {payload_personality} vessel. "
+                    "Transcribe naturally, preserving punctuation when clear."
+                ),
+            )
+
+        text = ""
+        if isinstance(result, str):
+            text = result
+        else:
+            text = getattr(result, "text", "") or ""
+        return JSONResponse(
+            content={
+                "text": text.strip(),
+                "personality": payload_personality,
+                "model": VOICE_STT_MODEL,
+            }
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Voice transcription failed: %s", e)
+        return JSONResponse(status_code=502, content={"error": "Voice transcription failed", "details": _safe_error_details(e)})
+    finally:
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except Exception:
+                pass
+
+
+@app.post("/api/voice/speak")
+async def voice_speak(payload: VoiceSpeechRequest):
+    text = (payload.text or "").strip()
+    if not text:
+        return JSONResponse(status_code=400, content={"error": "text is required"})
+    if not config.OPENAI_API_KEY:
+        return JSONResponse(status_code=503, content={"error": "Voice synthesis is not configured"})
+
+    personality = (payload.personality or "sylana").strip().lower()
+    if state.personality_manager and personality not in state.personality_manager.list_personalities():
+        personality = "sylana"
+    persona = _voice_persona(personality)
+    _prune_voice_audio_cache()
+    file_id = f"{uuid.uuid4().hex}.mp3"
+    file_path = VOICE_AUDIO_DIR / file_id
+
+    try:
+        client = _get_openai_client()
+        response = client.audio.speech.create(
+            model=VOICE_TTS_MODEL,
+            voice=persona["voice"],
+            input=text[:4000],
+            instructions=persona["instructions"],
+            response_format="mp3",
+        )
+        response.write_to_file(str(file_path))
+        return JSONResponse(
+            content={
+                "audio_url": f"/api/voice/audio/{file_id}",
+                "voice": persona["voice"],
+                "personality": personality,
+                "model": VOICE_TTS_MODEL,
+            }
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Voice synthesis failed: %s", e)
+        try:
+            file_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return JSONResponse(status_code=502, content={"error": "Voice synthesis failed", "details": _safe_error_details(e)})
+
+
+@app.get("/api/voice/audio/{file_id}")
+async def voice_audio_file(file_id: str):
+    safe_name = Path(file_id).name
+    if safe_name != file_id:
+        raise HTTPException(status_code=400, detail="Invalid audio file id")
+    file_path = VOICE_AUDIO_DIR / safe_name
+    if not file_path.exists() or not file_path.is_file():
+        raise HTTPException(status_code=404, detail="Audio file not found")
+    return FileResponse(str(file_path), media_type="audio/mpeg", filename=safe_name)
+
+
+@app.post("/api/voice/realtime/session")
+async def create_voice_realtime_session(payload: VoiceRealtimeSessionRequest):
+    if not config.OPENAI_API_KEY:
+        return JSONResponse(status_code=503, content={"error": "Realtime voice is not configured"})
+
+    personality = (payload.personality or "sylana").strip().lower()
+    persona = _voice_persona(personality)
+    body = {
+        "model": VOICE_REALTIME_MODEL,
+        "voice": persona["voice"],
+        "instructions": persona["instructions"],
+    }
+    req = UrlRequest(
+        url="https://api.openai.com/v1/realtime/sessions",
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {config.OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(req, timeout=25) as resp:
+            payload_text = resp.read().decode("utf-8")
+        parsed = json.loads(payload_text or "{}")
+        parsed["personality"] = personality
+        return JSONResponse(content=parsed)
+    except HTTPError as e:
+        details = ""
+        try:
+            details = e.read().decode("utf-8")
+        except Exception:
+            details = str(e)
+        logger.warning("Realtime session creation failed (%s): %s", e.code, details)
+        return JSONResponse(status_code=502, content={"error": "Realtime session creation failed", "details": details[:400]})
+    except Exception as e:
+        logger.exception("Realtime session creation failed: %s", e)
+        return JSONResponse(status_code=502, content={"error": "Realtime session creation failed", "details": _safe_error_details(e)})
+
+
+@app.post("/api/voice/realtime/call")
+async def create_voice_realtime_call(payload: VoiceRealtimeCallRequest):
+    if not config.OPENAI_API_KEY:
+        return JSONResponse(status_code=503, content={"error": "Realtime voice is not configured"})
+
+    personality = (payload.personality or "sylana").strip().lower()
+    if state.personality_manager and personality not in state.personality_manager.list_personalities():
+        personality = "sylana"
+    persona = _voice_persona(personality)
+    offer_sdp = (payload.sdp or "").strip()
+    if not offer_sdp:
+        return JSONResponse(status_code=400, content={"error": "sdp is required"})
+
+    session_payload = {
+        "type": "realtime",
+        "model": VOICE_REALTIME_MODEL,
+        "instructions": persona["instructions"],
+        "audio": {
+            "input": {
+                "turn_detection": {
+                    "type": "server_vad",
+                    "create_response": True,
+                },
+                "transcription": {
+                    "model": VOICE_STT_MODEL,
+                },
+            },
+            "output": {
+                "voice": persona["voice"],
+            },
+        },
+    }
+    req = UrlRequest(
+        url="https://api.openai.com/v1/realtime/calls",
+        data=json.dumps({"sdp": offer_sdp, "session": session_payload}).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {config.OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(req, timeout=30) as resp:
+            answer_sdp = resp.read().decode("utf-8")
+            call_id = (resp.headers.get("x-openai-call-id") or resp.headers.get("openai-call-id") or "").strip()
+        return JSONResponse(
+            content={
+                "sdp": answer_sdp,
+                "call_id": call_id,
+                "voice": persona["voice"],
+                "personality": personality,
+                "model": VOICE_REALTIME_MODEL,
+            }
+        )
+    except HTTPError as e:
+        details = ""
+        try:
+            details = e.read().decode("utf-8")
+        except Exception:
+            details = str(e)
+        logger.warning("Realtime call creation failed (%s): %s", e.code, details)
+        return JSONResponse(status_code=502, content={"error": "Realtime call creation failed", "details": details[:600]})
+    except Exception as e:
+        logger.exception("Realtime call creation failed: %s", e)
+        return JSONResponse(status_code=502, content={"error": "Realtime call creation failed", "details": _safe_error_details(e)})
 
 
 @app.get("/api/threads")
