@@ -90,7 +90,7 @@ VOICE_AUDIO_DIR = Path(__file__).parent / "data" / "media" / "voice"
 VOICE_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 VOICE_TTS_MODEL = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts").strip() or "gpt-4o-mini-tts"
 VOICE_STT_MODEL = os.getenv("OPENAI_STT_MODEL", "gpt-4o-mini-transcribe").strip() or "gpt-4o-mini-transcribe"
-VOICE_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime").strip() or "gpt-realtime"
+VOICE_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview").strip() or "gpt-4o-realtime-preview"
 VOICE_AUDIO_MAX_BYTES = int(os.getenv("VOICE_AUDIO_MAX_BYTES", str(12 * 1024 * 1024)))
 VOICE_AUDIO_TTL_SECONDS = int(os.getenv("VOICE_AUDIO_TTL_SECONDS", str(60 * 30)))
 VOICE_PERSONAS: Dict[str, Dict[str, str]] = {
@@ -5992,42 +5992,42 @@ async def create_voice_realtime_call(payload: VoiceRealtimeCallRequest):
     if not offer_sdp:
         return JSONResponse(status_code=400, content={"error": "sdp is required"})
 
-    session_payload = {
-        "type": "realtime",
-        "model": VOICE_REALTIME_MODEL,
-        "instructions": persona["instructions"],
-        "audio": {
-            "input": {
-                "turn_detection": {
-                    "type": "server_vad",
-                    "create_response": True,
-                },
-                "transcription": {
-                    "model": VOICE_STT_MODEL,
-                },
-            },
-            "output": {
-                "voice": persona["voice"],
-            },
-        },
-    }
-    multipart_body, boundary = _encode_multipart_form(
-        {
-            "sdp": offer_sdp,
-            "session": json.dumps(session_payload),
-        }
-    )
-    req = UrlRequest(
-        url="https://api.openai.com/v1/realtime/calls",
-        data=multipart_body,
-        headers={
-            "Authorization": f"Bearer {config.OPENAI_API_KEY}",
-            "Content-Type": f"multipart/form-data; boundary={boundary}",
-        },
-        method="POST",
-    )
     try:
-        with urlopen(req, timeout=30) as resp:
+        # Step 1: Create an ephemeral session to configure voice/persona.
+        session_body = json.dumps({
+            "model": VOICE_REALTIME_MODEL,
+            "voice": persona["voice"],
+            "instructions": persona["instructions"],
+            "turn_detection": {"type": "server_vad"},
+            "input_audio_transcription": {"model": VOICE_STT_MODEL},
+        }).encode("utf-8")
+        session_req = UrlRequest(
+            url="https://api.openai.com/v1/realtime/sessions",
+            data=session_body,
+            headers={
+                "Authorization": f"Bearer {config.OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urlopen(session_req, timeout=20) as resp:
+            session_data = json.loads(resp.read().decode("utf-8"))
+        ephemeral_key = (session_data.get("client_secret") or {}).get("value") or ""
+        if not ephemeral_key:
+            logger.warning("Realtime session did not return a client_secret: %s", session_data)
+            return JSONResponse(status_code=502, content={"error": "Realtime session did not return a client secret"})
+
+        # Step 2: Forward the SDP offer to OpenAI's WebRTC endpoint using the ephemeral key.
+        sdp_req = UrlRequest(
+            url=f"https://api.openai.com/v1/realtime?model={VOICE_REALTIME_MODEL}",
+            data=offer_sdp.encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {ephemeral_key}",
+                "Content-Type": "application/sdp",
+            },
+            method="POST",
+        )
+        with urlopen(sdp_req, timeout=30) as resp:
             answer_sdp = resp.read().decode("utf-8")
             call_id = (resp.headers.get("x-openai-call-id") or resp.headers.get("openai-call-id") or "").strip()
         return JSONResponse(
