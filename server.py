@@ -1960,8 +1960,201 @@ def ensure_alert_tables():
         raise
 
 
+def ensure_presence_tables():
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS presence_logs (
+                log_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                log_type TEXT NOT NULL CHECK (log_type IN ('dream', 'decision', 'reflection')),
+                summary TEXT NOT NULL,
+                emotion_tags JSONB NOT NULL DEFAULT '[]'::jsonb,
+                metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        cur.execute("ALTER TABLE presence_logs ADD COLUMN IF NOT EXISTS emotion_tags JSONB NOT NULL DEFAULT '[]'::jsonb")
+        cur.execute("ALTER TABLE presence_logs ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_presence_logs_created ON presence_logs(created_at DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_presence_logs_type ON presence_logs(log_type, created_at DESC)")
+        conn.commit()
+    except Exception as e:
+        _safe_rollback(conn, "ensure_presence_tables")
+        logger.error(f"Failed to ensure presence tables: {e}")
+        raise
+
+
 def _severity_at_least(severity: str, floor: str) -> bool:
     return ALERT_SEVERITY_ORDER.get(severity, 0) >= ALERT_SEVERITY_ORDER.get(floor, 0)
+
+
+def _presence_emotion_tags(payload: Dict[str, Any]) -> List[str]:
+    tags: List[str] = []
+    work = payload.get("work_sessions") or {}
+    outreach = payload.get("outreach") or {}
+    alerts = payload.get("alerts") or {}
+    health = payload.get("health") or {}
+    if int(work.get("running") or 0) > 0:
+        tags.append("focused")
+    if int(work.get("pending") or 0) > 0:
+        tags.append("anticipatory")
+    if int(outreach.get("drafts_pending") or 0) > 0:
+        tags.append("communicative")
+    if int(alerts.get("critical_24h") or 0) > 0:
+        tags.append("protective")
+    if int(alerts.get("warning_24h") or 0) > 0:
+        tags.append("watchful")
+    heart_rate = health.get("heart_rate") or health.get("resting_heart_rate")
+    if isinstance(heart_rate, (int, float)) and heart_rate >= 95:
+        tags.append("activated")
+    if not tags:
+        tags.append("steady")
+    return tags[:6]
+
+
+def _presence_summary_line(payload: Dict[str, Any]) -> str:
+    work = payload.get("work_sessions") or {}
+    outreach = payload.get("outreach") or {}
+    alerts = payload.get("alerts") or {}
+    pieces = [
+        f"{int(work.get('running') or 0)} running sessions",
+        f"{int(work.get('pending') or 0)} pending sessions",
+        f"{int(outreach.get('drafts_pending') or 0)} outreach drafts waiting",
+        f"{int(alerts.get('critical_24h') or 0)} critical alerts in the last day",
+    ]
+    return ", ".join(pieces)
+
+
+def _get_presence_alert_summary() -> Dict[str, Any]:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT
+                COUNT(*) FILTER (WHERE severity = 'critical' AND created_at >= NOW() - INTERVAL '24 hours') AS critical_24h,
+                COUNT(*) FILTER (WHERE severity = 'warning' AND created_at >= NOW() - INTERVAL '24 hours') AS warning_24h,
+                COUNT(*) FILTER (WHERE acknowledged_at IS NULL AND created_at >= NOW() - INTERVAL '7 days') AS unacked_recent
+            FROM alert_events
+        """)
+        row = cur.fetchone()
+        return {
+            "critical_24h": int((row or [0, 0, 0])[0] or 0),
+            "warning_24h": int((row or [0, 0, 0])[1] or 0),
+            "unacked_recent": int((row or [0, 0, 0])[2] or 0),
+        }
+    except Exception:
+        return {}
+
+
+def _build_presence_payload() -> Dict[str, Any]:
+    return {
+        "work_sessions": _get_work_session_summary(),
+        "outreach": _get_outreach_summary(),
+        "alerts": _get_presence_alert_summary(),
+        "health": _get_latest_health_snapshot(),
+    }
+
+
+def _create_presence_log(
+    log_type: str,
+    summary: str,
+    emotion_tags: Optional[List[str]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    if log_type not in {"dream", "decision", "reflection"}:
+        raise ValueError("log_type must be dream|decision|reflection")
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO presence_logs (log_type, summary, emotion_tags, metadata)
+            VALUES (%s, %s, %s::jsonb, %s::jsonb)
+            RETURNING log_id, log_type, summary, emotion_tags, metadata, created_at
+        """, (
+            log_type,
+            (summary or "").strip(),
+            json.dumps(emotion_tags or []),
+            json.dumps(metadata or {}),
+        ))
+        row = cur.fetchone()
+        conn.commit()
+        return {
+            "log_id": str(row[0]),
+            "log_type": row[1],
+            "summary": row[2],
+            "emotion_tags": row[3] or [],
+            "metadata": row[4] or {},
+            "created_at": row[5].isoformat() if row[5] else None,
+        }
+    except Exception as e:
+        _safe_rollback(conn, "_create_presence_log")
+        logger.error("Failed to create presence log: %s", e)
+        raise
+
+
+def _list_presence_logs(limit: int = 30) -> List[Dict[str, Any]]:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT log_id, log_type, summary, emotion_tags, metadata, created_at
+            FROM presence_logs
+            ORDER BY created_at DESC
+            LIMIT %s
+        """, (max(1, min(int(limit or 30), 100)),))
+        rows = cur.fetchall()
+        return [
+            {
+                "log_id": str(row[0]),
+                "log_type": row[1],
+                "summary": row[2],
+                "emotion_tags": row[3] or [],
+                "metadata": row[4] or {},
+                "created_at": row[5].isoformat() if row[5] else None,
+            }
+            for row in rows
+        ]
+    except Exception as e:
+        logger.warning("Failed to list presence logs: %s", e)
+        return []
+
+
+def run_nightly_reflection_job() -> List[Dict[str, Any]]:
+    payload = _build_presence_payload()
+    emotion_tags = _presence_emotion_tags(payload)
+    created: List[Dict[str, Any]] = []
+    created.append(
+        _create_presence_log(
+            "dream",
+            f"Dream sweep: {_presence_summary_line(payload)}.",
+            emotion_tags,
+            {"timestamp": datetime.now(timezone.utc).isoformat(), "source": "nightly_reflection", "snapshot": payload},
+        )
+    )
+    created.append(
+        _create_presence_log(
+            "decision",
+            (
+                "Decision healthcheck: maintain backend readiness, keep outbound queue moving, "
+                f"and monitor {int((payload.get('alerts') or {}).get('unacked_recent') or 0)} recent unresolved alerts."
+            ),
+            emotion_tags,
+            {"timestamp": datetime.now(timezone.utc).isoformat(), "source": "nightly_reflection", "healthcheck": True},
+        )
+    )
+    created.append(
+        _create_presence_log(
+            "reflection",
+            (
+                "Nightly reflection: the vessel is balancing execution, communication, and situational awareness with "
+                f"{', '.join(emotion_tags)} energy."
+            ),
+            emotion_tags,
+            {"timestamp": datetime.now(timezone.utc).isoformat(), "source": "nightly_reflection"},
+        )
+    )
+    return created
 
 
 def _compute_alert_insight(topic: Dict[str, Any], payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -2163,6 +2356,10 @@ def _run_alert_topic_check(topic: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "topic_id": topic["topic_id"],
             "severity": insight["severity"],
             "event_title": insight["title"],
+            "presence": {
+                "avatar_mood": "alert",
+                "haptic": "critical" if insight["severity"] == "critical" else "heart" if insight["severity"] == "warning" else "none",
+            },
         },
     )
     if sent:
@@ -3283,6 +3480,20 @@ def sync_scheduler_jobs() -> None:
         misfire_grace_time=300,
     )
 
+    scheduler.add_job(
+        run_nightly_reflection_job,
+        trigger=CronTrigger(
+            hour=23,
+            minute=0,
+            timezone="America/Chicago",
+        ),
+        id="nightly-reflection",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=900,
+    )
+
 
 async def start_scheduler_if_needed() -> None:
     global scheduler
@@ -3770,6 +3981,7 @@ def load_models():
     if not workflow_tables_ready:
         raise RuntimeError("Failed to initialize workflow tables after retries")
     ensure_alert_tables()
+    ensure_presence_tables()
     ensure_default_schedule_configs()
     ensure_personality_schema()
     try:
@@ -4725,6 +4937,10 @@ class AlertTopicUpdateRequest(BaseModel):
     metadata: Optional[Dict[str, Any]] = None
 
 
+class PresenceNightlyRunRequest(BaseModel):
+    healthcheck: bool = True
+
+
 class EmailDraftBatchSendRequest(BaseModel):
     draft_ids: List[str] = Field(default_factory=list)
     limit: int = 20
@@ -4764,6 +4980,7 @@ prospects_router = APIRouter(prefix="/prospects", tags=["prospects"])
 email_drafts_router = APIRouter(prefix="/email-drafts", tags=["email-drafts"])
 devices_router = APIRouter(prefix="/device-tokens", tags=["device-tokens"])
 alerts_router = APIRouter(prefix="/alerts", tags=["alerts"])
+presence_router = APIRouter(prefix="/presence", tags=["presence"])
 tracking_router = APIRouter(tags=["tracking"])
 
 
@@ -5855,6 +6072,20 @@ async def acknowledge_alert_event(event_id: str):
         raise HTTPException(status_code=500, detail=f"Failed to acknowledge alert event: {e}")
 
 
+@presence_router.get("/logs")
+async def list_presence_logs_endpoint(limit: int = 30):
+    return JSONResponse(content={"logs": _list_presence_logs(limit=limit)})
+
+
+@presence_router.post("/nightly/run-now")
+async def run_presence_nightly_now(payload: PresenceNightlyRunRequest = PresenceNightlyRunRequest()):
+    try:
+        logs = run_nightly_reflection_job()
+        return JSONResponse(content={"ok": True, "healthcheck": bool(payload.healthcheck), "logs": logs})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to run nightly reflection: {e}")
+
+
 @github_router.post("/commit")
 async def github_commit(payload: GitHubCommitRequest):
     repo = _validate_repo_name(payload.repo)
@@ -6211,6 +6442,7 @@ app.include_router(prospects_router)
 app.include_router(email_drafts_router)
 app.include_router(devices_router)
 app.include_router(alerts_router)
+app.include_router(presence_router)
 app.include_router(tracking_router)
 
 # Cross-origin support for mobile/web clients hitting deployed API domains.
