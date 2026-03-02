@@ -60,6 +60,7 @@ from anthropic import (
 from core.config_loader import config
 from core.prompt_engineer import PromptEngineer
 from core.claude_model import ClaudeModel
+from core.openrouter_model import OpenRouterModel
 from memory.supabase_client import get_connection, init_connection_pool
 try:
     from google.cloud import storage as gcs_storage
@@ -974,6 +975,7 @@ class SylanaState:
     def __init__(self):
         self.brain = None
         self.claude_model = None
+        self.openrouter_model = None
         self.emotion_detector = None
         self.memory_manager = None
         self.prompt_engineer = PromptEngineer()
@@ -1085,6 +1087,15 @@ def normalize_active_tools(active_tools: Optional[List[Any]]) -> List[str]:
         if val not in deduped:
             deduped.append(val)
     return deduped or list(DEFAULT_ACTIVE_TOOLS)
+
+
+def normalize_conversation_mode(mode: Optional[Any], personality: str) -> str:
+    """Restrict spicy mode to Sylana and normalize unknown values."""
+    normalized_personality = (personality or "sylana").strip().lower()
+    normalized_mode = str(mode or "default").strip().lower()
+    if normalized_personality != "sylana":
+        return "default"
+    return "spicy" if normalized_mode == "spicy" else "default"
 
 
 def _approx_token_count(text: str) -> int:
@@ -3962,6 +3973,26 @@ def load_models():
     )
     logger.info("Claude model initialized")
 
+    if config.OPENROUTER_API_KEY:
+        logger.info("Initializing OpenRouter spicy model: %s", config.OPENROUTER_SPICY_MODEL)
+        state.openrouter_model = OpenRouterModel(
+            api_key=config.OPENROUTER_API_KEY,
+            model=config.OPENROUTER_SPICY_MODEL,
+            base_url=config.OPENROUTER_BASE_URL,
+            app_name=config.OPENROUTER_APP_NAME,
+            site_url=config.OPENROUTER_SITE_URL,
+            enable_web_search=config.ENABLE_WEB_SEARCH,
+            brave_api_key=config.BRAVE_SEARCH_API_KEY or "",
+        )
+        state.openrouter_model.set_external_tools(
+            provider=_runtime_tool_specs,
+            runner=_runtime_tool_runner,
+        )
+        logger.info("OpenRouter spicy model initialized")
+    else:
+        state.openrouter_model = None
+        logger.warning("OPENROUTER_API_KEY not set; spicy mode will fall back to Claude routing")
+
     # 4. Initialize memory (Supabase backend)
     logger.info("Initializing memory system...")
     state.memory_manager = MemoryManager()
@@ -4346,7 +4377,12 @@ def build_memory_response_seed(memories: List[Dict]) -> str:
     return seed + " "
 
 
-def build_system_prompt(entity: str, active_tools: List[str], user_context: Optional[Dict[str, Any]] = None) -> str:
+def build_system_prompt(
+    entity: str,
+    active_tools: List[str],
+    user_context: Optional[Dict[str, Any]] = None,
+    conversation_mode: str = "default",
+) -> str:
     """Build dynamic system prompt from active tools + user context."""
     personality = (entity or "sylana").strip().lower()
     tools = normalize_active_tools(active_tools)
@@ -4373,6 +4409,11 @@ def build_system_prompt(entity: str, active_tools: List[str], user_context: Opti
         "Relationship context: You are Elias's trusted AI collaborator and companion. Keep responses clear, direct, and caring.",
         "Context safety: Only use data from tools currently active in this turn. If a tool is not active, do not reference its private data.",
     ]
+    if personality == "sylana" and conversation_mode == "spicy":
+        base_lines.append(
+            "Tone mode: spicy. Be bolder, flirtier, and more teasing than default Sylana. "
+            "Keep it emotionally intimate, suggestive, and playful without becoming graphically explicit."
+        )
 
     health_snapshot = user_ctx.get("health_snapshot") or {}
     github_snapshot = user_ctx.get("github_snapshot") or {}
@@ -4451,6 +4492,7 @@ def _format_session_continuity_context(payload: Dict[str, Any]) -> str:
 def _build_claude_inputs(
     user_input: str,
     personality: str,
+    conversation_mode: str,
     active_tools: List[str],
     user_context: Dict[str, Any],
     emotion_data: Dict[str, Any],
@@ -4461,7 +4503,7 @@ def _build_claude_inputs(
     memory_query: bool,
     has_memories: bool,
 ) -> Dict[str, Any]:
-    system_prompt = build_system_prompt(personality, active_tools, user_context)
+    system_prompt = build_system_prompt(personality, active_tools, user_context, conversation_mode=conversation_mode)
     if memory_query:
         composed_system = state.prompt_engineer.build_memory_grounded_message(
             personality_prompt=system_prompt,
@@ -4527,10 +4569,12 @@ def generate_response(
     thread_id: Optional[int] = None,
     personality: str = 'sylana',
     active_tools: Optional[List[str]] = None,
+    conversation_mode: str = "default",
 ) -> dict:
     """Generate a complete response (non-streaming)."""
     state.turn_count += 1
     resolved_tools = normalize_active_tools(active_tools)
+    resolved_mode = normalize_conversation_mode(conversation_mode, personality)
     memories_active = "memories" in resolved_tools
     user_context = _build_user_context(resolved_tools)
 
@@ -4577,6 +4621,7 @@ def generate_response(
         claude_inputs = _build_claude_inputs(
             user_input=user_input,
             personality=personality,
+            conversation_mode=resolved_mode,
             active_tools=resolved_tools,
             user_context=user_context,
             emotion_data=emotion_data,
@@ -4587,7 +4632,8 @@ def generate_response(
             memory_query=memory_query,
             has_memories=has_memories,
         )
-        response = state.claude_model.generate(
+        active_model = state.openrouter_model if resolved_mode == "spicy" and state.openrouter_model else state.claude_model
+        response = active_model.generate(
             system_prompt=claude_inputs['system_prompt'],
             messages=claude_inputs['messages'],
             max_tokens=_max_new_tokens_for_turn(memory_query=memory_query),
@@ -4605,7 +4651,7 @@ def generate_response(
         _update_conversation_tool_metadata(
             thread_id,
             active_tools=resolved_tools,
-            system_prompt=build_system_prompt(personality, resolved_tools, user_context),
+            system_prompt=build_system_prompt(personality, resolved_tools, user_context, conversation_mode=resolved_mode),
         )
 
     voice_score = None
@@ -4634,6 +4680,7 @@ def generate_response(
         'turn': state.turn_count,
         'thread_id': thread_id,
         'personality': personality,
+        'conversation_mode': resolved_mode,
         'active_tools': resolved_tools,
     }
     save_thread_turn(
@@ -4653,6 +4700,7 @@ async def generate_response_stream(
     thread_id: Optional[int] = None,
     personality: str = 'sylana',
     active_tools: Optional[List[str]] = None,
+    conversation_mode: str = "default",
 ):
     """Generate a streaming response using SSE."""
     def _chunk_text_for_sse(text: str, max_chars: int = 24) -> List[str]:
@@ -4667,8 +4715,9 @@ async def generate_response_stream(
         return chunks or [text or ""]
 
     resolved_tools = normalize_active_tools(active_tools)
+    resolved_mode = normalize_conversation_mode(conversation_mode, personality)
 
-    if state.brain:
+    if state.brain and resolved_mode == "default":
         brain_result = await state.brain.think_async(
             user_input,
             identity=personality,
@@ -4688,7 +4737,12 @@ async def generate_response_stream(
             _update_conversation_tool_metadata(
                 thread_id,
                 active_tools=resolved_tools,
-                system_prompt=build_system_prompt(personality, resolved_tools, _build_user_context(resolved_tools)),
+                system_prompt=build_system_prompt(
+                    personality,
+                    resolved_tools,
+                    _build_user_context(resolved_tools),
+                    conversation_mode=resolved_mode,
+                ),
             )
 
         voice_score = None
@@ -4714,6 +4768,7 @@ async def generate_response_stream(
                 'full_response': full_response,
                 'thread_id': thread_id,
                 'personality': personality,
+                'conversation_mode': resolved_mode,
                 'active_tools': resolved_tools,
             }
         })
@@ -4779,6 +4834,7 @@ async def generate_response_stream(
         claude_inputs = _build_claude_inputs(
             user_input=user_input,
             personality=personality,
+            conversation_mode=resolved_mode,
             active_tools=resolved_tools,
             user_context=user_context,
             emotion_data=emotion_data,
@@ -4791,7 +4847,8 @@ async def generate_response_stream(
         )
 
         full_response = ''
-        for token in state.claude_model.generate_stream(
+        active_model = state.openrouter_model if resolved_mode == "spicy" and state.openrouter_model else state.claude_model
+        for token in active_model.generate_stream(
             system_prompt=claude_inputs['system_prompt'],
             messages=claude_inputs['messages'],
             max_tokens=_max_new_tokens_for_turn(memory_query=memory_query),
@@ -4812,7 +4869,7 @@ async def generate_response_stream(
         _update_conversation_tool_metadata(
             thread_id,
             active_tools=resolved_tools,
-            system_prompt=build_system_prompt(personality, resolved_tools, user_context),
+            system_prompt=build_system_prompt(personality, resolved_tools, user_context, conversation_mode=resolved_mode),
         )
 
     voice_score = None
@@ -4842,6 +4899,7 @@ async def generate_response_stream(
             'full_response': full_response,
             'thread_id': thread_id,
             'personality': personality,
+            'conversation_mode': resolved_mode,
             'active_tools': resolved_tools,
         }
     })
@@ -6488,8 +6546,10 @@ async def chat(request: Request):
     thread_id = body.get("thread_id")
     requested_tools = body.get("active_tools", body.get("activeTools", None))
     personality = (body.get("personality") or "sylana").strip().lower()
+    conversation_mode = normalize_conversation_mode(body.get("conversation_mode"), personality)
     if state.personality_manager and personality not in state.personality_manager.list_personalities():
         personality = "sylana"
+        conversation_mode = normalize_conversation_mode(conversation_mode, personality)
 
     if not user_input:
         return JSONResponse(
@@ -6521,6 +6581,7 @@ async def chat(request: Request):
             thread_id=thread_id,
             personality=personality,
             active_tools=resolved_tools,
+            conversation_mode=conversation_mode,
         ),
         media_type="text/event-stream"
     )
@@ -6541,8 +6602,10 @@ async def chat_sync(request: Request):
     thread_id = body.get("thread_id")
     requested_tools = body.get("active_tools", body.get("activeTools", None))
     personality = (body.get("personality") or "sylana").strip().lower()
+    conversation_mode = normalize_conversation_mode(body.get("conversation_mode"), personality)
     if state.personality_manager and personality not in state.personality_manager.list_personalities():
         personality = "sylana"
+        conversation_mode = normalize_conversation_mode(conversation_mode, personality)
 
     if not user_input:
         return JSONResponse(
@@ -6566,7 +6629,7 @@ async def chat_sync(request: Request):
         _set_thread_tools(thread_id, resolved_tools)
 
     try:
-        if state.brain:
+        if state.brain and conversation_mode == "default":
             brain_result = await state.brain.think_async(
                 user_input,
                 identity=personality,
@@ -6585,7 +6648,12 @@ async def chat_sync(request: Request):
                 _update_conversation_tool_metadata(
                     thread_id,
                     active_tools=resolved_tools,
-                    system_prompt=build_system_prompt(personality, resolved_tools, _build_user_context(resolved_tools)),
+                    system_prompt=build_system_prompt(
+                        personality,
+                        resolved_tools,
+                        _build_user_context(resolved_tools),
+                        conversation_mode=conversation_mode,
+                    ),
                 )
 
             voice_score = None
@@ -6601,6 +6669,7 @@ async def chat_sync(request: Request):
                 "turn": turn,
                 "thread_id": thread_id,
                 "personality": personality,
+                "conversation_mode": conversation_mode,
                 "active_tools": resolved_tools,
             }
             save_thread_turn(
@@ -6618,6 +6687,7 @@ async def chat_sync(request: Request):
                 thread_id=thread_id,
                 personality=personality,
                 active_tools=resolved_tools,
+                conversation_mode=conversation_mode,
             )
         return JSONResponse(content=result)
     except Exception as e:

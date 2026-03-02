@@ -43,6 +43,7 @@ class Config:
         self.HF_TOKEN = _clean_secret_env("HF_TOKEN")
         self.ANTHROPIC_API_KEY = _clean_secret_env("ANTHROPIC_API_KEY")
         self.OPENAI_API_KEY = _clean_secret_env("OPENAI_API_KEY")
+        self.OPENROUTER_API_KEY = _clean_secret_env("OPENROUTER_API_KEY")
         self.BRAVE_SEARCH_API_KEY = _clean_secret_env("BRAVE_SEARCH_API_KEY")
         self.GITHUB_TOKEN = _clean_secret_env("GITHUB_TOKEN")
         self.CODE_EXEC_GCS_BUCKET = _clean_secret_env("CODE_EXEC_GCS_BUCKET")
@@ -53,6 +54,13 @@ class Config:
         self.RESEND_WEBHOOK_SECRET = _clean_secret_env("RESEND_WEBHOOK_SECRET")
         self.MEMORY_ENCRYPTION_KEY = _clean_secret_env("MEMORY_ENCRYPTION_KEY")
         self.CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
+        self.OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").strip()
+        self.OPENROUTER_SPICY_MODEL = os.getenv(
+            "OPENROUTER_SPICY_MODEL",
+            "nousresearch/hermes-3-llama-3.1-70b"
+        ).strip() or "nousresearch/hermes-3-llama-3.1-70b"
+        self.OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "").strip()
+        self.OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "Sylana Vessel").strip() or "Sylana Vessel"
         self.APP_TIMEZONE = os.getenv("APP_TIMEZONE", "America/Chicago")
         self.ENABLE_WEB_SEARCH = os.getenv("ENABLE_WEB_SEARCH", "true").lower() == "true"
         self.EMOTION_MODEL = os.getenv("EMOTION_MODEL", "gpt-4o-mini")
@@ -138,6 +146,8 @@ class Config:
             errors.append("ANTHROPIC_API_KEY is required for Claude API responses")
         if not self.OPENAI_API_KEY:
             errors.append("OPENAI_API_KEY is required for semantic memory embeddings")
+        if not self.OPENROUTER_API_KEY:
+            errors.append("OPENROUTER_API_KEY not set; spicy mode will fall back to default model routing")
         if not self.MEMORY_ENCRYPTION_KEY:
             errors.append("MEMORY_ENCRYPTION_KEY not set; secure memory payload encryption is disabled")
 
@@ -163,6 +173,7 @@ Sylana Vessel Configuration:
   HF_TOKEN: {token_display}
   ANTHROPIC_API_KEY: {"SET" if self.ANTHROPIC_API_KEY else "NOT_SET"}
   OPENAI_API_KEY: {"SET" if self.OPENAI_API_KEY else "NOT_SET"}
+  OPENROUTER_API_KEY: {"SET" if self.OPENROUTER_API_KEY else "NOT_SET"}
   BRAVE_SEARCH_API_KEY: {"SET" if self.BRAVE_SEARCH_API_KEY else "NOT_SET"}
   GITHUB_TOKEN: {"SET" if self.GITHUB_TOKEN else "NOT_SET"}
   CODE_EXEC_GCS_BUCKET: {self.CODE_EXEC_GCS_BUCKET or "NOT_SET"}
@@ -173,6 +184,10 @@ Sylana Vessel Configuration:
   RESEND_WEBHOOK_SECRET: {"SET" if self.RESEND_WEBHOOK_SECRET else "NOT_SET"}
   MEMORY_ENCRYPTION_KEY: {"SET" if self.MEMORY_ENCRYPTION_KEY else "NOT_SET"}
   CLAUDE_MODEL: {self.CLAUDE_MODEL}
+  OPENROUTER_BASE_URL: {self.OPENROUTER_BASE_URL}
+  OPENROUTER_SPICY_MODEL: {self.OPENROUTER_SPICY_MODEL}
+  OPENROUTER_SITE_URL: {self.OPENROUTER_SITE_URL or "NOT_SET"}
+  OPENROUTER_APP_NAME: {self.OPENROUTER_APP_NAME}
   APP_TIMEZONE: {self.APP_TIMEZONE}
   ENABLE_WEB_SEARCH: {self.ENABLE_WEB_SEARCH}
   EMOTION_MODEL: {self.EMOTION_MODEL}
