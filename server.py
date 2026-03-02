@@ -153,6 +153,22 @@ def _guess_audio_extension(content_type: str, filename: str) -> str:
     return ".webm"
 
 
+def _encode_multipart_form(fields: Dict[str, str]) -> tuple[bytes, str]:
+    boundary = f"----SylanaBoundary{uuid.uuid4().hex}"
+    chunks: List[bytes] = []
+    for name, value in fields.items():
+        chunks.extend(
+            [
+                f"--{boundary}\r\n".encode("utf-8"),
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"),
+                (value or "").encode("utf-8"),
+                b"\r\n",
+            ]
+        )
+    chunks.append(f"--{boundary}--\r\n".encode("utf-8"))
+    return b"".join(chunks), boundary
+
+
 def _safe_error_details(err: Exception, max_len: int = 240) -> str:
     """Bound response details and avoid leaking internals/secrets."""
     raw = (str(err) or err.__class__.__name__).replace("\n", " ").strip()
@@ -5995,12 +6011,18 @@ async def create_voice_realtime_call(payload: VoiceRealtimeCallRequest):
             },
         },
     }
+    multipart_body, boundary = _encode_multipart_form(
+        {
+            "sdp": offer_sdp,
+            "session": json.dumps(session_payload),
+        }
+    )
     req = UrlRequest(
         url="https://api.openai.com/v1/realtime/calls",
-        data=json.dumps({"sdp": offer_sdp, "session": session_payload}).encode("utf-8"),
+        data=multipart_body,
         headers={
             "Authorization": f"Bearer {config.OPENAI_API_KEY}",
-            "Content-Type": "application/json",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
         },
         method="POST",
     )
