@@ -14,6 +14,7 @@ import os
 import sys
 import json
 import time
+import hashlib
 import logging
 import asyncio
 import re
@@ -27,9 +28,10 @@ import selectors
 from collections import Counter
 from pathlib import Path
 from datetime import datetime, timezone
+from html import unescape
 from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request as UrlRequest, urlopen
 from urllib.error import HTTPError, URLError
 
@@ -1855,6 +1857,357 @@ def ensure_default_schedule_configs():
         logger.error(f"Failed to seed schedule configs: {e}")
 
 
+ALERT_SEVERITY_ORDER = {"info": 1, "warning": 2, "critical": 3}
+ALERT_DEFAULT_INTERVAL_MINUTES = 60
+ALERT_MAX_RESULTS = 6
+ALERT_SCHEDULER_MINUTES = 10
+ALERT_CRITICAL_TERMS = {
+    "war": 5,
+    "missile": 5,
+    "strike": 4,
+    "attack": 5,
+    "active shooter": 6,
+    "terror": 5,
+    "terrorist": 5,
+    "explosion": 4,
+    "evacuation": 5,
+    "nuclear": 6,
+    "chemical": 5,
+    "radiation": 6,
+    "wildfire": 5,
+    "tornado": 5,
+    "hurricane": 5,
+    "earthquake": 4,
+    "tsunami": 6,
+    "martial law": 6,
+    "amber alert": 5,
+    "kidnapping": 5,
+    "outbreak": 4,
+    "pandemic": 5,
+    "emergency": 4,
+}
+ALERT_WARNING_TERMS = {
+    "military": 3,
+    "troops": 3,
+    "protest": 2,
+    "riot": 4,
+    "unrest": 3,
+    "cyberattack": 4,
+    "recall": 2,
+    "storm": 2,
+    "flood": 3,
+    "blackout": 3,
+    "sanctions": 2,
+    "leak": 2,
+    "investigation": 1,
+    "court": 1,
+    "files": 1,
+    "warning": 3,
+    "advisory": 2,
+    "closure": 2,
+    "contamination": 4,
+}
+
+
+def ensure_alert_tables():
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS alert_topics (
+                topic_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                label TEXT NOT NULL,
+                query TEXT NOT NULL,
+                enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                interval_minutes INTEGER NOT NULL DEFAULT 60,
+                severity_floor TEXT NOT NULL DEFAULT 'info' CHECK (severity_floor IN ('info', 'warning', 'critical')),
+                metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                last_checked_at TIMESTAMPTZ,
+                last_alerted_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS alert_events (
+                event_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                topic_id UUID NOT NULL REFERENCES alert_topics(topic_id) ON DELETE CASCADE,
+                severity TEXT NOT NULL CHECK (severity IN ('info', 'warning', 'critical')),
+                score INTEGER NOT NULL DEFAULT 0,
+                title TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                result_count INTEGER NOT NULL DEFAULT 0,
+                dedupe_key TEXT NOT NULL,
+                search_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+                metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                pushed_at TIMESTAMPTZ,
+                acknowledged_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        cur.execute("ALTER TABLE alert_topics ADD COLUMN IF NOT EXISTS severity_floor TEXT NOT NULL DEFAULT 'info'")
+        cur.execute("ALTER TABLE alert_topics ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb")
+        cur.execute("ALTER TABLE alert_topics ADD COLUMN IF NOT EXISTS last_checked_at TIMESTAMPTZ")
+        cur.execute("ALTER TABLE alert_topics ADD COLUMN IF NOT EXISTS last_alerted_at TIMESTAMPTZ")
+        cur.execute("ALTER TABLE alert_events ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb")
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_alert_events_topic_dedupe ON alert_events(topic_id, dedupe_key)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_alert_topics_enabled_next ON alert_topics(enabled, last_checked_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_alert_events_created ON alert_events(created_at DESC)")
+        conn.commit()
+    except Exception as e:
+        _safe_rollback(conn, "ensure_alert_tables")
+        logger.error(f"Failed to ensure alert tables: {e}")
+        raise
+
+
+def _severity_at_least(severity: str, floor: str) -> bool:
+    return ALERT_SEVERITY_ORDER.get(severity, 0) >= ALERT_SEVERITY_ORDER.get(floor, 0)
+
+
+def _compute_alert_insight(topic: Dict[str, Any], payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    rows = (payload or {}).get("results") or []
+    if not rows:
+        return None
+
+    score = 0
+    matched_terms: List[str] = []
+    ranked_rows = []
+    for row in rows[:ALERT_MAX_RESULTS]:
+        title = str(row.get("title") or "").strip()
+        snippet = str(row.get("snippet") or "").strip()
+        text = f"{title} {snippet}".lower()
+        row_score = 0
+        for term_map in (ALERT_CRITICAL_TERMS, ALERT_WARNING_TERMS):
+            for term, weight in term_map.items():
+                if term in text:
+                    row_score += weight
+                    matched_terms.append(term)
+        if any(marker in text for marker in ["breaking", "urgent", "developing", "live updates"]):
+            row_score += 2
+        ranked_rows.append((row_score, row))
+        score += row_score
+
+    if score <= 0:
+        return None
+
+    severity = "info"
+    if score >= 12:
+        severity = "critical"
+    elif score >= 6:
+        severity = "warning"
+
+    top_row = max(ranked_rows, key=lambda item: item[0])[1]
+    top_title = str(top_row.get("title") or topic.get("label") or topic.get("query") or "Alert").strip()
+    snippets = []
+    for row in rows[:3]:
+        title = str(row.get("title") or "").strip()
+        snippet = str(row.get("snippet") or "").strip()
+        if title and snippet:
+            snippets.append(f"{title}: {snippet}")
+        elif title:
+            snippets.append(title)
+    summary = " | ".join(snippets)[:900]
+    dedupe_seed = "||".join(
+        [
+            str(topic.get("topic_id") or ""),
+            severity,
+            *(f"{row.get('title', '')}|{row.get('url', '')}" for row in rows[:3]),
+        ]
+    )
+    dedupe_key = hashlib.sha256(dedupe_seed.encode("utf-8")).hexdigest()
+    return {
+        "severity": severity,
+        "score": score,
+        "title": top_title[:220],
+        "summary": summary or top_title[:900],
+        "result_count": len(rows),
+        "dedupe_key": dedupe_key,
+        "matched_terms": sorted(set(matched_terms))[:12],
+    }
+
+
+def _serialize_alert_topic_row(row: Any) -> Dict[str, Any]:
+    return {
+        "topic_id": str(row[0]),
+        "label": row[1],
+        "query": row[2],
+        "enabled": bool(row[3]),
+        "interval_minutes": int(row[4] or ALERT_DEFAULT_INTERVAL_MINUTES),
+        "severity_floor": row[5] or "info",
+        "metadata": row[6] or {},
+        "last_checked_at": row[7].isoformat() if row[7] else None,
+        "last_alerted_at": row[8].isoformat() if row[8] else None,
+        "created_at": row[9].isoformat() if row[9] else None,
+        "updated_at": row[10].isoformat() if row[10] else None,
+    }
+
+
+def _list_alert_topics() -> List[Dict[str, Any]]:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT topic_id, label, query, enabled, interval_minutes, severity_floor, metadata,
+                   last_checked_at, last_alerted_at, created_at, updated_at
+            FROM alert_topics
+            ORDER BY updated_at DESC, created_at DESC
+        """)
+        return [_serialize_alert_topic_row(row) for row in cur.fetchall()]
+    except Exception as e:
+        logger.warning(f"Failed to list alert topics: {e}")
+        return []
+
+
+def _list_alert_events(limit: int = 50, topic_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        params: List[Any] = []
+        where = ""
+        if topic_id:
+            where = "WHERE e.topic_id = %s::uuid"
+            params.append(topic_id)
+        cur.execute(f"""
+            SELECT e.event_id, e.topic_id, t.label, e.severity, e.score, e.title, e.summary, e.result_count,
+                   e.search_payload, e.metadata, e.pushed_at, e.acknowledged_at, e.created_at
+            FROM alert_events e
+            JOIN alert_topics t ON t.topic_id = e.topic_id
+            {where}
+            ORDER BY e.created_at DESC
+            LIMIT %s
+        """, tuple(params + [limit]))
+        rows = cur.fetchall()
+        return [
+            {
+                "event_id": str(r[0]),
+                "topic_id": str(r[1]),
+                "topic_label": r[2],
+                "severity": r[3],
+                "score": int(r[4] or 0),
+                "title": r[5],
+                "summary": r[6],
+                "result_count": int(r[7] or 0),
+                "search_payload": r[8] or {},
+                "metadata": r[9] or {},
+                "pushed_at": r[10].isoformat() if r[10] else None,
+                "acknowledged_at": r[11].isoformat() if r[11] else None,
+                "created_at": r[12].isoformat() if r[12] else None,
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        logger.warning(f"Failed to list alert events: {e}")
+        return []
+
+
+def _run_alert_topic_check(topic: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    payload = _run_web_search(topic.get("query") or topic.get("label") or "", count=ALERT_MAX_RESULTS)
+    insight = _compute_alert_insight(topic, payload)
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "UPDATE alert_topics SET last_checked_at = NOW(), updated_at = NOW() WHERE topic_id = %s::uuid",
+            (topic["topic_id"],),
+        )
+        conn.commit()
+    except Exception:
+        _safe_rollback(conn, "_run_alert_topic_check:last_checked")
+
+    if not insight:
+        return None
+    if not _severity_at_least(insight["severity"], topic.get("severity_floor") or "info"):
+        return None
+
+    try:
+        cur.execute("""
+            INSERT INTO alert_events (
+                topic_id, severity, score, title, summary, result_count, dedupe_key, search_payload, metadata
+            )
+            VALUES (%s::uuid, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb)
+            ON CONFLICT (topic_id, dedupe_key) DO NOTHING
+            RETURNING event_id, created_at
+        """, (
+            topic["topic_id"],
+            insight["severity"],
+            insight["score"],
+            insight["title"],
+            insight["summary"],
+            insight["result_count"],
+            insight["dedupe_key"],
+            json.dumps(payload or {}),
+            json.dumps({"matched_terms": insight["matched_terms"]}),
+        ))
+        inserted = cur.fetchone()
+        if not inserted:
+            conn.commit()
+            return None
+        cur.execute(
+            "UPDATE alert_topics SET last_alerted_at = NOW(), updated_at = NOW() WHERE topic_id = %s::uuid",
+            (topic["topic_id"],),
+        )
+        conn.commit()
+    except Exception as e:
+        _safe_rollback(conn, "_run_alert_topic_check:insert")
+        logger.warning("Alert topic check failed for %s: %s", topic.get("label"), e)
+        return None
+
+    route = "/(tabs)/alerts"
+    sent = _send_push_notification(
+        f"{insight['severity'].upper()} alert: {topic.get('label') or topic.get('query')}",
+        insight["title"],
+        {
+            "type": "topic_alert",
+            "screen": "alerts",
+            "route": route,
+            "topic_id": topic["topic_id"],
+            "severity": insight["severity"],
+            "event_title": insight["title"],
+        },
+    )
+    if sent:
+        try:
+            cur.execute("UPDATE alert_events SET pushed_at = NOW() WHERE event_id = %s::uuid", (str(inserted[0]),))
+            conn.commit()
+        except Exception:
+            _safe_rollback(conn, "_run_alert_topic_check:pushed_at")
+
+    return {
+        "event_id": str(inserted[0]),
+        "created_at": inserted[1].isoformat() if inserted[1] else None,
+        **insight,
+    }
+
+
+async def run_due_alert_topic_checks() -> None:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT topic_id, label, query, enabled, interval_minutes, severity_floor, metadata,
+                   last_checked_at, last_alerted_at, created_at, updated_at
+            FROM alert_topics
+            WHERE enabled = TRUE
+              AND (
+                last_checked_at IS NULL OR
+                last_checked_at <= NOW() - (GREATEST(interval_minutes, 5) * INTERVAL '1 minute')
+              )
+            ORDER BY COALESCE(last_checked_at, to_timestamp(0)) ASC
+            LIMIT 12
+        """)
+        rows = cur.fetchall()
+    except Exception as e:
+        logger.warning("Failed to fetch due alert topics: %s", e)
+        return
+
+    for row in rows:
+        topic = _serialize_alert_topic_row(row)
+        try:
+            _run_alert_topic_check(topic)
+        except Exception as e:
+            logger.warning("Due alert topic run failed for %s: %s", topic.get("label"), e)
+
+
 def _create_work_session(entity: str, goal: str, session_type: str, metadata: Dict[str, Any], status: str = "pending") -> str:
     conn = get_connection()
     cur = conn.cursor()
@@ -2025,10 +2378,54 @@ def _insert_email_draft(payload: Dict[str, Any]) -> str:
         raise RuntimeError(f"Failed to insert email draft: {e}")
 
 
+def _duckduckgo_web_search(query: str, count: int = 8) -> Dict[str, Any]:
+    encoded_query = quote(query or "")
+    req = UrlRequest(
+        f"https://html.duckduckgo.com/html/?q={encoded_query}",
+        headers={"User-Agent": "Mozilla/5.0", "Accept-Language": "en-US,en;q=0.9"},
+        method="GET",
+    )
+    with urlopen(req, timeout=12) as resp:
+        html = resp.read().decode("utf-8", errors="ignore")
+
+    anchor_pattern = re.compile(
+        r'<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="(?P<href>[^"]+)"[^>]*>(?P<title>.*?)</a>',
+        re.IGNORECASE | re.DOTALL,
+    )
+    snippet_pattern = re.compile(
+        r'<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>(?P<snippet>.*?)</a>|<div[^>]+class="[^"]*result__snippet[^"]*"[^>]*>(?P<divsnippet>.*?)</div>',
+        re.IGNORECASE | re.DOTALL,
+    )
+    anchors = list(anchor_pattern.finditer(html))
+    snippets = list(snippet_pattern.finditer(html))
+    results = []
+    for idx, match in enumerate(anchors[:count]):
+        raw_href = unescape(match.group("href") or "")
+        parsed = urlparse(raw_href)
+        qs = parsed.query or ""
+        actual_url = raw_href
+        for param in qs.split("&"):
+            if param.startswith("uddg="):
+                actual_url = unquote(unescape(param.split("=", 1)[1]))
+                break
+        title = re.sub(r"<[^>]+>", "", unescape(match.group("title") or "")).strip()
+        snippet = ""
+        if idx < len(snippets):
+            snippet_raw = snippets[idx].group("snippet") or snippets[idx].group("divsnippet") or ""
+            snippet = re.sub(r"<[^>]+>", "", unescape(snippet_raw)).strip()
+        if title and actual_url:
+            results.append({"title": title[:240], "url": actual_url, "snippet": snippet[:400]})
+    return {"query": query, "count": count, "results": results}
+
+
 def _run_web_search(query: str, count: int = 8) -> Dict[str, Any]:
     if state.claude_model and getattr(state.claude_model, "enable_web_search", False):
         return state.claude_model._brave_web_search(query, count=count)  # noqa: SLF001
-    return {"query": query, "count": count, "results": []}
+    try:
+        return _duckduckgo_web_search(query, count=count)
+    except Exception as e:
+        logger.warning("Fallback web search failed for '%s': %s", query, e)
+        return {"query": query, "count": count, "results": []}
 
 
 LEAD_BLOCKED_DOMAINS = {
@@ -2873,6 +3270,19 @@ def sync_scheduler_jobs() -> None:
         misfire_grace_time=600,
     )
 
+    scheduler.add_job(
+        run_due_alert_topic_checks,
+        trigger=CronTrigger(
+            minute=f"*/{ALERT_SCHEDULER_MINUTES}",
+            timezone=getattr(config, "APP_TIMEZONE", "America/Chicago"),
+        ),
+        id="alert-topic-checks",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=300,
+    )
+
 
 async def start_scheduler_if_needed() -> None:
     global scheduler
@@ -3359,6 +3769,7 @@ def load_models():
             time.sleep(1.5)
     if not workflow_tables_ready:
         raise RuntimeError("Failed to initialize workflow tables after retries")
+    ensure_alert_tables()
     ensure_default_schedule_configs()
     ensure_personality_schema()
     try:
@@ -4296,6 +4707,24 @@ class ScheduleConfigUpdateRequest(BaseModel):
     product: Optional[str] = None
 
 
+class AlertTopicCreateRequest(BaseModel):
+    label: str
+    query: str
+    interval_minutes: int = 60
+    severity_floor: str = "info"
+    enabled: bool = True
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class AlertTopicUpdateRequest(BaseModel):
+    label: Optional[str] = None
+    query: Optional[str] = None
+    interval_minutes: Optional[int] = None
+    severity_floor: Optional[str] = None
+    enabled: Optional[bool] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
 class EmailDraftBatchSendRequest(BaseModel):
     draft_ids: List[str] = Field(default_factory=list)
     limit: int = 20
@@ -4334,6 +4763,7 @@ sessions_router = APIRouter(prefix="/sessions", tags=["sessions"])
 prospects_router = APIRouter(prefix="/prospects", tags=["prospects"])
 email_drafts_router = APIRouter(prefix="/email-drafts", tags=["email-drafts"])
 devices_router = APIRouter(prefix="/device-tokens", tags=["device-tokens"])
+alerts_router = APIRouter(prefix="/alerts", tags=["alerts"])
 tracking_router = APIRouter(tags=["tracking"])
 
 
@@ -5282,6 +5712,149 @@ async def register_device_token(payload: DeviceTokenRegisterRequest):
         raise HTTPException(status_code=500, detail=f"Failed to register token: {e}")
 
 
+@alerts_router.get("/topics")
+async def list_alert_topics_endpoint():
+    return JSONResponse(content={"topics": _list_alert_topics()})
+
+
+@alerts_router.post("/topics")
+async def create_alert_topic(payload: AlertTopicCreateRequest):
+    label = (payload.label or "").strip()
+    query = (payload.query or "").strip()
+    severity_floor = (payload.severity_floor or "info").strip().lower()
+    interval_minutes = max(5, min(int(payload.interval_minutes or ALERT_DEFAULT_INTERVAL_MINUTES), 24 * 60))
+    if not label or not query:
+        raise HTTPException(status_code=400, detail="label and query are required")
+    if severity_floor not in ALERT_SEVERITY_ORDER:
+        raise HTTPException(status_code=400, detail="severity_floor must be info|warning|critical")
+
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO alert_topics (label, query, enabled, interval_minutes, severity_floor, metadata, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s::jsonb, NOW())
+            RETURNING topic_id, label, query, enabled, interval_minutes, severity_floor, metadata,
+                      last_checked_at, last_alerted_at, created_at, updated_at
+        """, (label, query, bool(payload.enabled), interval_minutes, severity_floor, json.dumps(payload.metadata or {})))
+        topic = _serialize_alert_topic_row(cur.fetchone())
+        conn.commit()
+        sync_scheduler_jobs()
+        return JSONResponse(content={"topic": topic})
+    except Exception as e:
+        _safe_rollback(conn, "create_alert_topic")
+        raise HTTPException(status_code=500, detail=f"Failed to create alert topic: {e}")
+
+
+@alerts_router.patch("/topics/{topic_id}")
+async def update_alert_topic(topic_id: str, payload: AlertTopicUpdateRequest):
+    updates = []
+    params: List[Any] = []
+    if payload.label is not None:
+        updates.append("label = %s")
+        params.append(payload.label.strip())
+    if payload.query is not None:
+        updates.append("query = %s")
+        params.append(payload.query.strip())
+    if payload.enabled is not None:
+        updates.append("enabled = %s")
+        params.append(bool(payload.enabled))
+    if payload.interval_minutes is not None:
+        updates.append("interval_minutes = %s")
+        params.append(max(5, min(int(payload.interval_minutes), 24 * 60)))
+    if payload.severity_floor is not None:
+        floor = payload.severity_floor.strip().lower()
+        if floor not in ALERT_SEVERITY_ORDER:
+            raise HTTPException(status_code=400, detail="severity_floor must be info|warning|critical")
+        updates.append("severity_floor = %s")
+        params.append(floor)
+    if payload.metadata is not None:
+        updates.append("metadata = %s::jsonb")
+        params.append(json.dumps(payload.metadata))
+    if not updates:
+        raise HTTPException(status_code=400, detail="No update fields provided")
+
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        params.append(topic_id)
+        cur.execute(f"""
+            UPDATE alert_topics
+            SET {', '.join(updates)}, updated_at = NOW()
+            WHERE topic_id = %s::uuid
+            RETURNING topic_id, label, query, enabled, interval_minutes, severity_floor, metadata,
+                      last_checked_at, last_alerted_at, created_at, updated_at
+        """, tuple(params))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Alert topic not found")
+        topic = _serialize_alert_topic_row(row)
+        conn.commit()
+        sync_scheduler_jobs()
+        return JSONResponse(content={"topic": topic})
+    except HTTPException:
+        raise
+    except Exception as e:
+        _safe_rollback(conn, "update_alert_topic")
+        raise HTTPException(status_code=500, detail=f"Failed to update alert topic: {e}")
+
+
+@alerts_router.delete("/topics/{topic_id}")
+async def delete_alert_topic(topic_id: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("DELETE FROM alert_topics WHERE topic_id = %s::uuid RETURNING topic_id", (topic_id,))
+        row = cur.fetchone()
+        conn.commit()
+        if not row:
+            raise HTTPException(status_code=404, detail="Alert topic not found")
+        sync_scheduler_jobs()
+        return JSONResponse(content={"deleted": True, "topic_id": topic_id})
+    except HTTPException:
+        raise
+    except Exception as e:
+        _safe_rollback(conn, "delete_alert_topic")
+        raise HTTPException(status_code=500, detail=f"Failed to delete alert topic: {e}")
+
+
+@alerts_router.post("/topics/{topic_id}/run")
+async def run_alert_topic_now(topic_id: str):
+    topics = [topic for topic in _list_alert_topics() if topic.get("topic_id") == topic_id]
+    if not topics:
+        raise HTTPException(status_code=404, detail="Alert topic not found")
+    result = _run_alert_topic_check(topics[0])
+    return JSONResponse(content={"topic_id": topic_id, "event": result})
+
+
+@alerts_router.get("/events")
+async def list_alert_events_endpoint(limit: int = 50, topic_id: Optional[str] = None):
+    return JSONResponse(content={"events": _list_alert_events(limit=max(1, min(limit, 100)), topic_id=topic_id)})
+
+
+@alerts_router.post("/events/{event_id}/ack")
+async def acknowledge_alert_event(event_id: str):
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            UPDATE alert_events
+            SET acknowledged_at = NOW()
+            WHERE event_id = %s::uuid
+            RETURNING event_id
+        """, (event_id,))
+        row = cur.fetchone()
+        conn.commit()
+        if not row:
+            raise HTTPException(status_code=404, detail="Alert event not found")
+        return JSONResponse(content={"acknowledged": True, "event_id": event_id})
+    except HTTPException:
+        raise
+    except Exception as e:
+        _safe_rollback(conn, "acknowledge_alert_event")
+        raise HTTPException(status_code=500, detail=f"Failed to acknowledge alert event: {e}")
+
+
 @github_router.post("/commit")
 async def github_commit(payload: GitHubCommitRequest):
     repo = _validate_repo_name(payload.repo)
@@ -5637,6 +6210,7 @@ app.include_router(sessions_router)
 app.include_router(prospects_router)
 app.include_router(email_drafts_router)
 app.include_router(devices_router)
+app.include_router(alerts_router)
 app.include_router(tracking_router)
 
 # Cross-origin support for mobile/web clients hitting deployed API domains.
