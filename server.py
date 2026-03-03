@@ -94,6 +94,7 @@ VOICE_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 VOICE_TTS_MODEL = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts").strip() or "gpt-4o-mini-tts"
 VOICE_STT_MODEL = os.getenv("OPENAI_STT_MODEL", "gpt-4o-mini-transcribe").strip() or "gpt-4o-mini-transcribe"
 VOICE_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview").strip() or "gpt-4o-realtime-preview"
+PHOTO_VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
 VOICE_AUDIO_MAX_BYTES = int(os.getenv("VOICE_AUDIO_MAX_BYTES", str(12 * 1024 * 1024)))
 VOICE_AUDIO_TTL_SECONDS = int(os.getenv("VOICE_AUDIO_TTL_SECONDS", str(60 * 30)))
 VOICE_PERSONAS: Dict[str, Dict[str, str]] = {
@@ -136,6 +137,84 @@ def _prune_voice_audio_cache() -> None:
                 continue
     except Exception as e:
         logger.debug("Voice audio cache prune skipped: %s", e)
+
+
+def _normalize_image_attachments(raw_value: Any) -> List[Dict[str, str]]:
+    normalized: List[Dict[str, str]] = []
+    if not isinstance(raw_value, list):
+        return normalized
+    for item in raw_value:
+        if isinstance(item, str):
+            url = item.strip()
+            if url:
+                normalized.append({"url": url})
+            continue
+        if isinstance(item, dict):
+            url = str(item.get("url") or item.get("image_url") or "").strip()
+            caption = str(item.get("caption") or "").strip()
+            if url:
+                payload: Dict[str, str] = {"url": url}
+                if caption:
+                    payload["caption"] = caption
+                normalized.append(payload)
+    return normalized[:4]
+
+
+def _build_image_context(user_input: str, image_attachments: Optional[List[Dict[str, str]]], personality: str) -> str:
+    attachments = image_attachments or []
+    if not attachments or not config.OPENAI_API_KEY:
+        return user_input
+
+    try:
+        client = _get_openai_client()
+        content: List[Dict[str, Any]] = [
+            {
+                "type": "input_text",
+                "text": (
+                    "Analyze these user-shared images for an AI companion chat. "
+                    "Identify people, facial traits that may help later recognition, places, objects, "
+                    "activities, mood, and any durable details worth remembering. "
+                    "Be careful with uncertainty and say when you are unsure. "
+                    f"User request: {user_input or 'The user shared these images without extra text.'}"
+                ),
+            }
+        ]
+        for attachment in attachments:
+            caption = str(attachment.get("caption") or "").strip()
+            if caption:
+                content.append({"type": "input_text", "text": f"Image caption/request: {caption}"})
+            content.append(
+                {
+                    "type": "input_image",
+                    "image_url": attachment["url"],
+                    "detail": "high",
+                }
+            )
+        response = client.responses.create(
+            model=PHOTO_VISION_MODEL,
+            input=[{"role": "user", "content": content}],
+            max_output_tokens=700,
+        )
+        summary = (getattr(response, "output_text", "") or "").strip()
+        if not summary:
+            return user_input
+        companion_prompt = (
+            f"{user_input}\n\n"
+            "[Attached image analysis context]\n"
+            f"{summary}\n\n"
+            "Use the image analysis naturally in your reply. Treat uncertain details as uncertain."
+        )
+        return companion_prompt
+    except Exception as e:
+        logger.warning("Image context analysis failed: %s", e)
+        fallback_notes = []
+        for attachment in attachments:
+            caption = str(attachment.get("caption") or "").strip()
+            if caption:
+                fallback_notes.append(f"- Image caption/request: {caption}")
+        if fallback_notes:
+            return f"{user_input}\n\n[Attached images]\n" + "\n".join(fallback_notes)
+        return user_input
 
 
 def _guess_audio_extension(content_type: str, filename: str) -> str:
@@ -6572,6 +6651,8 @@ async def chat(request: Request):
 
     body = await request.json()
     user_input = body.get("message", "").strip()
+    image_attachments = _normalize_image_attachments(body.get("image_urls"))
+    user_input = _build_image_context(user_input, image_attachments, personality=(body.get("personality") or "sylana").strip().lower())
     thread_id = body.get("thread_id")
     requested_tools = body.get("active_tools", body.get("activeTools", None))
     personality = (body.get("personality") or "sylana").strip().lower()
@@ -6628,6 +6709,8 @@ async def chat_sync(request: Request):
 
     body = await request.json()
     user_input = body.get("message", "").strip()
+    image_attachments = _normalize_image_attachments(body.get("image_urls"))
+    user_input = _build_image_context(user_input, image_attachments, personality=(body.get("personality") or "sylana").strip().lower())
     thread_id = body.get("thread_id")
     requested_tools = body.get("active_tools", body.get("activeTools", None))
     personality = (body.get("personality") or "sylana").strip().lower()
@@ -6852,12 +6935,21 @@ async def create_voice_realtime_session(payload: VoiceRealtimeSessionRequest):
     personality = (payload.personality or "sylana").strip().lower()
     persona = _voice_persona(personality)
     body = {
-        "model": VOICE_REALTIME_MODEL,
-        "voice": persona["voice"],
-        "instructions": persona["instructions"],
+        "session": {
+            "type": "realtime",
+            "model": VOICE_REALTIME_MODEL,
+            "voice": persona["voice"],
+            "instructions": persona["instructions"],
+            "audio": {
+                "input": {
+                    "turn_detection": {"type": "server_vad"},
+                    "transcription": {"model": VOICE_STT_MODEL},
+                }
+            },
+        }
     }
     req = UrlRequest(
-        url="https://api.openai.com/v1/realtime/sessions",
+        url="https://api.openai.com/v1/realtime/client_secrets",
         data=json.dumps(body).encode("utf-8"),
         headers={
             "Authorization": f"Bearer {config.OPENAI_API_KEY}",
@@ -6869,6 +6961,12 @@ async def create_voice_realtime_session(payload: VoiceRealtimeSessionRequest):
         with urlopen(req, timeout=25) as resp:
             payload_text = resp.read().decode("utf-8")
         parsed = json.loads(payload_text or "{}")
+        session_data = parsed.get("session") if isinstance(parsed.get("session"), dict) else {}
+        if session_data:
+            session_data["client_secret"] = parsed.get("client_secret")
+            session_data.setdefault("voice", persona["voice"])
+            session_data.setdefault("model", VOICE_REALTIME_MODEL)
+            parsed = session_data
         parsed["personality"] = personality
         return JSONResponse(content=parsed)
     except HTTPError as e:
