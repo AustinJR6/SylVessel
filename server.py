@@ -4633,12 +4633,24 @@ def generate_response(
             has_memories=has_memories,
         )
         active_model = state.openrouter_model if resolved_mode == "spicy" and state.openrouter_model else state.claude_model
-        response = active_model.generate(
-            system_prompt=claude_inputs['system_prompt'],
-            messages=claude_inputs['messages'],
-            max_tokens=_max_new_tokens_for_turn(memory_query=memory_query),
-            active_tools=resolved_tools,
-        ).strip()
+        try:
+            response = active_model.generate(
+                system_prompt=claude_inputs['system_prompt'],
+                messages=claude_inputs['messages'],
+                max_tokens=_max_new_tokens_for_turn(memory_query=memory_query),
+                active_tools=resolved_tools,
+            ).strip()
+        except Exception as spicy_error:
+            if resolved_mode == "spicy" and state.openrouter_model:
+                logger.warning("Spicy mode provider failed; falling back to default model: %s", spicy_error)
+                response = state.claude_model.generate(
+                    system_prompt=claude_inputs['system_prompt'],
+                    messages=claude_inputs['messages'],
+                    max_tokens=_max_new_tokens_for_turn(memory_query=memory_query),
+                    active_tools=resolved_tools,
+                ).strip()
+            else:
+                raise
         if not response:
             response = "I'm here with you. Say that again for me."
         if thread_id:
@@ -4848,15 +4860,32 @@ async def generate_response_stream(
 
         full_response = ''
         active_model = state.openrouter_model if resolved_mode == "spicy" and state.openrouter_model else state.claude_model
-        for token in active_model.generate_stream(
-            system_prompt=claude_inputs['system_prompt'],
-            messages=claude_inputs['messages'],
-            max_tokens=_max_new_tokens_for_turn(memory_query=memory_query),
-            active_tools=resolved_tools,
-        ):
-            full_response += token
-            yield json.dumps({'type': 'token', 'data': token})
-            await asyncio.sleep(0.001)
+        try:
+            token_stream = active_model.generate_stream(
+                system_prompt=claude_inputs['system_prompt'],
+                messages=claude_inputs['messages'],
+                max_tokens=_max_new_tokens_for_turn(memory_query=memory_query),
+                active_tools=resolved_tools,
+            )
+            for token in token_stream:
+                full_response += token
+                yield json.dumps({'type': 'token', 'data': token})
+                await asyncio.sleep(0.001)
+        except Exception as spicy_error:
+            if resolved_mode == "spicy" and state.openrouter_model:
+                logger.warning("Spicy mode stream provider failed; falling back to default model: %s", spicy_error)
+                full_response = ""
+                for token in state.claude_model.generate_stream(
+                    system_prompt=claude_inputs['system_prompt'],
+                    messages=claude_inputs['messages'],
+                    max_tokens=_max_new_tokens_for_turn(memory_query=memory_query),
+                    active_tools=resolved_tools,
+                ):
+                    full_response += token
+                    yield json.dumps({'type': 'token', 'data': token})
+                    await asyncio.sleep(0.001)
+            else:
+                raise
 
         full_response = full_response.strip() or "I'm here with you. Say that again for me."
         if thread_id:
@@ -6869,41 +6898,35 @@ async def create_voice_realtime_call(payload: VoiceRealtimeCallRequest):
         return JSONResponse(status_code=400, content={"error": "sdp is required"})
 
     try:
-        # Step 1: Create an ephemeral session to configure voice/persona.
-        session_body = json.dumps({
+        # Current official OpenAI WebRTC flow accepts the SDP offer and session config
+        # together via /v1/realtime/calls, keeping the standard API key on the server.
+        session_config = {
+            "type": "realtime",
             "model": VOICE_REALTIME_MODEL,
-            "voice": persona["voice"],
             "instructions": persona["instructions"],
-            "turn_detection": {"type": "server_vad"},
-            "input_audio_transcription": {"model": VOICE_STT_MODEL},
-        }).encode("utf-8")
-        session_req = UrlRequest(
-            url="https://api.openai.com/v1/realtime/sessions",
-            data=session_body,
+            "audio": {
+                "output": {"voice": persona["voice"]},
+                "input": {
+                    "turn_detection": {"type": "server_vad"},
+                    "transcription": {"model": VOICE_STT_MODEL},
+                },
+            },
+        }
+        multipart_body, boundary = _encode_multipart_form({
+            "sdp": offer_sdp,
+            "session": json.dumps(session_config),
+        })
+        call_req = UrlRequest(
+            url="https://api.openai.com/v1/realtime/calls",
+            data=multipart_body,
             headers={
                 "Authorization": f"Bearer {config.OPENAI_API_KEY}",
-                "Content-Type": "application/json",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "Accept": "application/sdp",
             },
             method="POST",
         )
-        with urlopen(session_req, timeout=20) as resp:
-            session_data = json.loads(resp.read().decode("utf-8"))
-        ephemeral_key = (session_data.get("client_secret") or {}).get("value") or ""
-        if not ephemeral_key:
-            logger.warning("Realtime session did not return a client_secret: %s", session_data)
-            return JSONResponse(status_code=502, content={"error": "Realtime session did not return a client secret"})
-
-        # Step 2: Forward the SDP offer to OpenAI's WebRTC endpoint using the ephemeral key.
-        sdp_req = UrlRequest(
-            url=f"https://api.openai.com/v1/realtime?model={VOICE_REALTIME_MODEL}",
-            data=offer_sdp.encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {ephemeral_key}",
-                "Content-Type": "application/sdp",
-            },
-            method="POST",
-        )
-        with urlopen(sdp_req, timeout=30) as resp:
+        with urlopen(call_req, timeout=30) as resp:
             answer_sdp = resp.read().decode("utf-8")
             call_id = (resp.headers.get("x-openai-call-id") or resp.headers.get("openai-call-id") or "").strip()
         return JSONResponse(
