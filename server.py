@@ -319,6 +319,14 @@ def _generate_modelslab_images(
 
     urls = _normalize_generated_image_urls(parsed.get("output"))
     status_value = str(parsed.get("status") or ("success" if urls else "unknown"))
+    message_value = str(parsed.get("message") or "").strip()
+    if status_value.lower() == "error" or (not urls and message_value):
+        lowered_message = message_value.lower()
+        status_code = 402 if "credit" in lowered_message or "wallet" in lowered_message or "subscribe" in lowered_message else 502
+        raise HTTPException(
+            status_code=status_code,
+            detail=f"Modelslab image generation failed: {message_value or 'provider returned no images'}",
+        )
     return {
         "provider": "modelslab",
         "prompt": clean_prompt,
@@ -7130,7 +7138,6 @@ async def create_voice_realtime_session(payload: VoiceRealtimeSessionRequest):
         "session": {
             "type": "realtime",
             "model": VOICE_REALTIME_MODEL,
-            "voice": persona["voice"],
             "instructions": persona["instructions"],
             "audio": {
                 "input": {
@@ -7155,8 +7162,11 @@ async def create_voice_realtime_session(payload: VoiceRealtimeSessionRequest):
         parsed = json.loads(payload_text or "{}")
         session_data = parsed.get("session") if isinstance(parsed.get("session"), dict) else {}
         if session_data:
-            session_data["client_secret"] = parsed.get("client_secret")
-            session_data.setdefault("voice", persona["voice"])
+            session_data["client_secret"] = {
+                "value": parsed.get("value"),
+                "expires_at": parsed.get("expires_at"),
+            }
+            session_data["requested_voice"] = persona["voice"]
             session_data.setdefault("model", VOICE_REALTIME_MODEL)
             parsed = session_data
         parsed["personality"] = personality
