@@ -1299,6 +1299,125 @@ def normalize_conversation_mode(mode: Optional[Any], personality: str) -> str:
     return "spicy" if normalized_mode == "spicy" else "default"
 
 
+AVATAR_EXPRESSION_SET = {"idle", "listening", "thinking", "speaking", "alert"}
+
+
+def _heuristic_avatar_intent(
+    *,
+    speaking_role: str = "",
+    latest_user_text: str = "",
+    latest_assistant_text: str = "",
+    transcript_excerpt: str = "",
+    current_expression: str = "idle",
+) -> Dict[str, Any]:
+    role = (speaking_role or "").strip().lower()
+    user_text = (latest_user_text or "").strip()
+    assistant_text = (latest_assistant_text or "").strip()
+    transcript = (transcript_excerpt or "").strip()
+    signal = f"{user_text}\n{assistant_text}\n{transcript}".lower()
+
+    if role == "assistant":
+        return {"expression": "speaking", "intensity": 0.86, "hold_ms": 650, "reason": "assistant_currently_speaking", "source": "heuristic"}
+    if role == "user":
+        return {"expression": "listening", "intensity": 0.78, "hold_ms": 600, "reason": "user_currently_speaking", "source": "heuristic"}
+
+    if any(token in signal for token in ["danger", "urgent", "emergency", "critical", "help", "panic"]):
+        return {"expression": "alert", "intensity": 0.96, "hold_ms": 1600, "reason": "high_urgency_language", "source": "heuristic"}
+    if any(token in signal for token in ["hmm", "thinking", "not sure", "maybe", "consider", "let me think"]):
+        return {"expression": "thinking", "intensity": 0.64, "hold_ms": 1300, "reason": "deliberation_detected", "source": "heuristic"}
+    if signal and (("!" in signal) or ("?" in signal)):
+        return {"expression": "listening", "intensity": 0.58, "hold_ms": 950, "reason": "active_dialogue_punctuation", "source": "heuristic"}
+
+    fallback_expr = (current_expression or "idle").strip().lower()
+    if fallback_expr not in AVATAR_EXPRESSION_SET:
+        fallback_expr = "idle"
+    return {"expression": fallback_expr, "intensity": 0.48, "hold_ms": 900, "reason": "default_idle_flow", "source": "heuristic"}
+
+
+def _safe_parse_json_object(text: str) -> Dict[str, Any]:
+    raw = (text or "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        pass
+    match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+    if not match:
+        return {}
+    try:
+        parsed = json.loads(match.group(0))
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _generate_avatar_intent(payload: Dict[str, Any]) -> Dict[str, Any]:
+    personality = str(payload.get("personality") or "sylana").strip().lower()
+    speaking_role = str(payload.get("speaking_role") or "").strip().lower()
+    latest_user_text = str(payload.get("latest_user_text") or "").strip()[:1000]
+    latest_assistant_text = str(payload.get("latest_assistant_text") or "").strip()[:1000]
+    transcript_excerpt = str(payload.get("transcript_excerpt") or "").strip()[:1800]
+    current_expression = str(payload.get("current_expression") or "idle").strip().lower()
+    mode = str(payload.get("mode") or "hands_free").strip().lower()
+
+    fallback = _heuristic_avatar_intent(
+        speaking_role=speaking_role,
+        latest_user_text=latest_user_text,
+        latest_assistant_text=latest_assistant_text,
+        transcript_excerpt=transcript_excerpt,
+        current_expression=current_expression,
+    )
+
+    if not state.ready or not state.claude_model:
+        return fallback
+
+    prompt = (
+        "You are a real-time avatar expression controller for a voice AI app.\n"
+        "Choose exactly one expression from: idle, listening, thinking, speaking, alert.\n"
+        "Return strict JSON only with keys: expression, intensity, hold_ms, reason.\n"
+        "Rules:\n"
+        "- Prefer speaking when assistant is currently speaking.\n"
+        "- Prefer listening when user is currently speaking.\n"
+        "- Use alert only for clear urgency/safety/high-severity cues.\n"
+        "- hold_ms should be 400-2200.\n"
+        "- intensity should be 0.0-1.0.\n"
+        "- Keep reason short snake_case.\n\n"
+        f"personality={personality}\n"
+        f"mode={mode}\n"
+        f"speaking_role={speaking_role or 'none'}\n"
+        f"current_expression={current_expression}\n"
+        f"latest_user_text={latest_user_text or '[none]'}\n"
+        f"latest_assistant_text={latest_assistant_text or '[none]'}\n"
+        f"transcript_excerpt={transcript_excerpt or '[none]'}"
+    )
+    try:
+        raw = state.claude_model.generate(
+            system_prompt="Output valid JSON only.",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=140,
+            active_tools=[],
+        )
+        parsed = _safe_parse_json_object(raw)
+        expression = str(parsed.get("expression") or "").strip().lower()
+        if expression not in AVATAR_EXPRESSION_SET:
+            return fallback
+        intensity = float(parsed.get("intensity", 0.55) or 0.55)
+        hold_ms = int(parsed.get("hold_ms", 1000) or 1000)
+        reason = str(parsed.get("reason") or "ai_avatar_intent").strip() or "ai_avatar_intent"
+        return {
+            "expression": expression,
+            "intensity": round(max(0.0, min(intensity, 1.0)), 3),
+            "hold_ms": max(300, min(hold_ms, 2600)),
+            "reason": reason[:80],
+            "source": "ai",
+        }
+    except Exception as e:
+        logger.warning("Avatar intent AI inference failed, using heuristic fallback: %s", e)
+        return fallback
+
+
 def _approx_token_count(text: str) -> int:
     # Rough estimate for tracking prompt size trends.
     return max(1, (len(text or "") + 3) // 4)
@@ -5238,6 +5357,16 @@ class VoiceRealtimeCallRequest(BaseModel):
     personality: str = "sylana"
 
 
+class AvatarIntentRequest(BaseModel):
+    personality: str = "sylana"
+    mode: str = "hands_free"
+    speaking_role: Optional[str] = None
+    current_expression: Optional[str] = "idle"
+    latest_user_text: Optional[str] = None
+    latest_assistant_text: Optional[str] = None
+    transcript_excerpt: Optional[str] = None
+
+
 class ImageGenerationRequest(BaseModel):
     prompt: str
     negative_prompt: str = ""
@@ -7005,6 +7134,22 @@ async def generate_image(payload: ImageGenerationRequest):
             "generated_images": result.get("generated_images") or [],
         }
     )
+
+
+@app.post("/api/avatar/intent")
+async def avatar_intent(payload: AvatarIntentRequest):
+    result = _generate_avatar_intent(
+        {
+            "personality": payload.personality,
+            "mode": payload.mode,
+            "speaking_role": payload.speaking_role,
+            "current_expression": payload.current_expression,
+            "latest_user_text": payload.latest_user_text,
+            "latest_assistant_text": payload.latest_assistant_text,
+            "transcript_excerpt": payload.transcript_excerpt,
+        }
+    )
+    return JSONResponse(content=result)
 
 
 @app.post("/api/voice/transcribe")
