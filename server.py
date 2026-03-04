@@ -93,7 +93,8 @@ VOICE_AUDIO_DIR = Path(__file__).parent / "data" / "media" / "voice"
 VOICE_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 VOICE_TTS_MODEL = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts").strip() or "gpt-4o-mini-tts"
 VOICE_STT_MODEL = os.getenv("OPENAI_STT_MODEL", "gpt-4o-mini-transcribe").strip() or "gpt-4o-mini-transcribe"
-VOICE_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-4o-realtime-preview").strip() or "gpt-4o-realtime-preview"
+_voice_realtime_model_env = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime").strip() or "gpt-realtime"
+VOICE_REALTIME_MODEL = "gpt-realtime" if _voice_realtime_model_env == "gpt-4o-realtime-preview" else _voice_realtime_model_env
 PHOTO_VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
 VOICE_AUDIO_MAX_BYTES = int(os.getenv("VOICE_AUDIO_MAX_BYTES", str(12 * 1024 * 1024)))
 VOICE_AUDIO_TTL_SECONDS = int(os.getenv("VOICE_AUDIO_TTL_SECONDS", str(60 * 30)))
@@ -113,6 +114,11 @@ VOICE_PERSONAS: Dict[str, Dict[str, str]] = {
         ),
     },
 }
+IMAGE_REQUEST_PATTERN = re.compile(
+    r"\b(generate|create|draw|render|make|design|illustrate|paint)\b.{0,36}\b(image|picture|photo|portrait|art|illustration|logo|wallpaper|scene|cover)\b"
+    r"|\b(image|picture|portrait|wallpaper|logo|illustration)\b.{0,36}\b(generate|create|draw|render|make|design|illustrate|paint)\b",
+    re.IGNORECASE,
+)
 
 
 def _get_openai_client() -> OpenAI:
@@ -215,6 +221,113 @@ def _build_image_context(user_input: str, image_attachments: Optional[List[Dict[
         if fallback_notes:
             return f"{user_input}\n\n[Attached images]\n" + "\n".join(fallback_notes)
         return user_input
+
+
+def _normalize_generated_image_urls(raw_value: Any) -> List[str]:
+    urls: List[str] = []
+    if not isinstance(raw_value, list):
+        return urls
+    for item in raw_value:
+        if isinstance(item, str):
+            url = item.strip()
+            if url:
+                urls.append(url)
+        elif isinstance(item, dict):
+            url = str(item.get("url") or item.get("image") or item.get("src") or "").strip()
+            if url:
+                urls.append(url)
+    deduped: List[str] = []
+    for url in urls:
+        if url not in deduped:
+            deduped.append(url)
+    return deduped[:4]
+
+
+def _extract_image_prompt(user_input: str) -> str:
+    text = str(user_input or "").strip()
+    if not text:
+        return ""
+    if text.lower().startswith("/image "):
+        return text[7:].strip()
+    cleaned = re.sub(r"^\s*(please\s+)?(generate|create|draw|render|make|design|illustrate|paint)\s+(me\s+)?", "", text, flags=re.IGNORECASE)
+    cleaned = re.sub(r"^\s*(an?|the)\s+", "", cleaned, flags=re.IGNORECASE)
+    return cleaned.strip(" .") or text
+
+
+def _is_image_generation_request(user_input: str, active_tools: Optional[List[str]]) -> bool:
+    active = {str(t or "").strip().lower() for t in (active_tools or [])}
+    if "image_generation" not in active:
+        return False
+    text = str(user_input or "").strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    if lowered.startswith("/image "):
+        return True
+    return bool(IMAGE_REQUEST_PATTERN.search(text))
+
+
+def _generate_modelslab_images(
+    prompt: str,
+    *,
+    negative_prompt: str = "",
+    width: int = 1024,
+    height: int = 1024,
+    samples: int = 1,
+    model_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    if not config.MODELSLAB_API_KEY:
+        raise HTTPException(status_code=503, detail="MODELSLAB_API_KEY is not configured")
+
+    clean_prompt = str(prompt or "").strip()
+    if not clean_prompt:
+        raise HTTPException(status_code=400, detail="prompt is required")
+
+    payload = {
+        "key": config.MODELSLAB_API_KEY,
+        "prompt": clean_prompt[:1600],
+        "negative_prompt": str(negative_prompt or "").strip()[:600],
+        "width": str(max(256, min(int(width or 1024), 1536))),
+        "height": str(max(256, min(int(height or 1024), 1536))),
+        "samples": str(max(1, min(int(samples or 1), 4))),
+        "model_id": str(model_id or config.MODELSLAB_IMAGE_MODEL or "flux").strip() or "flux",
+        "safety_checker": "yes",
+        "enhance_prompt": "yes",
+        "base64": False,
+    }
+    req = UrlRequest(
+        url=f"{config.MODELSLAB_BASE_URL.rstrip('/')}/images/text2img",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlopen(req, timeout=90) as resp:
+            raw = resp.read().decode("utf-8")
+        parsed = json.loads(raw or "{}")
+    except HTTPError as e:
+        details = ""
+        try:
+            details = e.read().decode("utf-8")
+        except Exception:
+            details = str(e)
+        raise HTTPException(status_code=502, detail=f"Modelslab image generation failed: {details[:400]}") from e
+    except URLError as e:
+        raise HTTPException(status_code=502, detail=f"Modelslab image generation failed: {e}") from e
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Modelslab image generation failed: {e}") from e
+
+    urls = _normalize_generated_image_urls(parsed.get("output"))
+    status_value = str(parsed.get("status") or ("success" if urls else "unknown"))
+    return {
+        "provider": "modelslab",
+        "prompt": clean_prompt,
+        "model_id": str(parsed.get("model_id") or payload["model_id"]),
+        "status": status_value,
+        "generation_id": parsed.get("id"),
+        "generated_images": urls,
+        "raw": parsed,
+    }
 
 
 def _guess_audio_extension(content_type: str, filename: str) -> str:
@@ -1079,6 +1192,7 @@ NO_REPEAT_NGRAM_SIZE = 4
 DEFAULT_ACTIVE_TOOLS = ["web_search", "memories"]
 AVAILABLE_TOOLS: List[Dict[str, str]] = [
     {"key": "web_search", "display_name": "Web Search", "icon": "globe", "description": "Search current web information when needed."},
+    {"key": "image_generation", "display_name": "Image Generation", "icon": "sparkles", "description": "Generate images from prompts using Modelslab."},
     {"key": "code_execution", "display_name": "Code Execution", "icon": "terminal", "description": "Run Python, JavaScript, and bash securely."},
     {"key": "files", "display_name": "Files", "icon": "file-text", "description": "Create and retrieve files generated in sessions."},
     {"key": "health_data", "display_name": "Health Data", "icon": "heart-pulse", "description": "Use health metrics like sleep, steps, heart rate, and stress."},
@@ -1288,6 +1402,26 @@ def _runtime_tool_specs(active_tools: Optional[List[str]]) -> List[Dict[str, Any
     active = {str(t or "").strip().lower() for t in (active_tools or [])}
     specs: List[Dict[str, Any]] = []
 
+    if "image_generation" in active:
+        specs.append(
+            {
+                "name": "generate_image",
+                "description": "Generate an image from a text prompt and return hosted image URLs.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "prompt": {"type": "string", "description": "The image prompt to generate."},
+                        "negative_prompt": {"type": "string", "description": "Optional traits to avoid."},
+                        "width": {"type": "integer", "minimum": 256, "maximum": 1536},
+                        "height": {"type": "integer", "minimum": 256, "maximum": 1536},
+                        "samples": {"type": "integer", "minimum": 1, "maximum": 4},
+                        "model_id": {"type": "string", "description": "Optional Modelslab model identifier override."},
+                    },
+                    "required": ["prompt"],
+                },
+            }
+        )
+
     if "github" in active:
         specs.extend([
             {
@@ -1396,6 +1530,24 @@ def _runtime_tool_specs(active_tools: Optional[List[str]]) -> List[Dict[str, Any
 
 def _runtime_tool_runner(name: str, tool_input: Dict[str, Any]) -> Dict[str, Any]:
     tool_input = tool_input or {}
+
+    if name == "generate_image":
+        result = _generate_modelslab_images(
+            prompt=str(tool_input.get("prompt") or "").strip(),
+            negative_prompt=str(tool_input.get("negative_prompt") or "").strip(),
+            width=int(tool_input.get("width") or 1024),
+            height=int(tool_input.get("height") or 1024),
+            samples=int(tool_input.get("samples") or 1),
+            model_id=str(tool_input.get("model_id") or "").strip() or None,
+        )
+        return {
+            "provider": result.get("provider"),
+            "prompt": result.get("prompt"),
+            "model_id": result.get("model_id"),
+            "status": result.get("status"),
+            "generation_id": result.get("generation_id"),
+            "generated_images": result.get("generated_images") or [],
+        }
 
     if name == "github_list_repos":
         client = _get_github_client()
@@ -5078,6 +5230,15 @@ class VoiceRealtimeCallRequest(BaseModel):
     personality: str = "sylana"
 
 
+class ImageGenerationRequest(BaseModel):
+    prompt: str
+    negative_prompt: str = ""
+    width: int = 1024
+    height: int = 1024
+    samples: int = 1
+    model_id: Optional[str] = None
+
+
 class ScheduleConfigUpdateRequest(BaseModel):
     active: Optional[bool] = None
     cron_expr: Optional[str] = None
@@ -6801,10 +6962,41 @@ async def chat_sync(request: Request):
                 active_tools=resolved_tools,
                 conversation_mode=conversation_mode,
             )
+        if _is_image_generation_request(user_input, resolved_tools):
+            try:
+                image_result = _generate_modelslab_images(prompt=_extract_image_prompt(user_input))
+                result["generated_images"] = image_result.get("generated_images") or []
+                result["image_prompt"] = image_result.get("prompt")
+                result["image_model"] = image_result.get("model_id")
+            except HTTPException as image_error:
+                result["generated_images"] = []
+                result["image_generation_error"] = str(image_error.detail)
         return JSONResponse(content=result)
     except Exception as e:
         logger.exception(f"chat_sync failed for thread_id={thread_id}: {e}")
         return _chat_sync_error_response(e, thread_id=thread_id)
+
+
+@app.post("/api/images/generate")
+async def generate_image(payload: ImageGenerationRequest):
+    result = _generate_modelslab_images(
+        prompt=payload.prompt,
+        negative_prompt=payload.negative_prompt,
+        width=payload.width,
+        height=payload.height,
+        samples=payload.samples,
+        model_id=payload.model_id,
+    )
+    return JSONResponse(
+        content={
+            "provider": result.get("provider"),
+            "prompt": result.get("prompt"),
+            "model_id": result.get("model_id"),
+            "status": result.get("status"),
+            "generation_id": result.get("generation_id"),
+            "generated_images": result.get("generated_images") or [],
+        }
+    )
 
 
 @app.post("/api/voice/transcribe")

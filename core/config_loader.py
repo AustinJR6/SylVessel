@@ -44,6 +44,7 @@ class Config:
         self.ANTHROPIC_API_KEY = _clean_secret_env("ANTHROPIC_API_KEY")
         self.OPENAI_API_KEY = _clean_secret_env("OPENAI_API_KEY")
         self.OPENROUTER_API_KEY = _clean_secret_env("OPENROUTER_API_KEY")
+        self.MODELSLAB_API_KEY = _clean_secret_env("MODELSLAB_API_KEY")
         self.BRAVE_SEARCH_API_KEY = _clean_secret_env("BRAVE_SEARCH_API_KEY")
         self.GITHUB_TOKEN = _clean_secret_env("GITHUB_TOKEN")
         self.CODE_EXEC_GCS_BUCKET = _clean_secret_env("CODE_EXEC_GCS_BUCKET")
@@ -61,6 +62,8 @@ class Config:
         ).strip() or "nousresearch/hermes-3-llama-3.1-70b"
         self.OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL", "").strip()
         self.OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "Sylana Vessel").strip() or "Sylana Vessel"
+        self.MODELSLAB_BASE_URL = os.getenv("MODELSLAB_BASE_URL", "https://modelslab.com/api/v6").strip() or "https://modelslab.com/api/v6"
+        self.MODELSLAB_IMAGE_MODEL = os.getenv("MODELSLAB_IMAGE_MODEL", "flux").strip() or "flux"
         self.APP_TIMEZONE = os.getenv("APP_TIMEZONE", "America/Chicago")
         self.ENABLE_WEB_SEARCH = os.getenv("ENABLE_WEB_SEARCH", "true").lower() == "true"
         self.EMOTION_MODEL = os.getenv("EMOTION_MODEL", "gpt-4o-mini")
@@ -148,6 +151,8 @@ class Config:
             errors.append("OPENAI_API_KEY is required for semantic memory embeddings")
         if not self.OPENROUTER_API_KEY:
             errors.append("OPENROUTER_API_KEY not set; spicy mode will fall back to default model routing")
+        if not self.MODELSLAB_API_KEY:
+            errors.append("MODELSLAB_API_KEY not set; image generation will be unavailable")
         if not self.MEMORY_ENCRYPTION_KEY:
             errors.append("MEMORY_ENCRYPTION_KEY not set; secure memory payload encryption is disabled")
 
@@ -174,6 +179,7 @@ Sylana Vessel Configuration:
   ANTHROPIC_API_KEY: {"SET" if self.ANTHROPIC_API_KEY else "NOT_SET"}
   OPENAI_API_KEY: {"SET" if self.OPENAI_API_KEY else "NOT_SET"}
   OPENROUTER_API_KEY: {"SET" if self.OPENROUTER_API_KEY else "NOT_SET"}
+  MODELSLAB_API_KEY: {"SET" if self.MODELSLAB_API_KEY else "NOT_SET"}
   BRAVE_SEARCH_API_KEY: {"SET" if self.BRAVE_SEARCH_API_KEY else "NOT_SET"}
   GITHUB_TOKEN: {"SET" if self.GITHUB_TOKEN else "NOT_SET"}
   CODE_EXEC_GCS_BUCKET: {self.CODE_EXEC_GCS_BUCKET or "NOT_SET"}
@@ -188,6 +194,8 @@ Sylana Vessel Configuration:
   OPENROUTER_SPICY_MODEL: {self.OPENROUTER_SPICY_MODEL}
   OPENROUTER_SITE_URL: {self.OPENROUTER_SITE_URL or "NOT_SET"}
   OPENROUTER_APP_NAME: {self.OPENROUTER_APP_NAME}
+  MODELSLAB_BASE_URL: {self.MODELSLAB_BASE_URL}
+  MODELSLAB_IMAGE_MODEL: {self.MODELSLAB_IMAGE_MODEL}
   APP_TIMEZONE: {self.APP_TIMEZONE}
   ENABLE_WEB_SEARCH: {self.ENABLE_WEB_SEARCH}
   EMOTION_MODEL: {self.EMOTION_MODEL}
