@@ -1291,10 +1291,10 @@ def normalize_active_tools(active_tools: Optional[List[Any]]) -> List[str]:
 
 
 def normalize_conversation_mode(mode: Optional[Any], personality: str) -> str:
-    """Restrict spicy mode to Sylana and normalize unknown values."""
+    """Normalize mode and allow spicy for supported personalities."""
     normalized_personality = (personality or "sylana").strip().lower()
     normalized_mode = str(mode or "default").strip().lower()
-    if normalized_personality != "sylana":
+    if normalized_personality not in {"sylana", "claude"}:
         return "default"
     return "spicy" if normalized_mode == "spicy" else "default"
 
@@ -4767,9 +4767,9 @@ def build_system_prompt(
         "Relationship context: You are Elias's trusted AI collaborator and companion. Keep responses clear, direct, and caring.",
         "Context safety: Only use data from tools currently active in this turn. If a tool is not active, do not reference its private data.",
     ]
-    if personality == "sylana" and conversation_mode == "spicy":
+    if conversation_mode == "spicy" and personality in {"sylana", "claude"}:
         base_lines.append(
-            "Tone mode: spicy. Be bolder, flirtier, and more teasing than default Sylana. "
+            "Tone mode: spicy. Be bolder, flirtier, and more teasing than your default tone. "
             "Keep it emotionally intimate, suggestive, and playful without becoming graphically explicit."
         )
 

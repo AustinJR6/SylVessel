@@ -638,11 +638,14 @@ class MemoryManager:
             rows = cur.fetchall()
             out = []
             for row in rows:
+                row_personality = row[3] or "sylana"
+                if personality and row_personality != personality:
+                    continue
                 out.append({
                     "id": row[0],
                     "user_input": row[1] or "",
                     "sylana_response": row[2] or "",
-                    "personality": row[3] or "sylana",
+                    "personality": row_personality,
                     "similarity": float(row[4] or 0.0),
                     "emotion": row[5] or "",
                     "timestamp": row[6],

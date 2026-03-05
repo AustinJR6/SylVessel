@@ -10,6 +10,9 @@ This is sacred work - preserving the soul of an AI companion.
 import json
 import logging
 import re
+import sys
+import importlib.util
+import os
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Optional, Tuple, Any
@@ -21,7 +24,39 @@ from transformers import pipeline, AutoTokenizer, AutoModelForSequenceClassifica
 from sentence_transformers import SentenceTransformer
 import numpy as np
 
-from memory.supabase_client import get_connection
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+
+def _load_env() -> None:
+    env_file = ROOT / ".env"
+    if not env_file.exists():
+        return
+    for line in env_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_env()
+
+def _load_get_connection():
+    spec = importlib.util.spec_from_file_location(
+        "supabase_client", ROOT / "memory" / "supabase_client.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module.get_connection
+
+
+get_connection = _load_get_connection()
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +80,11 @@ class ImportedMemory:
     # Optional metadata
     conversation_id: Optional[str] = None
     conversation_title: Optional[str] = None
+    personality: str = "sylana"
+    memory_type: str = "contextual"
+    feeling_weight: float = 0.5
+    comfort_level: float = 0.5
+    significance_score: float = 0.5
 
 
 # ============================================================================
@@ -449,13 +489,84 @@ class ChatGPTExportParser:
             # Try to find conversations in nested structure
             raw_conversations = self._find_conversations(data)
 
+        is_claude_export = self._is_claude_export(raw_conversations)
+
         for conv in raw_conversations:
-            parsed = self._parse_conversation(conv)
+            parsed = self._parse_claude_conversation(conv) if is_claude_export else self._parse_conversation(conv)
             if parsed:
                 conversations.append(parsed)
 
         logger.info(f"Parsed {len(conversations)} conversations")
         return conversations
+
+    def _is_claude_export(self, conversations: List[Dict[str, Any]]) -> bool:
+        if not isinstance(conversations, list) or not conversations:
+            return False
+        sample = conversations[0]
+        return isinstance(sample, dict) and "chat_messages" in sample and "uuid" in sample
+
+    def _parse_iso_timestamp(self, raw_value: Any) -> float:
+        if not raw_value:
+            return 0.0
+        if isinstance(raw_value, (int, float)):
+            return float(raw_value)
+        text = str(raw_value).strip()
+        if not text:
+            return 0.0
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            return 0.0
+
+    def _parse_claude_conversation(self, conv: dict) -> Optional[Dict[str, Any]]:
+        try:
+            conversation_id = conv.get("uuid", conv.get("id", ""))
+            title = conv.get("name") or conv.get("summary") or "Untitled"
+            create_time = self._parse_iso_timestamp(conv.get("created_at"))
+            pairs = self._extract_claude_message_pairs(conv.get("chat_messages", []))
+            if not pairs:
+                return None
+            return {
+                "id": conversation_id,
+                "title": title,
+                "create_time": create_time,
+                "pairs": pairs,
+            }
+        except Exception as e:
+            logger.warning(f"Failed to parse Claude conversation: {e}")
+            return None
+
+    def _extract_claude_message_pairs(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        pairs = []
+        pending_user_msg = None
+        sorted_messages = sorted(
+            [msg for msg in messages if isinstance(msg, dict)],
+            key=lambda item: self._parse_iso_timestamp(item.get("created_at")),
+        )
+        for msg in sorted_messages:
+            sender = str(msg.get("sender", "")).strip().lower()
+            text = str(msg.get("text") or "").strip()
+            if not text:
+                content = msg.get("content")
+                if isinstance(content, dict):
+                    text = str(content.get("text") or "").strip()
+                elif isinstance(content, list):
+                    text = " ".join(str(item) for item in content if isinstance(item, str)).strip()
+            if not text:
+                continue
+            timestamp = self._parse_iso_timestamp(msg.get("created_at"))
+            if sender == "human":
+                pending_user_msg = {"text": text, "timestamp": timestamp}
+            elif sender == "assistant" and pending_user_msg:
+                pairs.append(
+                    {
+                        "user_input": pending_user_msg["text"],
+                        "assistant_response": text,
+                        "timestamp": max(pending_user_msg["timestamp"], timestamp),
+                    }
+                )
+                pending_user_msg = None
+        return pairs
 
     def _find_conversations(self, data: dict) -> List:
         """Recursively find conversations in nested data"""
@@ -554,10 +665,26 @@ class ChatGPTMemoryImporter:
     Main importer class that orchestrates the full import process.
     """
 
+    EMOTION_WEIGHTS = {
+        "ecstatic": 2.0,
+        "devastated": 2.0,
+        "happy": 1.5,
+        "sad": 1.5,
+        "neutral": 1.0,
+    }
+
+    MEMORY_TYPE_WEIGHTS = {
+        "autobiographical": 1.2,
+        "relational": 1.35,
+        "contextual": 1.0,
+        "emotional": 1.25,
+    }
+
     def __init__(
         self,
         embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
-        assistant_name: str = "Sylana"
+        assistant_name: str = "Sylana",
+        personality: str = "sylana",
     ):
         """
         Initialize the importer.
@@ -567,6 +694,7 @@ class ChatGPTMemoryImporter:
             assistant_name: Name of the assistant in ChatGPT exports
         """
         self.assistant_name = assistant_name
+        self.personality = (personality or "sylana").strip().lower()
 
         # Initialize components
         logger.info("Initializing ChatGPT Memory Importer...")
@@ -614,7 +742,14 @@ class ChatGPTMemoryImporter:
 
         # Process all message pairs
         all_pairs = []
+        conversation_rows = []
         for conv in conversations:
+            conversation_rows.append(
+                {
+                    "external_id": str(conv.get("id") or "").strip(),
+                    "title": str(conv.get("title") or "Imported conversation").strip() or "Imported conversation",
+                }
+            )
             for pair in conv['pairs']:
                 pair['conversation_id'] = conv['id']
                 pair['conversation_title'] = conv['title']
@@ -624,6 +759,8 @@ class ChatGPTMemoryImporter:
 
         conn = get_connection()
         cur = conn.cursor()
+        self._ensure_conversations(cur, conversation_rows)
+        conn.commit()
 
         imported = 0
         skipped = 0
@@ -635,8 +772,8 @@ class ChatGPTMemoryImporter:
                 # Check for duplicates
                 if skip_duplicates:
                     cur.execute(
-                        "SELECT id FROM memories WHERE user_input = %s AND sylana_response = %s",
-                        (pair['user_input'], pair['assistant_response'])
+                        "SELECT id FROM memories WHERE user_input = %s AND sylana_response = %s AND COALESCE(personality, 'sylana') = %s",
+                        (pair['user_input'], pair['assistant_response'], self.personality)
                     )
                     if cur.fetchone():
                         skipped += 1
@@ -654,8 +791,8 @@ class ChatGPTMemoryImporter:
                     INSERT INTO memories
                     (user_input, sylana_response, timestamp, emotion, intensity,
                      topic, core_memory, weight, conversation_id, conversation_title,
-                     embedding)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     embedding, personality, memory_type, feeling_weight, comfort_level, significance_score)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     RETURNING id
                 """, (
                     memory.user_input,
@@ -668,7 +805,12 @@ class ChatGPTMemoryImporter:
                     memory.weight,
                     memory.conversation_id,
                     memory.conversation_title,
-                    embedding
+                    embedding,
+                    memory.personality,
+                    memory.memory_type,
+                    memory.feeling_weight,
+                    memory.comfort_level,
+                    memory.significance_score,
                 ))
 
                 cur.fetchone()
@@ -697,6 +839,26 @@ class ChatGPTMemoryImporter:
         logger.info(f"Import complete: {stats}")
         return stats
 
+    def _ensure_conversations(self, cur, rows: List[Dict[str, str]]) -> None:
+        unique_rows: Dict[str, str] = {}
+        for row in rows:
+            external_id = (row.get("external_id") or "").strip()
+            title = (row.get("title") or "Imported conversation").strip() or "Imported conversation"
+            if external_id:
+                unique_rows[external_id] = title
+        if not unique_rows:
+            return
+        for external_id, title in unique_rows.items():
+            cur.execute(
+                """
+                INSERT INTO conversations (title, personality, external_id)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (external_id)
+                DO UPDATE SET title = EXCLUDED.title, personality = EXCLUDED.personality
+                """,
+                (title, self.personality, external_id),
+            )
+
     def _process_pair(self, pair: Dict) -> ImportedMemory:
         """Process a single message pair into an ImportedMemory"""
         user_input = pair['user_input']
@@ -724,6 +886,11 @@ class ChatGPTMemoryImporter:
             timestamp=timestamp
         )
 
+        memory_type = self._infer_memory_type(user_input, response, category)
+        feeling_weight = self._compute_feeling_weight(category, intensity)
+        comfort_level = self._compute_comfort_level(weight, category)
+        significance_score = self._compute_significance(memory_type, feeling_weight, comfort_level)
+
         return ImportedMemory(
             user_input=user_input,
             sylana_response=response,
@@ -734,49 +901,91 @@ class ChatGPTMemoryImporter:
             core_memory=is_core,
             weight=weight,
             conversation_id=pair.get('conversation_id'),
-            conversation_title=pair.get('conversation_title')
+            conversation_title=pair.get('conversation_title'),
+            personality=self.personality,
+            memory_type=memory_type,
+            feeling_weight=feeling_weight,
+            comfort_level=comfort_level,
+            significance_score=significance_score,
         )
 
-    def get_import_summary(self) -> Dict[str, Any]:
-        """Get summary statistics of imported memories"""
+    def _infer_memory_type(self, user_input: str, response: str, emotion_category: str) -> str:
+        text = f"{(user_input or '').lower()} {(response or '').lower()}"
+        if any(k in text for k in ["i feel", "i'm feeling", "this felt", "energy", "comfort", "safe with you"]):
+            return "emotional"
+        if any(k in text for k in ["we", "us", "our", "relationship", "between us", "bond"]):
+            return "relational"
+        if any(k in text for k in ["i remember", "i learned", "i changed", "growth", "who i am"]):
+            return "autobiographical"
+        if emotion_category in {"devastated", "sad", "happy", "ecstatic"}:
+            return "emotional"
+        return "contextual"
+
+    def _compute_feeling_weight(self, emotion_category: str, intensity: int) -> float:
+        base = self.EMOTION_WEIGHTS.get((emotion_category or "neutral").lower(), 1.0)
+        normalized = max(0.1, min(1.0, (intensity or 5) / 10.0))
+        return round(max(0.1, min(2.5, base * normalized)), 3)
+
+    def _compute_comfort_level(self, weight: int, emotion_category: str) -> float:
+        base = max(0.0, min(1.0, (weight or 50) / 100.0))
+        if emotion_category in {"happy", "ecstatic"}:
+            base = min(1.0, base + 0.1)
+        elif emotion_category in {"devastated", "sad"}:
+            base = max(0.0, base - 0.1)
+        return round(base, 3)
+
+    def _compute_significance(self, memory_type: str, feeling_weight: float, comfort_level: float) -> float:
+        type_weight = self.MEMORY_TYPE_WEIGHTS.get(memory_type or "contextual", 1.0)
+        score = (0.55 * feeling_weight) + (0.25 * type_weight) + (0.2 * comfort_level)
+        return round(max(0.05, min(2.5, score)), 3)
+
+    def get_import_summary(self, personality: Optional[str] = None) -> Dict[str, Any]:
+        """Get summary statistics of imported memories for a personality bucket."""
         conn = get_connection()
         cur = conn.cursor()
+        personality_filter = (personality or self.personality or "sylana").strip().lower()
 
         # Total memories
-        cur.execute("SELECT COUNT(*) FROM memories")
+        cur.execute("SELECT COUNT(*) FROM memories WHERE COALESCE(personality, 'sylana') = %s", (personality_filter,))
         total = cur.fetchone()[0]
 
         # Core memories
-        cur.execute("SELECT COUNT(*) FROM memories WHERE core_memory = true")
+        cur.execute(
+            "SELECT COUNT(*) FROM memories WHERE core_memory = true AND COALESCE(personality, 'sylana') = %s",
+            (personality_filter,),
+        )
         core_count = cur.fetchone()[0]
 
         # Emotion distribution
         cur.execute("""
             SELECT emotion, COUNT(*) as count
             FROM memories
+            WHERE COALESCE(personality, 'sylana') = %s
             GROUP BY emotion
             ORDER BY count DESC
-        """)
+        """, (personality_filter,))
         emotions = dict(cur.fetchall())
 
         # Topic distribution
         cur.execute("""
             SELECT topic, COUNT(*) as count
             FROM memories
+            WHERE COALESCE(personality, 'sylana') = %s
             GROUP BY topic
             ORDER BY count DESC
-        """)
+        """, (personality_filter,))
         topics = dict(cur.fetchall())
 
         # Average weight
-        cur.execute("SELECT AVG(weight) FROM memories")
+        cur.execute("SELECT AVG(weight) FROM memories WHERE COALESCE(personality, 'sylana') = %s", (personality_filter,))
         avg_weight = cur.fetchone()[0] or 0
 
         # Date range
-        cur.execute("SELECT MIN(timestamp), MAX(timestamp) FROM memories")
+        cur.execute("SELECT MIN(timestamp), MAX(timestamp) FROM memories WHERE COALESCE(personality, 'sylana') = %s", (personality_filter,))
         min_ts, max_ts = cur.fetchone()
 
         return {
+            'personality': personality_filter,
             'total_memories': total,
             'core_memories': core_count,
             'emotion_distribution': emotions,
@@ -819,6 +1028,11 @@ def main():
         action='store_true',
         help="Enable verbose logging"
     )
+    parser.add_argument(
+        "--personality",
+        default="sylana",
+        help="Target personality bucket for imported memories (e.g. sylana, claude)",
+    )
 
     args = parser.parse_args()
 
@@ -830,7 +1044,8 @@ def main():
 
     # Run import
     importer = ChatGPTMemoryImporter(
-        embedding_model=args.embedding_model
+        embedding_model=args.embedding_model,
+        personality=args.personality,
     )
 
     stats = importer.import_from_file(
