@@ -1,0 +1,78 @@
+version: "3.9"
+
+# =============================================================================
+# Sylana Vessel — Production Docker Compose
+# DigitalOcean Droplet @ 167.99.127.14
+#
+# Services:
+#   vessel   — FastAPI Python backend (port 8080, internal only)
+#   caddy    — Reverse proxy + auto HTTPS via sslip.io
+#
+# OpenClaw runs as a systemd service on the HOST (not in Docker) so it can
+# access the Docker socket for sandbox execution. FastAPI reaches it via
+# the host network bridge (host-gateway).
+#
+# Start:  docker compose -f docker-compose.prod.yml up -d --build
+# Stop:   docker compose -f docker-compose.prod.yml down
+# Logs:   docker compose -f docker-compose.prod.yml logs -f
+# =============================================================================
+
+services:
+
+  # ── FastAPI backend ──────────────────────────────────────
+  vessel:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: vessel
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - PORT=8080
+      - OPENCLAW_GATEWAY_URL=http://host-gateway:18789
+    extra_hosts:
+      # Allows vessel container to reach OpenClaw running on the host
+      - "host-gateway:host-gateway"
+    volumes:
+      # Persist FAISS index and voice profile between deploys
+      - vessel_data:/app/data
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/api/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    networks:
+      - internal
+
+  # ── Caddy reverse proxy + auto SSL ──────────────────────
+  caddy:
+    image: caddy:2-alpine
+    container_name: caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"   # HTTP/3
+    volumes:
+      - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    extra_hosts:
+      # Caddy also needs to reach the host for /claw WebSocket proxy
+      - "host-gateway:host-gateway"
+    networks:
+      - internal
+    depends_on:
+      - vessel
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  vessel_data:
+  caddy_data:
+  caddy_config:

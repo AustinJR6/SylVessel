@@ -1,0 +1,50 @@
+# =============================================================================
+# Sylana Vessel — Caddyfile
+# Auto HTTPS via sslip.io (no domain purchase needed).
+# When you get a real domain, replace "167-99-127-14.sslip.io" with it.
+#
+# Domain: https://167-99-127-14.sslip.io
+# =============================================================================
+
+167-99-127-14.sslip.io {
+
+  # ── OpenClaw WebSocket gateway (/claw/* → host OpenClaw on :18789) ──
+  # The RN app connects here directly for live agent sessions.
+  handle /claw/* {
+    uri strip_prefix /claw
+    reverse_proxy host-gateway:18789 {
+      header_up Host {host}
+      header_up X-Real-IP {remote_host}
+      # WebSocket upgrade is handled automatically by Caddy
+    }
+  }
+
+  # ── FastAPI backend (everything else) ──────────────────
+  handle {
+    reverse_proxy vessel:8080 {
+      header_up Host {host}
+      header_up X-Real-IP {remote_host}
+      header_up X-Forwarded-Proto {scheme}
+    }
+  }
+
+  # Security headers
+  header {
+    Strict-Transport-Security "max-age=31536000; includeSubDomains"
+    X-Content-Type-Options "nosniff"
+    X-Frame-Options "SAMEORIGIN"
+    -Server
+  }
+
+  # Logging
+  log {
+    output stdout
+    format json
+    level INFO
+  }
+}
+
+# Redirect bare HTTP → HTTPS
+http://167-99-127-14.sslip.io {
+  redir https://{host}{uri} permanent
+}
