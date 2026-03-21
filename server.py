@@ -4414,24 +4414,47 @@ def load_models():
     logger.info("Initializing memory system...")
     state.memory_manager = MemoryManager()
     logger.info("Memory system ready")
-    ensure_chat_thread_tables()
-    ensure_github_actions_table()
-    ensure_code_execution_table()
-    workflow_tables_ready = False
-    for attempt in range(1, 4):
-        try:
-            ensure_workflow_tables()
-            workflow_tables_ready = True
-            break
-        except Exception as e:
-            logger.warning("Workflow table setup attempt %s failed: %s", attempt, e)
-            time.sleep(1.5)
-    if not workflow_tables_ready:
-        logger.warning("Workflow tables could not be migrated — continuing startup (tables may already be current)")
-    ensure_alert_tables()
-    ensure_presence_tables()
-    ensure_default_schedule_configs()
-    ensure_personality_schema()
+
+    # Mark ready now — core systems (Claude + memory) are live.
+    # Schema migrations run below in a best-effort wrapper and must not block.
+    elapsed = time.time() - state.start_time
+    state.ready = True
+    logger.info(f"Core systems ready in {elapsed:.1f}s — running schema migrations in background")
+
+    # Best-effort schema migrations — skip silently if tables already exist
+    # or if the Supabase pooler times out / holds a lock.
+    try:
+        ensure_chat_thread_tables()
+    except Exception as e:
+        logger.warning("ensure_chat_thread_tables skipped: %s", e)
+    try:
+        ensure_github_actions_table()
+    except Exception as e:
+        logger.warning("ensure_github_actions_table skipped: %s", e)
+    try:
+        ensure_code_execution_table()
+    except Exception as e:
+        logger.warning("ensure_code_execution_table skipped: %s", e)
+    try:
+        ensure_workflow_tables()
+    except Exception as e:
+        logger.warning("ensure_workflow_tables skipped: %s", e)
+    try:
+        ensure_alert_tables()
+    except Exception as e:
+        logger.warning("ensure_alert_tables skipped: %s", e)
+    try:
+        ensure_presence_tables()
+    except Exception as e:
+        logger.warning("ensure_presence_tables skipped: %s", e)
+    try:
+        ensure_default_schedule_configs()
+    except Exception as e:
+        logger.warning("ensure_default_schedule_configs skipped: %s", e)
+    try:
+        ensure_personality_schema()
+    except Exception as e:
+        logger.warning("ensure_personality_schema skipped: %s", e)
     try:
         state.session_continuity = state.memory_manager.load_startup_continuity()
         logger.info("Loaded startup continuity state for %s personas", len(state.session_continuity))
@@ -4468,9 +4491,7 @@ def load_models():
         state.relationship_context = RelationshipContextBuilder(state.relationship_db)
         logger.info("Relationship memory loaded")
 
-    elapsed = time.time() - state.start_time
-    state.ready = True
-    logger.info(f"All systems loaded in {elapsed:.1f}s")
+    logger.info("All systems loaded")
 
 
 # ============================================================================
