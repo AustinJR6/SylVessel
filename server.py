@@ -74,10 +74,6 @@ except ImportError:
     _httpx = None
     HTTPX_AVAILABLE = False
 
-# OpenClaw gateway URL — FastAPI uses this to forward code execution
-# to the personality-driven agent running on the host.
-OPENCLAW_GATEWAY_URL = os.getenv("OPENCLAW_GATEWAY_URL", "").rstrip("/")
-
 # Runtime-loaded components (avoid heavy imports before port bind on Render).
 MemoryManager = None
 PersonalityManager = None
@@ -1081,52 +1077,6 @@ def _upload_execution_files_to_gcs(
     return produced
 
 
-async def _execute_via_openclaw(
-    *,
-    language: str,
-    code: str,
-    timeout_seconds: int,
-    execution_id: str,
-    entity: str = "sylana",
-) -> Optional[Dict[str, Any]]:
-    """
-    Forward code execution to the OpenClaw gateway so the Sylana/Claude
-    personality is the one driving execution (with sandbox isolation).
-    Returns None if OpenClaw is unavailable — caller falls back to direct Docker.
-
-    OpenClaw gateway docs: https://docs.openclaw.ai/tools/exec
-    The gateway's HTTP REST endpoint accepts POST /api/run with the payload below.
-    If OpenClaw changes its API shape, adjust the payload/response parsing here.
-    """
-    if not OPENCLAW_GATEWAY_URL or not HTTPX_AVAILABLE:
-        return None
-    try:
-        async with _httpx.AsyncClient(timeout=timeout_seconds + 5) as client:
-            resp = await client.post(
-                f"{OPENCLAW_GATEWAY_URL}/api/run",
-                json={
-                    "agent": entity,
-                    "tool": "exec",
-                    "input": {
-                        "language": language,
-                        "code": code,
-                    },
-                    "execution_id": execution_id,
-                },
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                return {
-                    "stdout": data.get("stdout") or data.get("output") or "",
-                    "stderr": data.get("stderr") or "",
-                    "return_code": data.get("exit_code") if data.get("exit_code") is not None else data.get("return_code", 0),
-                    "timed_out": bool(data.get("timed_out")),
-                    "execution_time_ms": int(data.get("execution_time_ms") or 0),
-                    "files_produced": data.get("files_produced") or [],
-                }
-    except Exception as exc:
-        logging.debug("OpenClaw gateway unavailable, falling back to Docker sandbox: %s", exc)
-    return None
 
 
 def execute_code_in_sandbox(
@@ -5567,22 +5517,12 @@ async def code_execute(payload: CodeExecutionRequest):
     timeout_seconds = max(1, min(timeout_seconds, MAX_CODE_TIMEOUT_SECONDS))
     execution_id = str(uuid.uuid4())
 
-    # Try OpenClaw gateway first (personality-driven execution).
-    # Falls back to direct Docker sandbox if OpenClaw is unavailable.
-    run = await _execute_via_openclaw(
+    run = execute_code_in_sandbox(
         language=language,
         code=code,
         timeout_seconds=timeout_seconds,
         execution_id=execution_id,
-        entity=entity,
     )
-    if run is None:
-        run = execute_code_in_sandbox(
-            language=language,
-            code=code,
-            timeout_seconds=timeout_seconds,
-            execution_id=execution_id,
-        )
     success = bool(run.get("return_code") == 0 and not run.get("timed_out"))
     stderr_text = run.get("stderr") or ""
     error_msg = None

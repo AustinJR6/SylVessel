@@ -20,19 +20,19 @@ echo "======================================================"
 
 # ── 1. System update ──────────────────────────────────────
 echo ""
-echo ">>> [1/8] Updating system packages..."
+echo ">>> [1/6] Updating system packages..."
 apt-get update -qq && apt-get upgrade -y -qq
 
 # ── 2. Install dependencies ───────────────────────────────
 echo ""
-echo ">>> [2/8] Installing core dependencies..."
+echo ">>> [2/6] Installing core dependencies..."
 apt-get install -y -qq \
   git curl wget unzip ufw fail2ban \
   ca-certificates gnupg lsb-release
 
 # ── 3. Install Docker ─────────────────────────────────────
 echo ""
-echo ">>> [3/8] Installing Docker..."
+echo ">>> [3/6] Installing Docker..."
 if ! command -v docker &>/dev/null; then
   install -m 0755 -d /etc/apt/keyrings
   curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
@@ -50,26 +50,9 @@ else
   echo "Docker already installed, skipping."
 fi
 
-# ── 4. Install Node.js 24 ─────────────────────────────────
+# ── 4. Create deploy user ─────────────────────────────────
 echo ""
-echo ">>> [4/8] Installing Node.js 24..."
-if ! node --version 2>/dev/null | grep -q "^v24"; then
-  curl -fsSL https://deb.nodesource.com/setup_24.x | bash -
-  apt-get install -y -qq nodejs
-  echo "Node.js $(node --version) installed."
-else
-  echo "Node.js 24 already installed, skipping."
-fi
-
-# ── 5. Install OpenClaw ───────────────────────────────────
-echo ""
-echo ">>> [5/8] Installing OpenClaw..."
-npm install -g openclaw@latest
-echo "OpenClaw $(openclaw --version 2>/dev/null || echo 'installed') ready."
-
-# ── 6. Create deploy user ─────────────────────────────────
-echo ""
-echo ">>> [6/8] Setting up deploy user..."
+echo ">>> [4/6] Setting up deploy user..."
 if ! id "$DEPLOY_USER" &>/dev/null; then
   useradd -m -s /bin/bash "$DEPLOY_USER"
   usermod -aG docker "$DEPLOY_USER"
@@ -89,11 +72,10 @@ chown -R "${DEPLOY_USER}:${DEPLOY_USER}" "/home/${DEPLOY_USER}/.ssh"
 echo ""
 echo "  !! ACTION REQUIRED: Paste your GitHub Actions deploy SSH public key into:"
 echo "     /home/${DEPLOY_USER}/.ssh/authorized_keys"
-echo "  !! You will generate this key pair in the GitHub setup step below."
 
-# ── 7. Clone repo ─────────────────────────────────────────
+# ── 5. Clone repo ─────────────────────────────────────────
 echo ""
-echo ">>> [7/8] Cloning repository..."
+echo ">>> [5/6] Cloning repository..."
 if [ ! -d "$APP_DIR/.git" ]; then
   git clone "$REPO" "$APP_DIR"
   chown -R "${DEPLOY_USER}:${DEPLOY_USER}" "$APP_DIR"
@@ -112,51 +94,17 @@ if [ ! -f "$APP_DIR/.env" ]; then
   echo "     See .env.production.template for all required variables."
 fi
 
-# ── 8. Firewall ───────────────────────────────────────────
+# ── 6. Firewall ───────────────────────────────────────────
 echo ""
-echo ">>> [8/8] Configuring firewall (UFW)..."
+echo ">>> [6/6] Configuring firewall (UFW)..."
 ufw --force reset
 ufw default deny incoming
 ufw default allow outgoing
 ufw allow ssh           # 22
 ufw allow 80/tcp        # HTTP (Caddy redirect)
 ufw allow 443/tcp       # HTTPS (Caddy)
-# Port 18789 (OpenClaw) is NOT exposed externally — only internal Docker network
 ufw --force enable
 echo "Firewall configured. Open ports: 22, 80, 443"
-
-# ── OpenClaw systemd service ──────────────────────────────
-echo ""
-echo ">>> Setting up OpenClaw gateway as systemd service..."
-
-# OpenClaw will be configured after you fill in .env
-# It runs as a service alongside Docker Compose
-
-cat > /etc/systemd/system/openclaw-gateway.service << 'UNIT'
-[Unit]
-Description=OpenClaw AI Agent Gateway
-After=network.target docker.service
-Wants=docker.service
-
-[Service]
-Type=simple
-User=deploy
-WorkingDirectory=/opt/SylVessel
-EnvironmentFile=/opt/SylVessel/.env
-ExecStartPre=/bin/sh -c 'mkdir -p /home/deploy/.openclaw'
-ExecStart=/usr/bin/openclaw gateway start
-Restart=on-failure
-RestartSec=5
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-
-systemctl daemon-reload
-# NOTE: Do NOT start openclaw yet — fill .env first, then run openclaw onboard
-echo "OpenClaw systemd unit created (not started yet — see next steps)."
 
 # ── Completion message ────────────────────────────────────
 echo ""
@@ -168,25 +116,14 @@ echo "STEP 1 — Fill in secrets:"
 echo "  nano $APP_DIR/.env"
 echo "  (Copy from .env.production.template, fill in all API keys)"
 echo ""
-echo "STEP 2 — Configure OpenClaw (interactive, run once):"
-echo "  cd $APP_DIR"
-echo "  source .env && openclaw onboard"
-echo "  # Select: Anthropic, enter your ANTHROPIC_API_KEY"
-echo "  # Enable sandbox mode when prompted"
-echo "  # This saves config to /home/deploy/.openclaw/"
-echo ""
-echo "STEP 3 — Start OpenClaw gateway:"
-echo "  systemctl enable --now openclaw-gateway"
-echo "  systemctl status openclaw-gateway"
-echo ""
-echo "STEP 4 — Start the app stack:"
+echo "STEP 2 — Start the app stack:"
 echo "  cd $APP_DIR"
 echo "  docker compose -f docker-compose.prod.yml up -d --build"
 echo "  docker compose -f docker-compose.prod.yml logs -f"
 echo ""
-echo "STEP 5 — GitHub Actions auto-deploy setup:"
+echo "STEP 3 — GitHub Actions auto-deploy setup:"
 echo "  On your LOCAL machine, generate a deploy SSH key pair:"
-echo "    ssh-keygen -t ed25519 -f ~/.ssh/SylVessel_deploy -N ''"
+echo "    ssh-keygen -t ed25519 -f ~/.ssh/SylVessel_deploy"
 echo "  Then:"
 echo "    cat ~/.ssh/SylVessel_deploy.pub"
 echo "    >> paste into /home/deploy/.ssh/authorized_keys on this droplet"
@@ -200,5 +137,4 @@ echo ""
 echo "  After that, every push to 'main' auto-deploys."
 echo ""
 echo "Your app will be live at: https://167-99-127-14.sslip.io"
-echo "OpenClaw gateway: http://localhost:18789 (internal only)"
 echo "======================================================"

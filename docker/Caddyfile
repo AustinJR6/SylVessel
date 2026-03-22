@@ -8,18 +8,7 @@
 
 167-99-127-14.sslip.io {
 
-  # ── OpenClaw WebSocket gateway (/claw/* → host OpenClaw on :18789) ──
-  # The RN app connects here directly for live agent sessions.
-  handle /claw/* {
-    uri strip_prefix /claw
-    reverse_proxy host-gateway:18789 {
-      header_up Host {host}
-      header_up X-Real-IP {remote_host}
-      # WebSocket upgrade is handled automatically by Caddy
-    }
-  }
-
-  # ── FastAPI backend (everything else) ──────────────────
+  # ── FastAPI backend ─────────────────────────────────────
   handle {
     reverse_proxy vessel:8080 {
       header_up Host {host}

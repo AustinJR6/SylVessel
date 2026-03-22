@@ -15,7 +15,18 @@
       "Bash(git push:*)",
       "Bash(ssh-keygen:*)",
       "Bash(git commit:*)",
-      "Bash(venv/Scripts/python tools/apply_db_indexes.py)"
+      "Bash(venv/Scripts/python tools/apply_db_indexes.py)",
+      "Bash(xargs grep:*)",
+      "WebSearch",
+      "WebFetch(domain:docs.openclaw.ai)",
+      "WebFetch(domain:github.com)",
+      "Bash(ls \"C:/Users/raust/Vessel_App/sylana-vessel-app/app/\\(tabs\\)/\")",
+      "Skill(claude-api)",
+      "Skill(claude-api:*)",
+      "Bash(eas build:*)",
+      "Bash(cat app/\\\\\\(tabs\\\\\\)/chat.tsx)",
+      "Bash(ssh deploy@167.99.127.14 \"openclaw --help 2>&1 || cat ~/.openclaw/config.json 2>/dev/null || ls ~/.openclaw/ 2>&1\")",
+      "Bash(npm info:*)"
     ]
   }
 }
