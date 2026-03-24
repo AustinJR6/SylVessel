@@ -8,6 +8,16 @@
 
 167-99-127-14.sslip.io {
 
+  # ── Agent SSE stream — flush immediately, no buffering ──
+  handle /api/agent/stream {
+    reverse_proxy vessel:8080 {
+      header_up Host {host}
+      header_up X-Real-IP {remote_host}
+      header_up X-Forwarded-Proto {scheme}
+      flush_interval -1
+    }
+  }
+
   # ── FastAPI backend ─────────────────────────────────────
   handle {
     reverse_proxy vessel:8080 {

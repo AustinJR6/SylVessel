@@ -38,7 +38,7 @@ from urllib.error import HTTPError, URLError
 from fastapi import FastAPI, Request, APIRouter, HTTPException, UploadFile, File, Form, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, JSONResponse, Response, RedirectResponse, FileResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, RedirectResponse, FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -5784,7 +5784,14 @@ async def agent_stream_endpoint(payload: AgentRunRequest, request: Request):
         except Exception as exc:
             yield f"data: {json.dumps({'type': 'error', 'error': str(exc)})}\n\n"
 
-    return EventSourceResponse(generate())
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # ── Sessions ───────────────────────────────────────────────────────────────────
