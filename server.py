@@ -5739,7 +5739,7 @@ async def agent_stream_endpoint(payload: AgentRunRequest, request: Request):
                                     current_tool = None
                                     current_input_parts = []
 
-                        final = stream.get_final_message()
+                        final = await stream.get_final_message()
                         stop_reason = final.stop_reason or "end_turn"
 
                 except Exception as api_err:
