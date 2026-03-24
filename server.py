@@ -4373,38 +4373,59 @@ def load_models():
 
     # Best-effort schema migrations — skip silently if tables already exist
     # or if the Supabase pooler times out / holds a lock.
+    # Advisory lock prevents multiple uvicorn workers from running DDL concurrently.
+    _MIG_LOCK_ID = 7351924
+    _mig_lock_acquired = False
+    _mig_conn = None
     try:
-        ensure_chat_thread_tables()
-    except Exception as e:
-        logger.warning("ensure_chat_thread_tables skipped: %s", e)
-    try:
-        ensure_github_actions_table()
-    except Exception as e:
-        logger.warning("ensure_github_actions_table skipped: %s", e)
-    try:
-        ensure_code_execution_table()
-    except Exception as e:
-        logger.warning("ensure_code_execution_table skipped: %s", e)
-    try:
-        ensure_workflow_tables()
-    except Exception as e:
-        logger.warning("ensure_workflow_tables skipped: %s", e)
-    try:
-        ensure_alert_tables()
-    except Exception as e:
-        logger.warning("ensure_alert_tables skipped: %s", e)
-    try:
-        ensure_presence_tables()
-    except Exception as e:
-        logger.warning("ensure_presence_tables skipped: %s", e)
-    try:
-        ensure_default_schedule_configs()
-    except Exception as e:
-        logger.warning("ensure_default_schedule_configs skipped: %s", e)
-    try:
-        ensure_personality_schema()
-    except Exception as e:
-        logger.warning("ensure_personality_schema skipped: %s", e)
+        _mig_conn = get_connection()
+        _mig_cur = _mig_conn.cursor()
+        _mig_cur.execute("SELECT pg_try_advisory_lock(%s)", (_MIG_LOCK_ID,))
+        _mig_lock_acquired = bool(_mig_cur.fetchone()[0])
+        _mig_cur.close()
+    except Exception as _e:
+        logger.warning("Migration advisory lock check failed: %s", _e)
+    if not _mig_lock_acquired:
+        logger.info("Migration lock held by another worker — skipping schema migrations")
+    else:
+        try:
+            ensure_chat_thread_tables()
+        except Exception as e:
+            logger.warning("ensure_chat_thread_tables skipped: %s", e)
+        try:
+            ensure_github_actions_table()
+        except Exception as e:
+            logger.warning("ensure_github_actions_table skipped: %s", e)
+        try:
+            ensure_code_execution_table()
+        except Exception as e:
+            logger.warning("ensure_code_execution_table skipped: %s", e)
+        try:
+            ensure_workflow_tables()
+        except Exception as e:
+            logger.warning("ensure_workflow_tables skipped: %s", e)
+        try:
+            ensure_alert_tables()
+        except Exception as e:
+            logger.warning("ensure_alert_tables skipped: %s", e)
+        try:
+            ensure_presence_tables()
+        except Exception as e:
+            logger.warning("ensure_presence_tables skipped: %s", e)
+        try:
+            ensure_default_schedule_configs()
+        except Exception as e:
+            logger.warning("ensure_default_schedule_configs skipped: %s", e)
+        try:
+            ensure_personality_schema()
+        except Exception as e:
+            logger.warning("ensure_personality_schema skipped: %s", e)
+        try:
+            if _mig_conn:
+                _mig_conn.cursor().execute("SELECT pg_advisory_unlock(%s)", (_MIG_LOCK_ID,))
+                _mig_conn.commit()
+        except Exception as _e:
+            logger.warning("Migration advisory unlock failed: %s", _e)
     try:
         state.session_continuity = state.memory_manager.load_startup_continuity()
         logger.info("Loaded startup continuity state for %s personas", len(state.session_continuity))

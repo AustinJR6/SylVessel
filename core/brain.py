@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import os
 import re
 from dataclasses import asdict
 from typing import Any, Dict, List, Optional
@@ -189,7 +190,7 @@ class Brain:
             response_text = self.inference.generate(
                 system_prompt=system_prompt,
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=320,
+                max_tokens=max(320, int(os.getenv("MAX_NEW_TOKENS", "2048"))),
                 active_tools=active_tools,
             ).strip() or "I'm here with you."
             tool_payload = None
