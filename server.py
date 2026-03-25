@@ -5687,8 +5687,9 @@ async def agent_stream_endpoint(payload: AgentRunRequest, request: Request):
 
         try:
             for _turn in range(max_turns):
-                if await request.is_disconnected():
-                    break
+                # Keep-alive comment keeps the SSE connection alive between turns
+                # (especially during the gap while Claude generates the final summary).
+                yield ": keep-alive\n\n"
 
                 response_content: List[Dict[str, Any]] = []
                 tool_calls_this_turn: List[Dict[str, Any]] = []
