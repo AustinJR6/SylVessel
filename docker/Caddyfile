@@ -8,12 +8,9 @@
 
 167-99-127-14.sslip.io {
 
-  # ── Agent SSE stream — flush immediately, no buffering ──
+  # ── Agent SSE stream — route to vessel-agent (Claude Code) on host ──
   handle /api/agent/stream {
-    reverse_proxy vessel:8080 {
-      header_up Host {host}
-      header_up X-Real-IP {remote_host}
-      header_up X-Forwarded-Proto {scheme}
+    reverse_proxy 172.18.0.1:18790 {
       flush_interval -1
     }
   }
