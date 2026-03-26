@@ -24,6 +24,9 @@ jobs:
             echo ">>> Pulling latest code..."
             git pull origin main
 
+            echo ">>> Removing legacy fixed-name containers if present..."
+            docker rm -f vessel caddy 2>/dev/null || true
+
             echo ">>> Rebuilding and restarting containers..."
             docker compose -f docker-compose.prod.yml up -d --build --remove-orphans
 
