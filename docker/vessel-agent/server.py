@@ -10,6 +10,7 @@ Requires:
 
 import json
 import os
+from pathlib import Path
 
 import uvicorn
 from claude_agent_sdk import (
@@ -23,6 +24,21 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 app = FastAPI(title="vessel-agent")
+WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
+PROMPT_FILES = ["AGENTS.md", "SOUL.md", "TOOLS.md"]
+
+
+def _workspace_prompt_block() -> str:
+    sections = []
+    for name in PROMPT_FILES:
+        path = WORKSPACE_ROOT / name
+        try:
+            content = path.read_text(encoding="utf-8").strip()
+        except Exception:
+            content = ""
+        if content:
+            sections.append(f"{name}:\n{content}")
+    return "\n\n".join(sections)
 
 # ── System prompts ─────────────────────────────────────────────────────────────
 
@@ -57,6 +73,10 @@ _CLAUDE_SYSTEM = (
     "When asked about the system, apply that context."
     + _GITHUB_RULES
 )
+_WORKSPACE_PROMPTS = _workspace_prompt_block()
+if _WORKSPACE_PROMPTS:
+    _SYLANA_SYSTEM = f"{_SYLANA_SYSTEM}\n\n{_WORKSPACE_PROMPTS}"
+    _CLAUDE_SYSTEM = f"{_CLAUDE_SYSTEM}\n\n{_WORKSPACE_PROMPTS}"
 
 # ── Request model ──────────────────────────────────────────────────────────────
 

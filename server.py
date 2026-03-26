@@ -127,6 +127,26 @@ IMAGE_REQUEST_PATTERN = re.compile(
     r"|\b(image|picture|portrait|wallpaper|logo|illustration)\b.{0,36}\b(generate|create|draw|render|make|design|illustrate|paint)\b",
     re.IGNORECASE,
 )
+WORKSPACE_ROOT = Path(__file__).resolve().parent
+WORKSPACE_PROMPT_FILES: Dict[str, str] = {
+    "agents": "AGENTS.md",
+    "soul": "SOUL.md",
+    "tools": "TOOLS.md",
+    "heartbeat": "HEARTBEAT.md",
+}
+DEFAULT_HEARTBEAT_INTERVAL_MINUTES = max(5, int(os.getenv("HEARTBEAT_INTERVAL_MINUTES", "30") or "30"))
+HEARTBEAT_PUSH_ENABLED = os.getenv("HEARTBEAT_PUSH_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
+ALLOWED_SESSION_MODES = {"main", "isolated", "system"}
+ALLOWED_TRIGGER_SOURCES = {"user", "cron", "heartbeat", "hook", "system"}
+ALLOWED_JOB_KINDS = {"prospect_research", "prompt_session"}
+ALLOWED_ANNOUNCE_POLICIES = {"always", "important_only", "never"}
+ALLOWED_HOOK_ACTION_KINDS = {"enqueue_note", "create_session"}
+HOOK_EVENT_STARTUP = "startup"
+HOOK_EVENT_SESSION_CREATED = "session_created"
+HOOK_EVENT_SCHEDULE_COMPLETED = "schedule_completed"
+HOOK_EVENT_HEARTBEAT_ALERT = "heartbeat_alert"
+HOOK_EVENT_HEARTBEAT_OK = "heartbeat_ok"
+HOOK_EVENT_NOTE_CREATED = "note_created"
 
 
 def _get_openai_client() -> OpenAI:
@@ -138,6 +158,33 @@ def _get_openai_client() -> OpenAI:
 def _voice_persona(name: str) -> Dict[str, str]:
     normalized = (name or "sylana").strip().lower()
     return VOICE_PERSONAS.get(normalized, VOICE_PERSONAS["sylana"])
+
+
+def _load_workspace_prompt_files() -> Dict[str, str]:
+    prompts: Dict[str, str] = {}
+    for key, filename in WORKSPACE_PROMPT_FILES.items():
+        path = WORKSPACE_ROOT / filename
+        try:
+            prompts[key] = path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            prompts[key] = ""
+        except Exception as exc:
+            logger.warning("Failed to load workspace prompt file %s: %s", filename, exc)
+            prompts[key] = ""
+    return prompts
+
+
+def _workspace_prompt_block(keys: Optional[List[str]] = None) -> str:
+    prompts = state.workspace_prompts or {}
+    wanted = keys or ["agents", "soul", "tools"]
+    sections: List[str] = []
+    for key in wanted:
+        content = (prompts.get(key) or "").strip()
+        if not content:
+            continue
+        label = WORKSPACE_PROMPT_FILES.get(key, key).upper()
+        sections.append(f"{label}:\n{content}")
+    return "\n\n".join(sections)
 
 
 def _prune_voice_audio_cache() -> None:
@@ -1201,6 +1248,8 @@ class SylanaState:
         self.lysara_client = None
         self.lysara_last_status = {}
         self.lysara_loop_task = None
+        self.workspace_prompts: Dict[str, str] = {}
+        self.last_heartbeat_result: Dict[str, Any] = {}
 
 
 state = SylanaState()
@@ -1538,6 +1587,7 @@ def _build_user_context(active_tools: List[str]) -> Dict[str, Any]:
         ctx["outreach_summary"] = _get_outreach_summary()
     if "lysara" in active_tools:
         ctx["lysara_status"] = _get_lysara_status_snapshot()
+    ctx["last_heartbeat_result"] = state.last_heartbeat_result or {}
     return ctx
 
 
@@ -2054,7 +2104,7 @@ def _runtime_tool_runner(name: str, tool_input: Dict[str, Any]) -> Dict[str, Any
             params.append(session_type)
         where_sql = f"WHERE {' AND '.join(where)}" if where else ""
         cur.execute(f"""
-            SELECT session_id, entity, goal, status, session_type, created_at
+            SELECT session_id, entity, goal, status, session_type, created_at, session_mode, trigger_source
             FROM work_sessions
             {where_sql}
             ORDER BY created_at DESC
@@ -2071,6 +2121,8 @@ def _runtime_tool_runner(name: str, tool_input: Dict[str, Any]) -> Dict[str, Any
                     "status": r[3],
                     "session_type": r[4],
                     "created_at": r[5].isoformat() if r[5] else None,
+                    "session_mode": r[6] or "main",
+                    "trigger_source": r[7] or "user",
                 }
                 for r in rows
             ],
@@ -2463,6 +2515,359 @@ def ensure_default_schedule_configs():
     except Exception as e:
         _safe_rollback(conn, "ensure_default_schedule_configs")
         logger.error(f"Failed to seed schedule configs: {e}")
+
+
+def ensure_proactive_runtime_tables():
+    """Create proactive runtime tables and extend session/schedule metadata."""
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SET statement_timeout = 0")
+        cur.execute("""
+            ALTER TABLE work_sessions
+            ADD COLUMN IF NOT EXISTS session_mode TEXT NOT NULL DEFAULT 'main'
+        """)
+        cur.execute("""
+            ALTER TABLE work_sessions
+            ADD COLUMN IF NOT EXISTS trigger_source TEXT NOT NULL DEFAULT 'user'
+        """)
+        cur.execute("""
+            ALTER TABLE work_sessions
+            ADD COLUMN IF NOT EXISTS parent_session_id UUID REFERENCES work_sessions(session_id) ON DELETE SET NULL
+        """)
+        cur.execute("""
+            ALTER TABLE work_sessions
+            ADD COLUMN IF NOT EXISTS announcement_target TEXT
+        """)
+        cur.execute("""
+            ALTER TABLE schedule_configs
+            ADD COLUMN IF NOT EXISTS job_kind TEXT NOT NULL DEFAULT 'prospect_research'
+        """)
+        cur.execute("""
+            ALTER TABLE schedule_configs
+            ADD COLUMN IF NOT EXISTS execution_mode TEXT NOT NULL DEFAULT 'isolated'
+        """)
+        cur.execute("""
+            ALTER TABLE schedule_configs
+            ADD COLUMN IF NOT EXISTS target_entity TEXT NOT NULL DEFAULT 'claude'
+        """)
+        cur.execute("""
+            ALTER TABLE schedule_configs
+            ADD COLUMN IF NOT EXISTS prompt TEXT
+        """)
+        cur.execute("""
+            ALTER TABLE schedule_configs
+            ADD COLUMN IF NOT EXISTS announce_policy TEXT NOT NULL DEFAULT 'important_only'
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS proactive_notes (
+                note_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                source TEXT NOT NULL,
+                source_id TEXT,
+                session_id UUID REFERENCES work_sessions(session_id) ON DELETE SET NULL,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                severity TEXT NOT NULL DEFAULT 'info',
+                status TEXT NOT NULL DEFAULT 'pending',
+                dedupe_key TEXT,
+                announce_policy TEXT NOT NULL DEFAULT 'important_only',
+                metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                visible_after TIMESTAMPTZ,
+                expires_at TIMESTAMPTZ,
+                processed_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS runtime_hooks (
+                hook_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                event_name TEXT NOT NULL,
+                enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                target_entity TEXT NOT NULL DEFAULT 'claude',
+                session_mode TEXT NOT NULL DEFAULT 'isolated',
+                action_kind TEXT NOT NULL DEFAULT 'enqueue_note',
+                action_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_proactive_notes_status_visible ON proactive_notes(status, created_at DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_runtime_hooks_event_enabled ON runtime_hooks(event_name, enabled)")
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_proactive_notes_dedupe_pending ON proactive_notes(dedupe_key) WHERE dedupe_key IS NOT NULL AND status = 'pending'")
+        conn.commit()
+    except Exception as e:
+        _safe_rollback(conn, "ensure_proactive_runtime_tables")
+        logger.warning("Proactive runtime migration skipped: %s", e)
+
+
+def _serialize_schedule_config_row(row: Any) -> Dict[str, Any]:
+    return {
+        "job_name": row[0],
+        "session_type": row[1],
+        "product": row[2],
+        "count": int(row[3] or 0),
+        "cron_expr": row[4],
+        "active": bool(row[5]),
+        "job_kind": row[6] or "prospect_research",
+        "execution_mode": row[7] or "isolated",
+        "target_entity": row[8] or "claude",
+        "prompt": row[9] or "",
+        "announce_policy": row[10] or "important_only",
+        "metadata": row[11] or {},
+        "last_run_at": row[12].isoformat() if row[12] else None,
+        "updated_at": row[13].isoformat() if row[13] else None,
+    }
+
+
+def _serialize_runtime_hook_row(row: Any) -> Dict[str, Any]:
+    return {
+        "hook_id": str(row[0]),
+        "event_name": row[1],
+        "enabled": bool(row[2]),
+        "target_entity": row[3],
+        "session_mode": row[4],
+        "action_kind": row[5],
+        "action_payload": row[6] or {},
+        "created_at": row[7].isoformat() if row[7] else None,
+        "updated_at": row[8].isoformat() if row[8] else None,
+    }
+
+
+def _serialize_proactive_note_row(row: Any) -> Dict[str, Any]:
+    return {
+        "note_id": str(row[0]),
+        "source": row[1],
+        "source_id": row[2] or "",
+        "session_id": str(row[3]) if row[3] else None,
+        "title": row[4],
+        "body": row[5],
+        "severity": row[6],
+        "status": row[7],
+        "dedupe_key": row[8],
+        "announce_policy": row[9],
+        "metadata": row[10] or {},
+        "visible_after": row[11].isoformat() if row[11] else None,
+        "expires_at": row[12].isoformat() if row[12] else None,
+        "processed_at": row[13].isoformat() if row[13] else None,
+        "created_at": row[14].isoformat() if row[14] else None,
+    }
+
+
+def _list_runtime_hooks(event_name: Optional[str] = None) -> List[Dict[str, Any]]:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        params: List[Any] = []
+        where = ""
+        if event_name:
+            where = "WHERE event_name = %s"
+            params.append(event_name)
+        cur.execute(f"""
+            SELECT hook_id, event_name, enabled, target_entity, session_mode, action_kind, action_payload, created_at, updated_at
+            FROM runtime_hooks
+            {where}
+            ORDER BY event_name ASC, created_at DESC
+        """, tuple(params))
+        return [_serialize_runtime_hook_row(row) for row in cur.fetchall()]
+    except Exception as e:
+        logger.warning("Failed to list runtime hooks: %s", e)
+        return []
+
+
+def _list_proactive_notes(limit: int = 50, status: Optional[str] = None) -> List[Dict[str, Any]]:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        params: List[Any] = []
+        where = ""
+        if status:
+            where = "WHERE status = %s"
+            params.append(status)
+        params.append(max(1, min(limit, 200)))
+        cur.execute(f"""
+            SELECT note_id, source, source_id, session_id, title, body, severity, status, dedupe_key,
+                   announce_policy, metadata, visible_after, expires_at, processed_at, created_at
+            FROM proactive_notes
+            {where}
+            ORDER BY created_at DESC
+            LIMIT %s
+        """, tuple(params))
+        return [_serialize_proactive_note_row(row) for row in cur.fetchall()]
+    except Exception as e:
+        logger.warning("Failed to list proactive notes: %s", e)
+        return []
+
+
+def _enqueue_proactive_note(
+    *,
+    source: str,
+    title: str,
+    body: str,
+    severity: str = "info",
+    session_id: Optional[str] = None,
+    source_id: Optional[str] = None,
+    dedupe_key: Optional[str] = None,
+    announce_policy: str = "important_only",
+    metadata: Optional[Dict[str, Any]] = None,
+    visible_after: Optional[datetime] = None,
+    expires_at: Optional[datetime] = None,
+) -> Optional[Dict[str, Any]]:
+    sev = (severity or "info").strip().lower()
+    if sev not in ALERT_SEVERITY_ORDER:
+        sev = "info"
+    policy = (announce_policy or "important_only").strip().lower()
+    if policy not in ALLOWED_ANNOUNCE_POLICIES:
+        policy = "important_only"
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO proactive_notes (
+                source, source_id, session_id, title, body, severity, status, dedupe_key,
+                announce_policy, metadata, visible_after, expires_at
+            )
+            VALUES (%s, %s, %s::uuid, %s, %s, %s, 'pending', %s, %s, %s::jsonb, %s, %s)
+            ON CONFLICT DO NOTHING
+            RETURNING note_id, source, source_id, session_id, title, body, severity, status, dedupe_key,
+                      announce_policy, metadata, visible_after, expires_at, processed_at, created_at
+        """, (
+            source,
+            source_id,
+            session_id,
+            title,
+            body,
+            sev,
+            dedupe_key,
+            policy,
+            json.dumps(metadata or {}),
+            visible_after,
+            expires_at,
+        ))
+        row = cur.fetchone()
+        conn.commit()
+        note = _serialize_proactive_note_row(row) if row else None
+    except Exception as e:
+        _safe_rollback(conn, "_enqueue_proactive_note")
+        logger.warning("Failed to enqueue proactive note: %s", e)
+        return None
+    if note:
+        _fire_runtime_hooks(HOOK_EVENT_NOTE_CREATED, {"note": note})
+    return note
+
+
+def _get_due_proactive_notes(limit: int = 20) -> List[Dict[str, Any]]:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT note_id, source, source_id, session_id, title, body, severity, status, dedupe_key,
+                   announce_policy, metadata, visible_after, expires_at, processed_at, created_at
+            FROM proactive_notes
+            WHERE status = 'pending'
+              AND (visible_after IS NULL OR visible_after <= NOW())
+              AND (expires_at IS NULL OR expires_at > NOW())
+            ORDER BY created_at ASC
+            LIMIT %s
+        """, (max(1, min(limit, 100)),))
+        return [_serialize_proactive_note_row(row) for row in cur.fetchall()]
+    except Exception as e:
+        logger.warning("Failed to fetch due proactive notes: %s", e)
+        return []
+
+
+def _mark_proactive_notes(note_ids: List[str], status: str) -> None:
+    if not note_ids:
+        return
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            UPDATE proactive_notes
+            SET status = %s, processed_at = NOW()
+            WHERE note_id = ANY(%s::uuid[])
+        """, (status, note_ids))
+        conn.commit()
+    except Exception as e:
+        _safe_rollback(conn, "_mark_proactive_notes")
+        logger.warning("Failed to mark proactive notes: %s", e)
+
+
+def _fire_runtime_hooks(event_name: str, payload: Dict[str, Any]) -> None:
+    hooks = [hook for hook in _list_runtime_hooks(event_name=event_name) if hook.get("enabled")]
+    for hook in hooks:
+        action = (hook.get("action_kind") or "enqueue_note").strip().lower()
+        action_payload = hook.get("action_payload") or {}
+        if event_name == HOOK_EVENT_NOTE_CREATED and action == "enqueue_note":
+            continue
+        if action == "enqueue_note":
+            title = str(action_payload.get("title") or f"Hook event: {event_name}")
+            body_template = str(action_payload.get("body") or json.dumps(payload))
+            _enqueue_proactive_note(
+                source=f"hook:{event_name}",
+                title=title,
+                body=body_template,
+                severity=str(action_payload.get("severity") or "info"),
+                dedupe_key=str(action_payload.get("dedupe_key") or f"{event_name}:{hashlib.sha1(body_template.encode('utf-8')).hexdigest()[:12]}"),
+                announce_policy=str(action_payload.get("announce_policy") or "important_only"),
+                metadata={"event_name": event_name, "payload": payload, "hook_id": hook.get("hook_id")},
+            )
+        elif action == "create_session":
+            prompt = str(action_payload.get("prompt") or "").strip()
+            if not prompt:
+                continue
+            _run_prompt_session(
+                entity=str(hook.get("target_entity") or "claude"),
+                prompt=prompt,
+                session_type=str(action_payload.get("session_type") or "general"),
+                session_mode=str(hook.get("session_mode") or "isolated"),
+                trigger_source="hook",
+                metadata={"hook_id": hook.get("hook_id"), "event_name": event_name, "payload": payload},
+                announce_policy=str(action_payload.get("announce_policy") or "important_only"),
+            )
+
+
+def _run_heartbeat() -> Dict[str, Any]:
+    heartbeat_doc = (state.workspace_prompts or {}).get("heartbeat", "").strip()
+    notes = _get_due_proactive_notes(limit=20)
+    important = [
+        note for note in notes
+        if note.get("announce_policy") != "never" and (
+            note.get("announce_policy") == "always"
+        or ALERT_SEVERITY_ORDER.get(note.get("severity") or "info", 1) >= ALERT_SEVERITY_ORDER["warning"]
+        )
+    ]
+    summary_lines: List[str] = []
+    if heartbeat_doc:
+        summary_lines.append("Heartbeat checklist loaded.")
+    if important:
+        for note in important[:5]:
+            summary_lines.append(f"[{str(note.get('severity') or 'info').upper()}] {note.get('title')}: {note.get('body')}")
+    elif notes:
+        summary_lines.append(f"{len(notes)} pending note(s) reviewed; nothing crossed the importance threshold.")
+    else:
+        summary_lines.append("No pending proactive notes.")
+
+    surfaced = bool(important)
+    status = "surfaced" if surfaced else "HEARTBEAT_OK"
+    if notes:
+        _mark_proactive_notes([str(note["note_id"]) for note in notes], "surfaced" if surfaced else "swallowed")
+
+    result = {
+        "status": status,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "heartbeat_loaded": bool(heartbeat_doc),
+        "notes_seen": len(notes),
+        "notes_surfaced": len(important),
+        "summary": "\n".join(summary_lines).strip(),
+    }
+    state.last_heartbeat_result = result
+    if surfaced:
+        if HEARTBEAT_PUSH_ENABLED:
+            _send_push_notification("Sylana heartbeat", summary_lines[0][:160], {"type": "heartbeat", "notes": len(important)})
+        _fire_runtime_hooks(HOOK_EVENT_HEARTBEAT_ALERT, result)
+    else:
+        _fire_runtime_hooks(HOOK_EVENT_HEARTBEAT_OK, result)
+    return result
 
 
 ALERT_SEVERITY_ORDER = {"info": 1, "warning": 2, "critical": 3}
@@ -3013,21 +3418,65 @@ async def run_due_alert_topic_checks() -> None:
             logger.warning("Due alert topic run failed for %s: %s", topic.get("label"), e)
 
 
-def _create_work_session(entity: str, goal: str, session_type: str, metadata: Dict[str, Any], status: str = "pending") -> str:
+def _create_work_session(
+    entity: str,
+    goal: str,
+    session_type: str,
+    metadata: Dict[str, Any],
+    status: str = "pending",
+    *,
+    session_mode: str = "main",
+    trigger_source: str = "user",
+    parent_session_id: Optional[str] = None,
+    announcement_target: Optional[str] = None,
+) -> str:
+    safe_mode = session_mode if session_mode in ALLOWED_SESSION_MODES else "main"
+    safe_trigger = trigger_source if trigger_source in ALLOWED_TRIGGER_SOURCES else "user"
     conn = get_connection()
     cur = conn.cursor()
     try:
         cur.execute("""
-            INSERT INTO work_sessions (entity, goal, status, session_type, metadata, started_at)
-            VALUES (%s, %s, %s, %s, %s::jsonb, CASE WHEN %s='running' THEN NOW() ELSE NULL END)
+            INSERT INTO work_sessions (
+                entity, goal, status, session_type, metadata, started_at,
+                session_mode, trigger_source, parent_session_id, announcement_target
+            )
+            VALUES (
+                %s, %s, %s, %s, %s::jsonb, CASE WHEN %s='running' THEN NOW() ELSE NULL END,
+                %s, %s, %s::uuid, %s
+            )
             RETURNING session_id
-        """, (entity, goal, status, session_type, json.dumps(metadata or {}), status))
+        """, (
+            entity,
+            goal,
+            status,
+            session_type,
+            json.dumps(metadata or {}),
+            status,
+            safe_mode,
+            safe_trigger,
+            parent_session_id,
+            announcement_target,
+        ))
         row = cur.fetchone()
         conn.commit()
-        return str(row[0])
+        session_id = str(row[0])
     except Exception as e:
         _safe_rollback(conn, "_create_work_session")
         raise RuntimeError(f"Failed to create work session: {e}")
+    _fire_runtime_hooks(
+        HOOK_EVENT_SESSION_CREATED,
+        {
+            "session_id": session_id,
+            "entity": entity,
+            "goal": goal,
+            "session_type": session_type,
+            "session_mode": safe_mode,
+            "trigger_source": safe_trigger,
+            "parent_session_id": parent_session_id,
+            "announcement_target": announcement_target,
+        },
+    )
+    return session_id
 
 
 def _update_work_session(
@@ -3777,22 +4226,78 @@ def _list_schedule_configs() -> List[Dict[str, Any]]:
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
-        SELECT job_name, session_type, product, count, cron_expr, active
+        SELECT job_name, session_type, product, count, cron_expr, active,
+               job_kind, execution_mode, target_entity, prompt, announce_policy, metadata, last_run_at, updated_at
         FROM schedule_configs
         ORDER BY job_name
     """)
-    rows = cur.fetchall()
-    return [
-        {
-            "job_name": r[0],
-            "session_type": r[1],
-            "product": r[2],
-            "count": int(r[3] or 5),
-            "cron_expr": r[4],
-            "active": bool(r[5]),
-        }
-        for r in rows
-    ]
+    return [_serialize_schedule_config_row(row) for row in cur.fetchall()]
+
+
+def _run_prompt_session(
+    *,
+    entity: str,
+    prompt: str,
+    session_type: str = "general",
+    session_mode: str = "isolated",
+    trigger_source: str = "cron",
+    metadata: Optional[Dict[str, Any]] = None,
+    announce_policy: str = "important_only",
+    parent_session_id: Optional[str] = None,
+    announcement_target: Optional[str] = None,
+) -> Dict[str, Any]:
+    session_id = _create_work_session(
+        entity=entity,
+        goal=prompt[:240],
+        session_type=session_type,
+        metadata=metadata or {},
+        status="pending",
+        session_mode=session_mode,
+        trigger_source=trigger_source,
+        parent_session_id=parent_session_id,
+        announcement_target=announcement_target,
+    )
+    _update_work_session(session_id, status="running")
+    try:
+        active_tools = normalize_active_tools((metadata or {}).get("active_tools") or DEFAULT_ACTIVE_TOOLS)
+        response = generate_response(
+            prompt,
+            thread_id=None,
+            personality=entity,
+            active_tools=active_tools,
+            conversation_mode="default",
+        )
+        summary = str((response or {}).get("response") or "").strip()
+        _update_work_session(
+            session_id,
+            status="completed",
+            summary=summary[:1000] or "Prompt session completed",
+            metadata={
+                "active_tools": active_tools,
+                "response_excerpt": summary[:1000],
+                "session_mode": session_mode,
+                "trigger_source": trigger_source,
+            },
+        )
+        note = _enqueue_proactive_note(
+            source=f"{trigger_source}:prompt_session",
+            source_id=session_id,
+            session_id=session_id,
+            title=f"{entity.title()} prompt session completed",
+            body=summary[:1500] or "Prompt session completed with no text output.",
+            severity="warning" if announce_policy == "always" else "info",
+            announce_policy=announce_policy,
+            dedupe_key=f"prompt-session:{session_id}",
+            metadata={"entity": entity, "session_mode": session_mode, "trigger_source": trigger_source},
+        )
+        _fire_runtime_hooks(
+            HOOK_EVENT_SCHEDULE_COMPLETED,
+            {"job_kind": "prompt_session", "session_id": session_id, "result": response, "note": note},
+        )
+        return {"session_id": session_id, "response": response, "note": note}
+    except Exception as e:
+        _update_work_session(session_id, status="failed", summary=f"Prompt session failed: {e}")
+        raise
 
 
 def run_prospect_research_session(
@@ -3983,7 +4488,7 @@ def run_prospect_research_session(
     sent_push = _send_session_notifications(session_id, prospects_created, drafts_created)
     if sent_push:
         _update_work_session(session_id, metadata={"notifications_sent": sent_push})
-    return {
+    result = {
         "session_id": session_id,
         "prospects_created": prospects_created,
         "drafts_created": drafts_created,
@@ -3991,36 +4496,81 @@ def run_prospect_research_session(
         "status": status,
         "summary": summary,
     }
-
-
-async def _scheduled_prospect_research_job(job_name: str, product: str, count: int) -> None:
-    entity = "claude"
-    goal = f"Scheduled prospect research for {product} ({count} prospects)"
-    session_id = _create_work_session(
-        entity=entity,
-        goal=goal,
-        session_type="prospect_research",
-        metadata={"scheduled_job": job_name, "product": product, "count": count},
-        status="pending",
+    note = _enqueue_proactive_note(
+        source=source,
+        source_id=session_id,
+        session_id=session_id,
+        title=f"Prospect research finished for {product}",
+        body=summary,
+        severity="warning" if prospects_created > 0 else "info",
+        announce_policy="important_only",
+        dedupe_key=f"prospect-research:{session_id}",
+        metadata={"product": product, "entity": entity, "result": result},
     )
+    _fire_runtime_hooks(HOOK_EVENT_SCHEDULE_COMPLETED, {"job_kind": "prospect_research", "session_id": session_id, "result": result, "note": note})
+    return result
+
+
+async def _run_scheduled_job(cfg: Dict[str, Any]) -> None:
+    job_name = str(cfg.get("job_name") or "")
+    job_kind = str(cfg.get("job_kind") or "prospect_research").strip().lower()
+    entity = str(cfg.get("target_entity") or "claude").strip().lower()
+    execution_mode = str(cfg.get("execution_mode") or "isolated").strip().lower()
+    announce_policy = str(cfg.get("announce_policy") or "important_only").strip().lower()
+    metadata = dict(cfg.get("metadata") or {})
+    metadata["scheduled_job"] = job_name
     try:
-        run_prospect_research_session(
-            session_id=session_id,
-            entity=entity,
-            product=product,
-            count=count,
-            source=f"schedule:{job_name}",
-        )
+        if job_kind == "prompt_session":
+            prompt = str(cfg.get("prompt") or metadata.get("prompt") or "").strip()
+            if not prompt:
+                raise RuntimeError("Scheduled prompt_session is missing prompt text")
+            _run_prompt_session(
+                entity=_normalized_execution_entity(entity),
+                prompt=prompt,
+                session_type=_normalized_session_type(str(cfg.get("session_type") or "general")),
+                session_mode=execution_mode if execution_mode in ALLOWED_SESSION_MODES else "isolated",
+                trigger_source="cron",
+                metadata=metadata,
+                announce_policy=announce_policy,
+            )
+        else:
+            product = _normalized_product(str(cfg.get("product") or "manifest"))
+            count = max(1, min(int(cfg.get("count") or 5), 25))
+            goal = f"Scheduled prospect research for {product} ({count} prospects)"
+            session_id = _create_work_session(
+                entity=_normalized_execution_entity(entity),
+                goal=goal,
+                session_type="prospect_research",
+                metadata=metadata | {"product": product, "count": count},
+                status="pending",
+                session_mode=execution_mode if execution_mode in ALLOWED_SESSION_MODES else "isolated",
+                trigger_source="cron",
+            )
+            run_prospect_research_session(
+                session_id=session_id,
+                entity=_normalized_execution_entity(entity),
+                product=product,
+                count=count,
+                source=f"schedule:{job_name}",
+            )
         conn = get_connection()
         cur = conn.cursor()
         try:
             cur.execute("UPDATE schedule_configs SET last_run_at = NOW(), updated_at = NOW() WHERE job_name = %s", (job_name,))
             conn.commit()
         except Exception:
-            _safe_rollback(conn, "_scheduled_prospect_research_job")
+            _safe_rollback(conn, "_run_scheduled_job")
     except Exception as e:
-        _update_work_session(session_id, status="failed", summary=f"Scheduled run failed: {e}")
         logger.error("Scheduled job %s failed: %s", job_name, e)
+        _enqueue_proactive_note(
+            source=f"schedule:{job_name}",
+            title=f"Scheduled job failed: {job_name}",
+            body=str(e),
+            severity="warning",
+            announce_policy="always",
+            dedupe_key=f"schedule-failure:{job_name}",
+            metadata={"job_name": job_name, "job_kind": job_kind},
+        )
 
 
 def sync_scheduler_jobs() -> None:
@@ -4050,15 +4600,11 @@ def sync_scheduler_jobs() -> None:
             timezone=getattr(config, "APP_TIMEZONE", "America/Chicago"),
         )
         scheduler.add_job(
-            _scheduled_prospect_research_job,
+            _run_scheduled_job,
             trigger=trigger,
             id=f"schedule-config:{cfg['job_name']}",
             replace_existing=True,
-            kwargs={
-                "job_name": cfg["job_name"],
-                "product": cfg.get("product") or "manifest",
-                "count": int(cfg.get("count") or 5),
-            },
+            kwargs={"cfg": cfg},
             coalesce=True,
             max_instances=1,
             misfire_grace_time=300,
@@ -4100,6 +4646,19 @@ def sync_scheduler_jobs() -> None:
         coalesce=True,
         max_instances=1,
         misfire_grace_time=900,
+    )
+
+    scheduler.add_job(
+        _run_heartbeat,
+        trigger=CronTrigger(
+            minute=f"*/{DEFAULT_HEARTBEAT_INTERVAL_MINUTES}",
+            timezone=getattr(config, "APP_TIMEZONE", "America/Chicago"),
+        ),
+        id="proactive-heartbeat",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=300,
     )
 
 
@@ -4499,6 +5058,7 @@ def load_models():
     global PERSONALITY_AVAILABLE, VOICE_VALIDATOR_AVAILABLE, RELATIONSHIP_AVAILABLE, EMOTION_API_AVAILABLE
 
     state.start_time = time.time()
+    state.workspace_prompts = _load_workspace_prompt_files()
     try:
         init_connection_pool()
         logger.info("Supabase pooled connections ready")
@@ -4647,6 +5207,10 @@ def load_models():
         except Exception as e:
             logger.warning("ensure_default_schedule_configs skipped: %s", e)
         try:
+            ensure_proactive_runtime_tables()
+        except Exception as e:
+            logger.warning("ensure_proactive_runtime_tables skipped: %s", e)
+        try:
             ensure_personality_schema()
         except Exception as e:
             logger.warning("ensure_personality_schema skipped: %s", e)
@@ -4692,6 +5256,7 @@ def load_models():
         state.relationship_context = RelationshipContextBuilder(state.relationship_db)
         logger.info("Relationship memory loaded")
 
+    _fire_runtime_hooks(HOOK_EVENT_STARTUP, {"started_at": datetime.now(timezone.utc).isoformat()})
     logger.info("All systems loaded")
 
 
@@ -5048,6 +5613,9 @@ def build_system_prompt(
         "Relationship context: You are Elias's trusted AI collaborator and companion. Keep responses clear, direct, and caring.",
         "Context safety: Only use data from tools currently active in this turn. If a tool is not active, do not reference its private data.",
     ]
+    workspace_block = _workspace_prompt_block(["agents", "soul", "tools"])
+    if workspace_block:
+        base_lines.append(workspace_block)
     if conversation_mode == "spicy" and personality in {"sylana", "claude"}:
         base_lines.append(
             "Tone mode: spicy. Be bolder, flirtier, and more teasing than your default tone. "
@@ -5059,6 +5627,7 @@ def build_system_prompt(
     work_sessions_summary = user_ctx.get("work_sessions_summary") or {}
     outreach_summary = user_ctx.get("outreach_summary") or {}
     lysara_status = user_ctx.get("lysara_status") or {}
+    heartbeat_result = user_ctx.get("last_heartbeat_result") or {}
     tool_blocks = {
         "web_search": "You have access to web search. Use it when current information would improve your response.",
         "code_execution": "You have access to code execution. You can write and run Python, JavaScript, or bash. Use this to produce real outputs, not just describe them.",
@@ -5095,6 +5664,8 @@ def build_system_prompt(
                 "Financial operator policy: for current market-moving decisions, gather current source-backed information via web search before submitting any trade intent. "
                 "Only use approved Lysara mutation tools for risk, strategy controls, pause/resume, and trade intents."
             )
+    if heartbeat_result:
+        base_lines.append(f"Latest heartbeat summary: {json.dumps(heartbeat_result)[:1200]}")
     return "\n\n".join(base_lines)
 
 
@@ -5612,6 +6183,10 @@ class SessionCreateRequest(BaseModel):
     entity: str
     goal: str
     session_type: str = "general"
+    session_mode: str = "main"
+    trigger_source: str = "user"
+    parent_session_id: Optional[str] = None
+    announcement_target: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -5670,6 +6245,27 @@ class ScheduleConfigUpdateRequest(BaseModel):
     cron_expr: Optional[str] = None
     count: Optional[int] = None
     product: Optional[str] = None
+    job_kind: Optional[str] = None
+    execution_mode: Optional[str] = None
+    target_entity: Optional[str] = None
+    prompt: Optional[str] = None
+    announce_policy: Optional[str] = None
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class ScheduleConfigCreateRequest(BaseModel):
+    job_name: str
+    session_type: str = "general"
+    cron_expr: str
+    active: bool = True
+    count: int = 5
+    product: Optional[str] = None
+    job_kind: str = "prompt_session"
+    execution_mode: str = "isolated"
+    target_entity: str = "claude"
+    prompt: Optional[str] = None
+    announce_policy: str = "important_only"
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
 class AlertTopicCreateRequest(BaseModel):
@@ -5692,6 +6288,34 @@ class AlertTopicUpdateRequest(BaseModel):
 
 class PresenceNightlyRunRequest(BaseModel):
     healthcheck: bool = True
+
+
+class ProactiveNoteCreateRequest(BaseModel):
+    source: str = "manual"
+    title: str
+    body: str
+    severity: str = "info"
+    announce_policy: str = "important_only"
+    dedupe_key: Optional[str] = None
+    session_id: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class RuntimeHookCreateRequest(BaseModel):
+    event_name: str
+    enabled: bool = True
+    target_entity: str = "claude"
+    session_mode: str = "isolated"
+    action_kind: str = "enqueue_note"
+    action_payload: Dict[str, Any] = Field(default_factory=dict)
+
+
+class RuntimeHookUpdateRequest(BaseModel):
+    enabled: Optional[bool] = None
+    target_entity: Optional[str] = None
+    session_mode: Optional[str] = None
+    action_kind: Optional[str] = None
+    action_payload: Optional[Dict[str, Any]] = None
 
 
 class EmailDraftBatchSendRequest(BaseModel):
@@ -5759,6 +6383,41 @@ def _normalized_session_type(value: str) -> str:
     if session_type not in allowed:
         raise HTTPException(status_code=400, detail="session_type must be prospect_research|email_drafting|content|general")
     return session_type
+
+
+def _normalized_session_mode(value: str) -> str:
+    session_mode = (value or "").strip().lower()
+    if session_mode not in ALLOWED_SESSION_MODES:
+        raise HTTPException(status_code=400, detail="session_mode must be main|isolated|system")
+    return session_mode
+
+
+def _normalized_trigger_source(value: str) -> str:
+    trigger_source = (value or "").strip().lower()
+    if trigger_source not in ALLOWED_TRIGGER_SOURCES:
+        raise HTTPException(status_code=400, detail="trigger_source must be user|cron|heartbeat|hook|system")
+    return trigger_source
+
+
+def _normalized_job_kind(value: str) -> str:
+    job_kind = (value or "").strip().lower()
+    if job_kind not in ALLOWED_JOB_KINDS:
+        raise HTTPException(status_code=400, detail="job_kind must be prospect_research|prompt_session")
+    return job_kind
+
+
+def _normalized_announce_policy(value: str) -> str:
+    policy = (value or "").strip().lower()
+    if policy not in ALLOWED_ANNOUNCE_POLICIES:
+        raise HTTPException(status_code=400, detail="announce_policy must be always|important_only|never")
+    return policy
+
+
+def _normalized_hook_action_kind(value: str) -> str:
+    action_kind = (value or "").strip().lower()
+    if action_kind not in ALLOWED_HOOK_ACTION_KINDS:
+        raise HTTPException(status_code=400, detail="action_kind must be enqueue_note|create_session")
+    return action_kind
 
 
 def _normalized_product(value: str) -> str:
@@ -5872,6 +6531,14 @@ _CLAUDE_AGENT_SYSTEM = (
     + _AGENT_EFFICIENCY_RULES
 )
 
+
+def _compose_agent_system_prompt(agent_name: str) -> str:
+    base = _SYLANA_AGENT_SYSTEM if agent_name == "sylana" else _CLAUDE_AGENT_SYSTEM
+    workspace_block = _workspace_prompt_block(["agents", "soul", "tools"])
+    if not workspace_block:
+        return base
+    return f"{base}\n\n{workspace_block}"
+
 _AGENT_BASH_TOOL = {
     "name": "bash",
     "description": "Execute shell commands or code in the Vessel server environment.",
@@ -5933,7 +6600,7 @@ async def agent_stream_endpoint(payload: AgentRunRequest, request: Request):
     agent_name = (payload.agent or "sylana").lower().strip()
     if agent_name not in ("sylana", "claude"):
         raise HTTPException(status_code=400, detail="agent must be sylana or claude")
-    system_prompt = _SYLANA_AGENT_SYSTEM if agent_name == "sylana" else _CLAUDE_AGENT_SYSTEM
+    system_prompt = _compose_agent_system_prompt(agent_name)
     prompt = (payload.prompt or "").strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="prompt is required")
@@ -6063,14 +6730,20 @@ async def create_work_session_endpoint(payload: SessionCreateRequest):
     if not goal:
         raise HTTPException(status_code=400, detail="goal is required")
     session_type = _normalized_session_type(payload.session_type)
+    session_mode = _normalized_session_mode(payload.session_mode)
+    trigger_source = _normalized_trigger_source(payload.trigger_source)
     session_id = _create_work_session(
         entity=entity,
         goal=goal,
         session_type=session_type,
         metadata=payload.metadata or {},
         status="pending",
+        session_mode=session_mode,
+        trigger_source=trigger_source,
+        parent_session_id=payload.parent_session_id,
+        announcement_target=payload.announcement_target,
     )
-    return JSONResponse(content={"session_id": session_id, "status": "pending"})
+    return JSONResponse(content={"session_id": session_id, "status": "pending", "session_mode": session_mode, "trigger_source": trigger_source})
 
 
 @sessions_router.get("")
@@ -6080,6 +6753,8 @@ async def list_sessions(
     entity: Optional[str] = None,
     status: Optional[str] = None,
     session_type: Optional[str] = None,
+    session_mode: Optional[str] = None,
+    trigger_source: Optional[str] = None,
 ):
     page = max(1, int(page or 1))
     page_size = max(1, min(int(page_size or 20), 100))
@@ -6103,12 +6778,19 @@ async def list_sessions(
         st = _normalized_session_type(session_type)
         where.append("s.session_type = %s")
         params.append(st)
+    if session_mode:
+        where.append("s.session_mode = %s")
+        params.append(_normalized_session_mode(session_mode))
+    if trigger_source:
+        where.append("s.trigger_source = %s")
+        params.append(_normalized_trigger_source(trigger_source))
 
     where_sql = f"WHERE {' AND '.join(where)}" if where else ""
     try:
         cur.execute(f"""
             SELECT
                 s.session_id, s.entity, s.goal, s.status, s.session_type, s.started_at, s.completed_at, s.summary, s.metadata,
+                s.session_mode, s.trigger_source, s.parent_session_id, s.announcement_target,
                 COALESCE(t.task_count, 0) AS task_count
             FROM work_sessions s
             LEFT JOIN (
@@ -6139,7 +6821,11 @@ async def list_sessions(
             "completed_at": r[6].isoformat() if r[6] else None,
             "summary": r[7] or "",
             "metadata": r[8] or {},
-            "task_count": int(r[9] or 0),
+            "session_mode": r[9] or "main",
+            "trigger_source": r[10] or "user",
+            "parent_session_id": str(r[11]) if r[11] else None,
+            "announcement_target": r[12],
+            "task_count": int(r[13] or 0),
         })
 
     return JSONResponse(content={
@@ -6153,6 +6839,56 @@ async def list_sessions(
 @sessions_router.get("/schedules/configs")
 async def list_session_schedules():
     return JSONResponse(content={"schedules": _list_schedule_configs()})
+
+
+@sessions_router.post("/schedules/configs")
+async def create_session_schedule(payload: ScheduleConfigCreateRequest):
+    job_name = (payload.job_name or "").strip()
+    if not job_name:
+        raise HTTPException(status_code=400, detail="job_name is required")
+    cron = (payload.cron_expr or "").strip()
+    if len(cron.split()) != 5:
+        raise HTTPException(status_code=400, detail="cron_expr must be five-field cron format")
+    job_kind = _normalized_job_kind(payload.job_kind)
+    session_type = _normalized_session_type(payload.session_type)
+    execution_mode = _normalized_session_mode(payload.execution_mode)
+    target_entity = _normalized_execution_entity(payload.target_entity)
+    announce_policy = _normalized_announce_policy(payload.announce_policy)
+    product = _normalized_product(payload.product) if payload.product else None
+    count = max(1, min(int(payload.count or 5), 25))
+    prompt = (payload.prompt or "").strip() or None
+    metadata = payload.metadata or {}
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO schedule_configs (
+                job_name, session_type, product, count, cron_expr, active, metadata,
+                job_kind, execution_mode, target_entity, prompt, announce_policy, updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, NOW())
+            RETURNING job_name
+        """, (
+            job_name,
+            session_type,
+            product,
+            count,
+            cron,
+            bool(payload.active),
+            json.dumps(metadata),
+            job_kind,
+            execution_mode,
+            target_entity,
+            prompt,
+            announce_policy,
+        ))
+        row = cur.fetchone()
+        conn.commit()
+        sync_scheduler_jobs()
+        return JSONResponse(content={"job_name": row[0], "created": True})
+    except Exception as e:
+        _safe_rollback(conn, "create_session_schedule")
+        raise HTTPException(status_code=500, detail=f"Failed to create schedule config: {e}")
 
 
 @sessions_router.patch("/schedules/{job_name}")
@@ -6176,6 +6912,24 @@ async def update_session_schedule(job_name: str, payload: ScheduleConfigUpdateRe
         prod = _normalized_product(payload.product)
         updates.append("product = %s")
         params.append(prod)
+    if payload.job_kind is not None:
+        updates.append("job_kind = %s")
+        params.append(_normalized_job_kind(payload.job_kind))
+    if payload.execution_mode is not None:
+        updates.append("execution_mode = %s")
+        params.append(_normalized_session_mode(payload.execution_mode))
+    if payload.target_entity is not None:
+        updates.append("target_entity = %s")
+        params.append(_normalized_execution_entity(payload.target_entity))
+    if payload.prompt is not None:
+        updates.append("prompt = %s")
+        params.append((payload.prompt or "").strip() or None)
+    if payload.announce_policy is not None:
+        updates.append("announce_policy = %s")
+        params.append(_normalized_announce_policy(payload.announce_policy))
+    if payload.metadata is not None:
+        updates.append("metadata = %s::jsonb")
+        params.append(json.dumps(payload.metadata))
     if not updates:
         raise HTTPException(status_code=400, detail="No update fields provided")
 
@@ -6200,6 +6954,116 @@ async def update_session_schedule(job_name: str, payload: ScheduleConfigUpdateRe
         raise HTTPException(status_code=500, detail=f"Failed to update schedule config: {e}")
 
 
+@sessions_router.get("/proactive/prompt-files")
+async def proactive_prompt_files():
+    state.workspace_prompts = _load_workspace_prompt_files()
+    return JSONResponse(content={"prompt_files": state.workspace_prompts, "filenames": WORKSPACE_PROMPT_FILES})
+
+
+@sessions_router.get("/proactive/notes")
+async def list_proactive_notes_endpoint(limit: int = 50, status: Optional[str] = None):
+    return JSONResponse(content={"notes": _list_proactive_notes(limit=limit, status=status)})
+
+
+@sessions_router.post("/proactive/notes")
+async def create_proactive_note(payload: ProactiveNoteCreateRequest):
+    note = _enqueue_proactive_note(
+        source=(payload.source or "manual").strip() or "manual",
+        title=(payload.title or "").strip(),
+        body=(payload.body or "").strip(),
+        severity=(payload.severity or "info").strip().lower(),
+        session_id=payload.session_id,
+        dedupe_key=payload.dedupe_key,
+        announce_policy=_normalized_announce_policy(payload.announce_policy),
+        metadata=payload.metadata or {},
+    )
+    if not note:
+        raise HTTPException(status_code=500, detail="Failed to create proactive note")
+    return JSONResponse(content={"note": note})
+
+
+@sessions_router.get("/proactive/hooks")
+async def list_proactive_hooks(event_name: Optional[str] = None):
+    return JSONResponse(content={"hooks": _list_runtime_hooks(event_name=event_name)})
+
+
+@sessions_router.post("/proactive/hooks")
+async def create_proactive_hook(payload: RuntimeHookCreateRequest):
+    event_name = (payload.event_name or "").strip().lower()
+    if not event_name:
+        raise HTTPException(status_code=400, detail="event_name is required")
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO runtime_hooks (event_name, enabled, target_entity, session_mode, action_kind, action_payload, updated_at)
+            VALUES (%s, %s, %s, %s, %s, %s::jsonb, NOW())
+            RETURNING hook_id, event_name, enabled, target_entity, session_mode, action_kind, action_payload, created_at, updated_at
+        """, (
+            event_name,
+            bool(payload.enabled),
+            _normalized_execution_entity(payload.target_entity),
+            _normalized_session_mode(payload.session_mode),
+            _normalized_hook_action_kind(payload.action_kind),
+            json.dumps(payload.action_payload or {}),
+        ))
+        row = cur.fetchone()
+        conn.commit()
+        return JSONResponse(content={"hook": _serialize_runtime_hook_row(row)})
+    except Exception as e:
+        _safe_rollback(conn, "create_proactive_hook")
+        raise HTTPException(status_code=500, detail=f"Failed to create runtime hook: {e}")
+
+
+@sessions_router.patch("/proactive/hooks/{hook_id}")
+async def update_proactive_hook(hook_id: str, payload: RuntimeHookUpdateRequest):
+    updates = []
+    params: List[Any] = []
+    if payload.enabled is not None:
+        updates.append("enabled = %s")
+        params.append(bool(payload.enabled))
+    if payload.target_entity is not None:
+        updates.append("target_entity = %s")
+        params.append(_normalized_execution_entity(payload.target_entity))
+    if payload.session_mode is not None:
+        updates.append("session_mode = %s")
+        params.append(_normalized_session_mode(payload.session_mode))
+    if payload.action_kind is not None:
+        updates.append("action_kind = %s")
+        params.append(_normalized_hook_action_kind(payload.action_kind))
+    if payload.action_payload is not None:
+        updates.append("action_payload = %s::jsonb")
+        params.append(json.dumps(payload.action_payload))
+    if not updates:
+        raise HTTPException(status_code=400, detail="No update fields provided")
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        params.append(hook_id)
+        cur.execute(f"""
+            UPDATE runtime_hooks
+            SET {', '.join(updates)}, updated_at = NOW()
+            WHERE hook_id = %s::uuid
+            RETURNING hook_id, event_name, enabled, target_entity, session_mode, action_kind, action_payload, created_at, updated_at
+        """, tuple(params))
+        row = cur.fetchone()
+        conn.commit()
+        if not row:
+            raise HTTPException(status_code=404, detail="Runtime hook not found")
+        return JSONResponse(content={"hook": _serialize_runtime_hook_row(row)})
+    except HTTPException:
+        raise
+    except Exception as e:
+        _safe_rollback(conn, "update_proactive_hook")
+        raise HTTPException(status_code=500, detail=f"Failed to update runtime hook: {e}")
+
+
+@sessions_router.post("/proactive/heartbeat/run")
+async def run_heartbeat_now():
+    state.workspace_prompts = _load_workspace_prompt_files()
+    return JSONResponse(content={"heartbeat": _run_heartbeat()})
+
+
 @sessions_router.post("/run-prospect-research")
 async def run_prospect_research(payload: ProspectResearchRunRequest):
     entity = _normalized_execution_entity(payload.entity)
@@ -6213,6 +7077,8 @@ async def run_prospect_research(payload: ProspectResearchRunRequest):
         session_type="prospect_research",
         metadata={"product": product, "count": count},
         status="pending",
+        session_mode="isolated",
+        trigger_source="user",
     )
 
     result = run_prospect_research_session(
@@ -6231,7 +7097,8 @@ async def get_session_details(session_id: str):
     cur = conn.cursor()
     try:
         cur.execute("""
-            SELECT session_id, entity, goal, status, session_type, started_at, completed_at, summary, metadata, created_at
+            SELECT session_id, entity, goal, status, session_type, started_at, completed_at, summary, metadata, created_at,
+                   session_mode, trigger_source, parent_session_id, announcement_target
             FROM work_sessions
             WHERE session_id = %s::uuid
         """, (session_id,))
@@ -6278,6 +7145,10 @@ async def get_session_details(session_id: str):
             "summary": s[7] or "",
             "metadata": s[8] or {},
             "created_at": s[9].isoformat() if s[9] else None,
+            "session_mode": s[10] or "main",
+            "trigger_source": s[11] or "user",
+            "parent_session_id": str(s[12]) if s[12] else None,
+            "announcement_target": s[13],
             "tasks": tasks,
         }
     })
