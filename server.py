@@ -133,6 +133,7 @@ WORKSPACE_PROMPT_FILES: Dict[str, str] = {
     "soul": "SOUL.md",
     "tools": "TOOLS.md",
     "heartbeat": "HEARTBEAT.md",
+    "risk": "RISK.md",
 }
 DEFAULT_HEARTBEAT_INTERVAL_MINUTES = max(5, int(os.getenv("HEARTBEAT_INTERVAL_MINUTES", "30") or "30"))
 HEARTBEAT_PUSH_ENABLED = os.getenv("HEARTBEAT_PUSH_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
@@ -147,6 +148,8 @@ HOOK_EVENT_SCHEDULE_COMPLETED = "schedule_completed"
 HOOK_EVENT_HEARTBEAT_ALERT = "heartbeat_alert"
 HOOK_EVENT_HEARTBEAT_OK = "heartbeat_ok"
 HOOK_EVENT_NOTE_CREATED = "note_created"
+HOOK_EVENT_TRADE_CLOSE = "trade_close"
+HOOK_EVENT_TRADE_APPROVAL_REQUIRED = "trade_approval_required"
 
 
 def _get_openai_client() -> OpenAI:
@@ -185,6 +188,51 @@ def _workspace_prompt_block(keys: Optional[List[str]] = None) -> str:
         label = WORKSPACE_PROMPT_FILES.get(key, key).upper()
         sections.append(f"{label}:\n{content}")
     return "\n\n".join(sections)
+
+
+def _parse_risk_config(text: str) -> Dict[str, Any]:
+    cfg: Dict[str, Any] = {
+        "max_notional_auto_approve": 1000.0,
+        "max_size_hint_auto_approve": 0.1,
+        "max_confidence_auto_execute": 0.95,
+        "max_daily_loss_pct": 3.0,
+        "max_drawdown_pct": 8.0,
+        "max_sector_exposure_pct": 35.0,
+        "max_single_position_pct": 20.0,
+        "allowed_markets": ["stocks", "crypto"],
+        "auto_adjust_regime_params": False,
+        "regime_volatility_warn": 2.5,
+        "regime_volatility_high": 4.0,
+        "requires_approval_above_notional": 1000.0,
+    }
+    if not text:
+        return cfg
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or ":" not in stripped:
+            continue
+        key, raw = stripped.split(":", 1)
+        norm = key.strip().lower()
+        value = raw.strip()
+        if not norm:
+            continue
+        if value.lower() in {"true", "false"}:
+            cfg[norm] = value.lower() == "true"
+            continue
+        if "," in value:
+            parts = [p.strip() for p in value.split(",") if p.strip()]
+            if parts:
+                cfg[norm] = parts
+                continue
+        try:
+            if "." in value:
+                cfg[norm] = float(value)
+            else:
+                cfg[norm] = int(value)
+            continue
+        except Exception:
+            cfg[norm] = value
+    return cfg
 
 
 def _prune_voice_audio_cache() -> None:
@@ -1250,6 +1298,7 @@ class SylanaState:
         self.lysara_loop_task = None
         self.workspace_prompts: Dict[str, str] = {}
         self.last_heartbeat_result: Dict[str, Any] = {}
+        self.lysara_risk_config: Dict[str, Any] = {}
 
 
 state = SylanaState()
@@ -1587,6 +1636,8 @@ def _build_user_context(active_tools: List[str]) -> Dict[str, Any]:
         ctx["outreach_summary"] = _get_outreach_summary()
     if "lysara" in active_tools:
         ctx["lysara_status"] = _get_lysara_status_snapshot()
+        ctx["lysara_risk"] = state.lysara_risk_config or {}
+        ctx["lysara_performance"] = _get_lysara_performance_summary(limit=50)
     ctx["last_heartbeat_result"] = state.last_heartbeat_result or {}
     return ctx
 
@@ -2176,7 +2227,7 @@ def _runtime_tool_runner(name: str, tool_input: Dict[str, Any]) -> Dict[str, Any
                     actor=str(tool_input.get("actor") or "sylana"),
                 )
             if name == "lysara_submit_trade_intent":
-                return client.submit_trade_intent(
+                return _submit_lysara_trade_intent_with_policy(
                     {
                         "market": str(tool_input.get("market") or ""),
                         "symbol": str(tool_input.get("symbol") or "").upper(),
@@ -2571,6 +2622,11 @@ def ensure_proactive_runtime_tables():
                 status TEXT NOT NULL DEFAULT 'pending',
                 dedupe_key TEXT,
                 announce_policy TEXT NOT NULL DEFAULT 'important_only',
+                requires_approval BOOLEAN NOT NULL DEFAULT FALSE,
+                approval_status TEXT NOT NULL DEFAULT 'not_required',
+                approved_by TEXT,
+                approved_at TIMESTAMPTZ,
+                approval_reason TEXT,
                 metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
                 visible_after TIMESTAMPTZ,
                 expires_at TIMESTAMPTZ,
@@ -2591,9 +2647,48 @@ def ensure_proactive_runtime_tables():
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS lysara_trade_performance (
+                metric_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                trade_id TEXT,
+                market TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                strategy_name TEXT,
+                sector TEXT,
+                regime_label TEXT,
+                pnl REAL NOT NULL DEFAULT 0,
+                pnl_pct REAL,
+                win BOOLEAN,
+                closed_at TIMESTAMPTZ NOT NULL,
+                metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS lysara_market_regimes (
+                regime_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                market TEXT NOT NULL,
+                regime_label TEXT NOT NULL,
+                volatility_score REAL,
+                trend_score REAL,
+                confidence REAL,
+                recommended_params JSONB NOT NULL DEFAULT '{}'::jsonb,
+                applied BOOLEAN NOT NULL DEFAULT FALSE,
+                source TEXT NOT NULL DEFAULT 'heartbeat',
+                observed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        cur.execute("ALTER TABLE proactive_notes ADD COLUMN IF NOT EXISTS requires_approval BOOLEAN NOT NULL DEFAULT FALSE")
+        cur.execute("ALTER TABLE proactive_notes ADD COLUMN IF NOT EXISTS approval_status TEXT NOT NULL DEFAULT 'not_required'")
+        cur.execute("ALTER TABLE proactive_notes ADD COLUMN IF NOT EXISTS approved_by TEXT")
+        cur.execute("ALTER TABLE proactive_notes ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ")
+        cur.execute("ALTER TABLE proactive_notes ADD COLUMN IF NOT EXISTS approval_reason TEXT")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_proactive_notes_status_visible ON proactive_notes(status, created_at DESC)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_runtime_hooks_event_enabled ON runtime_hooks(event_name, enabled)")
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_proactive_notes_dedupe_pending ON proactive_notes(dedupe_key) WHERE dedupe_key IS NOT NULL AND status = 'pending'")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_lysara_trade_performance_closed_at ON lysara_trade_performance(closed_at DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_lysara_market_regimes_market_obs ON lysara_market_regimes(market, observed_at DESC)")
         conn.commit()
     except Exception as e:
         _safe_rollback(conn, "ensure_proactive_runtime_tables")
@@ -2645,11 +2740,16 @@ def _serialize_proactive_note_row(row: Any) -> Dict[str, Any]:
         "status": row[7],
         "dedupe_key": row[8],
         "announce_policy": row[9],
-        "metadata": row[10] or {},
-        "visible_after": row[11].isoformat() if row[11] else None,
-        "expires_at": row[12].isoformat() if row[12] else None,
-        "processed_at": row[13].isoformat() if row[13] else None,
-        "created_at": row[14].isoformat() if row[14] else None,
+        "requires_approval": bool(row[10]),
+        "approval_status": row[11] or "not_required",
+        "approved_by": row[12],
+        "approved_at": row[13].isoformat() if row[13] else None,
+        "approval_reason": row[14],
+        "metadata": row[15] or {},
+        "visible_after": row[16].isoformat() if row[16] else None,
+        "expires_at": row[17].isoformat() if row[17] else None,
+        "processed_at": row[18].isoformat() if row[18] else None,
+        "created_at": row[19].isoformat() if row[19] else None,
     }
 
 
@@ -2686,7 +2786,8 @@ def _list_proactive_notes(limit: int = 50, status: Optional[str] = None) -> List
         params.append(max(1, min(limit, 200)))
         cur.execute(f"""
             SELECT note_id, source, source_id, session_id, title, body, severity, status, dedupe_key,
-                   announce_policy, metadata, visible_after, expires_at, processed_at, created_at
+                   announce_policy, requires_approval, approval_status, approved_by, approved_at, approval_reason,
+                   metadata, visible_after, expires_at, processed_at, created_at
             FROM proactive_notes
             {where}
             ORDER BY created_at DESC
@@ -2711,6 +2812,7 @@ def _enqueue_proactive_note(
     metadata: Optional[Dict[str, Any]] = None,
     visible_after: Optional[datetime] = None,
     expires_at: Optional[datetime] = None,
+    requires_approval: bool = False,
 ) -> Optional[Dict[str, Any]]:
     sev = (severity or "info").strip().lower()
     if sev not in ALERT_SEVERITY_ORDER:
@@ -2724,12 +2826,13 @@ def _enqueue_proactive_note(
         cur.execute("""
             INSERT INTO proactive_notes (
                 source, source_id, session_id, title, body, severity, status, dedupe_key,
-                announce_policy, metadata, visible_after, expires_at
+                announce_policy, requires_approval, approval_status, metadata, visible_after, expires_at
             )
-            VALUES (%s, %s, %s::uuid, %s, %s, %s, 'pending', %s, %s, %s::jsonb, %s, %s)
+            VALUES (%s, %s, %s::uuid, %s, %s, %s, 'pending', %s, %s, %s, %s, %s::jsonb, %s, %s)
             ON CONFLICT DO NOTHING
             RETURNING note_id, source, source_id, session_id, title, body, severity, status, dedupe_key,
-                      announce_policy, metadata, visible_after, expires_at, processed_at, created_at
+                      announce_policy, requires_approval, approval_status, approved_by, approved_at, approval_reason,
+                      metadata, visible_after, expires_at, processed_at, created_at
         """, (
             source,
             source_id,
@@ -2739,6 +2842,8 @@ def _enqueue_proactive_note(
             sev,
             dedupe_key,
             policy,
+            bool(requires_approval),
+            "pending_approval" if requires_approval else "not_required",
             json.dumps(metadata or {}),
             visible_after,
             expires_at,
@@ -2761,7 +2866,8 @@ def _get_due_proactive_notes(limit: int = 20) -> List[Dict[str, Any]]:
     try:
         cur.execute("""
             SELECT note_id, source, source_id, session_id, title, body, severity, status, dedupe_key,
-                   announce_policy, metadata, visible_after, expires_at, processed_at, created_at
+                   announce_policy, requires_approval, approval_status, approved_by, approved_at, approval_reason,
+                   metadata, visible_after, expires_at, processed_at, created_at
             FROM proactive_notes
             WHERE status = 'pending'
               AND (visible_after IS NULL OR visible_after <= NOW())
@@ -2790,6 +2896,266 @@ def _mark_proactive_notes(note_ids: List[str], status: str) -> None:
     except Exception as e:
         _safe_rollback(conn, "_mark_proactive_notes")
         logger.warning("Failed to mark proactive notes: %s", e)
+
+
+def _set_proactive_note_approval(note_id: str, approved: bool, actor: str, reason: str = "") -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        next_status = "approved" if approved else "rejected"
+        next_note_status = "approved" if approved else "rejected"
+        cur.execute("""
+            UPDATE proactive_notes
+            SET approval_status = %s,
+                approved_by = %s,
+                approved_at = NOW(),
+                approval_reason = %s,
+                status = %s
+            WHERE note_id = %s::uuid
+            RETURNING note_id, source, source_id, session_id, title, body, severity, status, dedupe_key,
+                      announce_policy, requires_approval, approval_status, approved_by, approved_at, approval_reason,
+                      metadata, visible_after, expires_at, processed_at, created_at
+        """, (next_status, actor, reason, next_note_status, note_id))
+        row = cur.fetchone()
+        conn.commit()
+        return _serialize_proactive_note_row(row) if row else None
+    except Exception as e:
+        _safe_rollback(conn, "_set_proactive_note_approval")
+        logger.warning("Failed to update proactive note approval: %s", e)
+        return None
+
+
+def _extract_portfolio_notional(portfolio: Dict[str, Any]) -> float:
+    candidates = [
+        portfolio.get("total_equity"),
+        portfolio.get("equity"),
+        portfolio.get("net_liquidation"),
+        portfolio.get("portfolio_value"),
+        ((portfolio.get("summary") or {}).get("total_equity") if isinstance(portfolio.get("summary"), dict) else None),
+    ]
+    for candidate in candidates:
+        try:
+            if candidate is not None:
+                return abs(float(candidate))
+        except Exception:
+            continue
+    return 0.0
+
+
+def _infer_market_sector(symbol: str, market: str) -> str:
+    sym = (symbol or "").upper()
+    if market == "crypto":
+        if "BTC" in sym:
+            return "store_of_value"
+        if "ETH" in sym or "SOL" in sym:
+            return "layer1"
+        return "crypto_other"
+    return "equities"
+
+
+def _estimate_trade_notional(payload: Dict[str, Any], portfolio: Dict[str, Any]) -> float:
+    try:
+        size_hint = float(payload.get("size_hint") or 0.0)
+    except Exception:
+        size_hint = 0.0
+    portfolio_value = _extract_portfolio_notional(portfolio)
+    if size_hint > 0 and size_hint <= 1.0 and portfolio_value > 0:
+        return size_hint * portfolio_value
+    if size_hint > 1.0:
+        return size_hint
+    return 0.0
+
+
+def _evaluate_trade_risk(payload: Dict[str, Any]) -> Dict[str, Any]:
+    cfg = state.lysara_risk_config or {}
+    client = _get_lysara_client()
+    portfolio = client.get_portfolio() if client is not None else {}
+    positions = client.get_positions(market=str(payload.get("market") or "")) if client is not None else {}
+    market = str(payload.get("market") or "").strip().lower()
+    symbol = str(payload.get("symbol") or "").strip().upper()
+    confidence = float(payload.get("confidence") or 0.0)
+    notional = _estimate_trade_notional(payload, portfolio)
+    side = str(payload.get("side") or "").strip().lower()
+    reasons: List[str] = []
+
+    allowed_markets = [str(x).strip().lower() for x in (cfg.get("allowed_markets") or [])]
+    if allowed_markets and market and market not in allowed_markets:
+        reasons.append(f"market {market} not allowed by risk policy")
+
+    auto_approve_threshold = float(cfg.get("requires_approval_above_notional") or cfg.get("max_notional_auto_approve") or 0.0)
+    if auto_approve_threshold > 0 and notional > auto_approve_threshold:
+        reasons.append(f"estimated notional {round(notional, 2)} exceeds auto-approval limit {round(auto_approve_threshold, 2)}")
+
+    max_size_hint = float(cfg.get("max_size_hint_auto_approve") or 0.0)
+    try:
+        size_hint = float(payload.get("size_hint") or 0.0)
+    except Exception:
+        size_hint = 0.0
+    if max_size_hint > 0 and size_hint > max_size_hint:
+        reasons.append(f"size_hint {size_hint} exceeds policy limit {max_size_hint}")
+
+    if confidence > float(cfg.get("max_confidence_auto_execute") or 0.95):
+        reasons.append(f"confidence {confidence} exceeds auto-execution cap")
+
+    positions_rows = []
+    if isinstance(positions, dict):
+        positions_rows = positions.get("positions") or positions.get("items") or []
+    sector = _infer_market_sector(symbol, market)
+    sector_count = sum(1 for row in positions_rows if _infer_market_sector(str((row or {}).get("symbol") or ""), market) == sector)
+    if positions_rows and sector_count / max(1, len(positions_rows)) * 100.0 > float(cfg.get("max_sector_exposure_pct") or 100.0):
+        reasons.append(f"sector exposure for {sector} exceeds configured limit")
+
+    requires_approval = bool(reasons)
+    return {
+        "requires_approval": requires_approval,
+        "reasons": reasons,
+        "estimated_notional": round(notional, 2),
+        "portfolio_value": round(_extract_portfolio_notional(portfolio), 2),
+        "sector": sector,
+        "market": market,
+        "symbol": symbol,
+        "side": side,
+    }
+
+
+def _record_trade_close_event(payload: Dict[str, Any]) -> Dict[str, Any]:
+    market = str(payload.get("market") or "").strip().lower() or "unknown"
+    symbol = str(payload.get("symbol") or "").strip().upper()
+    if not symbol:
+        raise HTTPException(status_code=400, detail="symbol is required")
+    pnl = float(payload.get("pnl") or 0.0)
+    pnl_pct = payload.get("pnl_pct")
+    pnl_pct_value = float(pnl_pct) if pnl_pct is not None else None
+    strategy_name = str(payload.get("strategy_name") or "").strip() or None
+    sector = str(payload.get("sector") or _infer_market_sector(symbol, market))
+    regime_label = str(payload.get("regime_label") or "").strip() or None
+    closed_at = payload.get("closed_at") or datetime.now(timezone.utc).isoformat()
+    metadata = payload.get("metadata") or {}
+    trade_id = str(payload.get("trade_id") or "").strip() or None
+
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO lysara_trade_performance (
+                trade_id, market, symbol, strategy_name, sector, regime_label, pnl, pnl_pct, win, closed_at, metadata
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::timestamptz, %s::jsonb)
+            RETURNING metric_id, created_at
+        """, (
+            trade_id, market, symbol, strategy_name, sector, regime_label, pnl, pnl_pct_value, pnl > 0, closed_at, json.dumps(metadata),
+        ))
+        metric_row = cur.fetchone()
+        conn.commit()
+    except Exception as e:
+        _safe_rollback(conn, "_record_trade_close_event")
+        raise HTTPException(status_code=500, detail=f"Failed to record trade close event: {e}")
+
+    event = {
+        "metric_id": str(metric_row[0]),
+        "created_at": metric_row[1].isoformat() if metric_row and metric_row[1] else None,
+        "trade_id": trade_id,
+        "market": market,
+        "symbol": symbol,
+        "strategy_name": strategy_name,
+        "sector": sector,
+        "regime_label": regime_label,
+        "pnl": pnl,
+        "pnl_pct": pnl_pct_value,
+        "win": pnl > 0,
+    }
+    _fire_runtime_hooks(HOOK_EVENT_TRADE_CLOSE, {"trade_close": event})
+    return event
+
+
+def _get_lysara_performance_summary(limit: int = 100) -> Dict[str, Any]:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT pnl, COALESCE(win, FALSE), market, strategy_name, regime_label
+            FROM lysara_trade_performance
+            ORDER BY closed_at DESC
+            LIMIT %s
+        """, (max(1, min(limit, 500)),))
+        rows = cur.fetchall()
+    except Exception as e:
+        logger.warning("Failed to load Lysara performance summary: %s", e)
+        return {"trade_count": 0, "total_pnl": 0.0, "win_rate": 0.0}
+    trade_count = len(rows)
+    total_pnl = round(sum(float(r[0] or 0.0) for r in rows), 2)
+    wins = sum(1 for r in rows if bool(r[1]))
+    strategies = Counter(str(r[3] or "unknown") for r in rows)
+    regimes = Counter(str(r[4] or "unknown") for r in rows)
+    return {
+        "trade_count": trade_count,
+        "total_pnl": total_pnl,
+        "win_rate": round((wins / trade_count) if trade_count else 0.0, 4),
+        "top_strategies": strategies.most_common(3),
+        "top_regimes": regimes.most_common(3),
+    }
+
+
+def _assess_market_regime() -> List[Dict[str, Any]]:
+    client = _get_lysara_client()
+    if client is None:
+        return []
+    cfg = state.lysara_risk_config or {}
+    snapshot = client.get_market_snapshot()
+    prices = (snapshot or {}).get("prices") or {}
+    market = str((snapshot or {}).get("market") or "mixed").strip().lower() or "mixed"
+    items: List[Dict[str, Any]] = []
+    for symbol, raw in list(prices.items())[:10]:
+        try:
+            if isinstance(raw, dict):
+                change_pct = abs(float(raw.get("change_pct_24h") or raw.get("change_pct") or 0.0))
+                momentum = float(raw.get("trend_score") or raw.get("momentum") or raw.get("change_pct_24h") or 0.0)
+            else:
+                change_pct = 0.0
+                momentum = 0.0
+        except Exception:
+            change_pct = 0.0
+            momentum = 0.0
+        regime = "volatile" if change_pct >= float(cfg.get("regime_volatility_high") or 4.0) else "trending" if abs(momentum) >= float(cfg.get("regime_volatility_warn") or 2.5) else "rangebound"
+        recommended = {
+            "risk_per_trade_multiplier": 0.7 if regime == "volatile" else 1.0,
+            "reduce_size": regime == "volatile",
+            "trend_bias": "momentum" if regime == "trending" else "mean_reversion" if regime == "rangebound" else "defensive",
+        }
+        items.append({
+            "market": market,
+            "symbol": str(symbol).upper(),
+            "regime_label": regime,
+            "volatility_score": round(change_pct, 4),
+            "trend_score": round(momentum, 4),
+            "confidence": round(min(0.9, 0.45 + change_pct / 10.0), 4),
+            "recommended_params": recommended,
+        })
+    return items
+
+
+def _persist_market_regime(item: Dict[str, Any], applied: bool = False) -> None:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO lysara_market_regimes (
+                market, regime_label, volatility_score, trend_score, confidence, recommended_params, applied, source, observed_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, 'heartbeat', NOW())
+        """, (
+            item.get("market"),
+            item.get("regime_label"),
+            item.get("volatility_score"),
+            item.get("trend_score"),
+            item.get("confidence"),
+            json.dumps(item.get("recommended_params") or {}),
+            bool(applied),
+        ))
+        conn.commit()
+    except Exception as e:
+        _safe_rollback(conn, "_persist_market_regime")
+        logger.warning("Failed to persist market regime: %s", e)
 
 
 def _fire_runtime_hooks(event_name: str, payload: Dict[str, Any]) -> None:
@@ -2829,6 +3195,30 @@ def _fire_runtime_hooks(event_name: str, payload: Dict[str, Any]) -> None:
 def _run_heartbeat() -> Dict[str, Any]:
     heartbeat_doc = (state.workspace_prompts or {}).get("heartbeat", "").strip()
     notes = _get_due_proactive_notes(limit=20)
+    regime_items: List[Dict[str, Any]] = []
+    regime_alerts: List[str] = []
+    try:
+        regime_items = _assess_market_regime()
+        for item in regime_items[:3]:
+            applied = False
+            if bool((state.lysara_risk_config or {}).get("auto_adjust_regime_params")) and str(item.get("regime_label")) == "volatile":
+                try:
+                    _lysara_proxy(
+                        "update_strategy_params",
+                        market=str(item.get("market") or "all"),
+                        actor="heartbeat",
+                        params={"risk_per_trade_multiplier": 0.7, "regime_bias": "defensive"},
+                    )
+                    applied = True
+                except Exception as exc:
+                    logger.warning("Heartbeat auto-adjust failed: %s", exc)
+            _persist_market_regime(item, applied=applied)
+            if str(item.get("regime_label")) == "volatile":
+                regime_alerts.append(
+                    f"[WARNING] Regime shift for {item.get('symbol')}: volatile, vol={item.get('volatility_score')}, trend={item.get('trend_score')}"
+                )
+    except Exception as exc:
+        logger.warning("Heartbeat regime assessment failed: %s", exc)
     important = [
         note for note in notes
         if note.get("announce_policy") != "never" and (
@@ -2839,6 +3229,7 @@ def _run_heartbeat() -> Dict[str, Any]:
     summary_lines: List[str] = []
     if heartbeat_doc:
         summary_lines.append("Heartbeat checklist loaded.")
+    summary_lines.extend(regime_alerts[:3])
     if important:
         for note in important[:5]:
             summary_lines.append(f"[{str(note.get('severity') or 'info').upper()}] {note.get('title')}: {note.get('body')}")
@@ -2847,7 +3238,7 @@ def _run_heartbeat() -> Dict[str, Any]:
     else:
         summary_lines.append("No pending proactive notes.")
 
-    surfaced = bool(important)
+    surfaced = bool(important or regime_alerts)
     status = "surfaced" if surfaced else "HEARTBEAT_OK"
     if notes:
         _mark_proactive_notes([str(note["note_id"]) for note in notes], "surfaced" if surfaced else "swallowed")
@@ -2858,6 +3249,7 @@ def _run_heartbeat() -> Dict[str, Any]:
         "heartbeat_loaded": bool(heartbeat_doc),
         "notes_seen": len(notes),
         "notes_surfaced": len(important),
+        "regimes_observed": len(regime_items),
         "summary": "\n".join(summary_lines).strip(),
     }
     state.last_heartbeat_result = result
@@ -5059,6 +5451,7 @@ def load_models():
 
     state.start_time = time.time()
     state.workspace_prompts = _load_workspace_prompt_files()
+    state.lysara_risk_config = _parse_risk_config((state.workspace_prompts or {}).get("risk", ""))
     try:
         init_connection_pool()
         logger.info("Supabase pooled connections ready")
@@ -5627,6 +6020,8 @@ def build_system_prompt(
     work_sessions_summary = user_ctx.get("work_sessions_summary") or {}
     outreach_summary = user_ctx.get("outreach_summary") or {}
     lysara_status = user_ctx.get("lysara_status") or {}
+    lysara_risk = user_ctx.get("lysara_risk") or {}
+    lysara_performance = user_ctx.get("lysara_performance") or {}
     heartbeat_result = user_ctx.get("last_heartbeat_result") or {}
     tool_blocks = {
         "web_search": "You have access to web search. Use it when current information would improve your response.",
@@ -5660,6 +6055,10 @@ def build_system_prompt(
             )
         if tool == "lysara" and lysara_status:
             base_lines.append(f"Lysara status snapshot: {json.dumps(lysara_status)[:1800]}")
+            if lysara_risk:
+                base_lines.append(f"Lysara risk policy: {json.dumps(lysara_risk)[:1200]}")
+            if lysara_performance:
+                base_lines.append(f"Lysara performance snapshot: {json.dumps(lysara_performance)[:1200]}")
             base_lines.append(
                 "Financial operator policy: for current market-moving decisions, gather current source-backed information via web search before submitting any trade intent. "
                 "Only use approved Lysara mutation tools for risk, strategy controls, pause/resume, and trade intents."
@@ -6299,6 +6698,7 @@ class ProactiveNoteCreateRequest(BaseModel):
     dedupe_key: Optional[str] = None
     session_id: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
+    requires_approval: bool = False
 
 
 class RuntimeHookCreateRequest(BaseModel):
@@ -6316,6 +6716,25 @@ class RuntimeHookUpdateRequest(BaseModel):
     session_mode: Optional[str] = None
     action_kind: Optional[str] = None
     action_payload: Optional[Dict[str, Any]] = None
+
+
+class ProactiveNoteApprovalRequest(BaseModel):
+    approved: bool
+    actor: str = "operator"
+    reason: str = ""
+
+
+class LysaraTradeCloseRequest(BaseModel):
+    market: str
+    symbol: str
+    pnl: float
+    pnl_pct: Optional[float] = None
+    trade_id: Optional[str] = None
+    strategy_name: Optional[str] = None
+    sector: Optional[str] = None
+    regime_label: Optional[str] = None
+    closed_at: Optional[str] = None
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
 class EmailDraftBatchSendRequest(BaseModel):
@@ -6976,9 +7395,28 @@ async def create_proactive_note(payload: ProactiveNoteCreateRequest):
         dedupe_key=payload.dedupe_key,
         announce_policy=_normalized_announce_policy(payload.announce_policy),
         metadata=payload.metadata or {},
+        requires_approval=bool(payload.requires_approval),
     )
     if not note:
         raise HTTPException(status_code=500, detail="Failed to create proactive note")
+    return JSONResponse(content={"note": note})
+
+
+@sessions_router.post("/proactive/notes/{note_id}/approval")
+async def update_proactive_note_approval(note_id: str, payload: ProactiveNoteApprovalRequest):
+    note = _set_proactive_note_approval(
+        note_id=note_id,
+        approved=bool(payload.approved),
+        actor=(payload.actor or "operator").strip() or "operator",
+        reason=(payload.reason or "").strip(),
+    )
+    if not note:
+        raise HTTPException(status_code=404, detail="Proactive note not found")
+    if payload.approved:
+        trade_payload = ((note.get("metadata") or {}).get("trade_payload") or {})
+        if trade_payload:
+            execution = _submit_lysara_trade_intent_with_policy(trade_payload, allow_approval_bypass=True)
+            return JSONResponse(content={"note": note, "execution": execution})
     return JSONResponse(content={"note": note})
 
 
@@ -8271,6 +8709,58 @@ def _lysara_proxy(callable_name: str, *args, **kwargs) -> Dict[str, Any]:
         raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
 
 
+def _submit_lysara_trade_intent_with_policy(payload: Dict[str, Any], allow_approval_bypass: bool = False) -> Dict[str, Any]:
+    client = _lysara_client_or_503()
+    trade_payload = {
+        "market": str(payload.get("market") or "").strip().lower(),
+        "symbol": str(payload.get("symbol") or "").strip().upper(),
+        "side": str(payload.get("side") or "").strip().lower(),
+        "thesis": str(payload.get("thesis") or "").strip(),
+        "confidence": float(payload.get("confidence") or 0.0),
+        "size_hint": payload.get("size_hint"),
+        "time_horizon": str(payload.get("time_horizon") or "intraday"),
+        "source": str(payload.get("source") or "vessel_api"),
+        "actor": str(payload.get("actor") or "operator"),
+        "dedupe_nonce": payload.get("dedupe_nonce"),
+    }
+    if not all([trade_payload["market"], trade_payload["symbol"], trade_payload["side"], trade_payload["thesis"]]):
+        raise HTTPException(status_code=400, detail="market, symbol, side, and thesis are required")
+
+    risk = _evaluate_trade_risk(trade_payload)
+    if risk["requires_approval"] and not allow_approval_bypass:
+        title = f"Trade approval required for {trade_payload['symbol']} {trade_payload['side']}"
+        body = "; ".join(risk["reasons"]) or "Trade exceeds configured policy thresholds."
+        note = _enqueue_proactive_note(
+            source="lysara_trade_intent",
+            title=title,
+            body=body,
+            severity="warning",
+            announce_policy="always",
+            requires_approval=True,
+            dedupe_key=f"trade-approval:{trade_payload['market']}:{trade_payload['symbol']}:{trade_payload['side']}:{hashlib.sha1(json.dumps(trade_payload, sort_keys=True).encode('utf-8')).hexdigest()[:12]}",
+            metadata={"trade_payload": trade_payload, "risk": risk},
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=12),
+        )
+        _fire_runtime_hooks(HOOK_EVENT_TRADE_APPROVAL_REQUIRED, {"note": note, "trade_payload": trade_payload, "risk": risk})
+        return {
+            "status": "approval_required",
+            "requires_approval": True,
+            "risk": risk,
+            "approval_note": note,
+        }
+
+    try:
+        execution = client.submit_trade_intent(trade_payload)
+    except LysaraOpsError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+    return {
+        "status": str(execution.get("status") or "submitted"),
+        "requires_approval": False,
+        "risk": risk,
+        "execution": execution,
+    }
+
+
 def _lysara_research_summary(query: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     results = ((payload or {}).get("results") or [])[:4]
     titles = [str(item.get("title") or "").strip() for item in results if str(item.get("title") or "").strip()]
@@ -8336,7 +8826,7 @@ async def _run_lysara_operator_cycle() -> None:
             }
             if bool(os.getenv("LYSARA_AUTONOMOUS_ENABLED", "false").strip().lower() == "true") and research["confidence"] >= 0.6:
                 side = "buy" if len(research["bullish_factors"]) >= len(research["bearish_factors"]) else "sell"
-                execution = client.submit_trade_intent(
+                execution = _submit_lysara_trade_intent_with_policy(
                     {
                         "actor": "sylana",
                         "source": "autonomous_monitor",
@@ -8402,6 +8892,55 @@ async def lysara_journal(limit: int = 50):
     return JSONResponse(content=_lysara_proxy("get_journal", limit))
 
 
+@lysara_router.get("/risk-policy")
+async def lysara_risk_policy():
+    state.workspace_prompts = _load_workspace_prompt_files()
+    state.lysara_risk_config = _parse_risk_config((state.workspace_prompts or {}).get("risk", ""))
+    return JSONResponse(content={"risk_policy": state.lysara_risk_config, "source_file": "RISK.md"})
+
+
+@lysara_router.get("/performance")
+async def lysara_performance(limit: int = 100):
+    return JSONResponse(content=_get_lysara_performance_summary(limit=limit))
+
+
+@lysara_router.get("/regimes")
+async def lysara_regimes(limit: int = 25):
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT market, regime_label, volatility_score, trend_score, confidence, recommended_params, applied, observed_at
+            FROM lysara_market_regimes
+            ORDER BY observed_at DESC
+            LIMIT %s
+        """, (max(1, min(limit, 100)),))
+        rows = cur.fetchall()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to load regimes: {e}")
+    return JSONResponse(content={
+        "items": [
+            {
+                "market": r[0],
+                "regime_label": r[1],
+                "volatility_score": r[2],
+                "trend_score": r[3],
+                "confidence": r[4],
+                "recommended_params": r[5] or {},
+                "applied": bool(r[6]),
+                "observed_at": r[7].isoformat() if r[7] else None,
+            }
+            for r in rows
+        ]
+    })
+
+
+@lysara_router.post("/trade-close")
+async def lysara_trade_close(payload: LysaraTradeCloseRequest):
+    event = _record_trade_close_event(payload.dict())
+    return JSONResponse(content={"event": event, "performance": _get_lysara_performance_summary(limit=100)})
+
+
 @lysara_router.post("/pause")
 async def lysara_pause(request: Request):
     body = await request.json()
@@ -8454,7 +8993,7 @@ async def lysara_update_strategy(request: Request):
 @lysara_router.post("/trade-intents")
 async def lysara_trade_intent(request: Request):
     body = await request.json()
-    return JSONResponse(content=_lysara_proxy("submit_trade_intent", body))
+    return JSONResponse(content=_submit_lysara_trade_intent_with_policy(body))
 
 
 # ============================================================================
