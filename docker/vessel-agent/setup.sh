@@ -10,8 +10,10 @@
 # =============================================================================
 set -euo pipefail
 
-APP_DIR="/opt/sylvessel"
-AGENT_DIR="${APP_DIR}/docker/vessel-agent"
+# Resolve app dir relative to this script so the path is always correct
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+APP_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+AGENT_DIR="${SCRIPT_DIR}"
 SERVICE_NAME="vessel-agent"
 PYTHON_BIN="$(command -v python3)"
 VENV_DIR="${AGENT_DIR}/.venv"
