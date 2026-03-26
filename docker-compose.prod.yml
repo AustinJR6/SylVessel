@@ -22,6 +22,8 @@ services:
     env_file: .env
     environment:
       - PORT=8080
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       # Persist FAISS index and voice profile between deploys
       - vessel_data:/app/data
