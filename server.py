@@ -1306,6 +1306,7 @@ class SylanaState:
         self.workspace_prompts: Dict[str, str] = {}
         self.last_heartbeat_result: Dict[str, Any] = {}
         self.lysara_risk_config: Dict[str, Any] = {}
+        self.lysara_simulation_override: Optional[bool] = None
 
 
 state = SylanaState()
@@ -1919,7 +1920,23 @@ def _get_lysara_client() -> Optional[LysaraOpsClient]:
 
 
 def _lysara_simulation_enabled() -> bool:
+    if state.lysara_simulation_override is not None:
+        return bool(state.lysara_simulation_override)
     return str(os.getenv("LYSARA_SIMULATION_MODE", "false")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _lysara_simulation_mode_source() -> str:
+    return "runtime_override" if state.lysara_simulation_override is not None else "env"
+
+
+def _set_lysara_simulation_mode(enabled: bool) -> Dict[str, Any]:
+    state.lysara_simulation_override = bool(enabled)
+    return {
+        "simulation_mode": _lysara_simulation_enabled(),
+        "source": _lysara_simulation_mode_source(),
+        "autonomous_enabled": bool(os.getenv("LYSARA_AUTONOMOUS_ENABLED", "false").strip().lower() == "true"),
+        "live_autonomous_trading_enabled": bool(state.lysara_risk_config.get("live_autonomous_trading_enabled")),
+    }
 
 
 def _lysara_mutation_names() -> set[str]:
@@ -7200,6 +7217,11 @@ class LysaraTradeCloseRequest(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
+class LysaraRuntimeModeUpdateRequest(BaseModel):
+    simulation_mode: bool
+    actor: str = "operator"
+
+
 class EmailDraftBatchSendRequest(BaseModel):
     draft_ids: List[str] = Field(default_factory=list)
     limit: int = 20
@@ -9485,10 +9507,18 @@ async def lysara_runtime_mode():
     return JSONResponse(
         content={
             "simulation_mode": _lysara_simulation_enabled(),
+            "source": _lysara_simulation_mode_source(),
             "autonomous_enabled": bool(os.getenv("LYSARA_AUTONOMOUS_ENABLED", "false").strip().lower() == "true"),
             "live_autonomous_trading_enabled": bool(state.lysara_risk_config.get("live_autonomous_trading_enabled")),
         }
     )
+
+
+@lysara_router.post("/runtime-mode")
+async def lysara_runtime_mode_update(payload: LysaraRuntimeModeUpdateRequest):
+    updated = _set_lysara_simulation_mode(payload.simulation_mode)
+    logger.info("Lysara simulation mode set to %s by %s", updated["simulation_mode"], payload.actor)
+    return JSONResponse(content={**updated, "actor": payload.actor})
 
 
 @lysara_router.get("/performance")
