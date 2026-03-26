@@ -1918,6 +1918,34 @@ def _get_lysara_client() -> Optional[LysaraOpsClient]:
     return state.lysara_client
 
 
+def _lysara_simulation_enabled() -> bool:
+    return str(os.getenv("LYSARA_SIMULATION_MODE", "false")).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _lysara_mutation_names() -> set[str]:
+    return {
+        "pause_trading",
+        "resume_trading",
+        "adjust_risk",
+        "update_strategy_params",
+        "submit_trade_intent",
+        "record_research",
+        "record_journal",
+        "acknowledge_incident",
+        "resolve_incident",
+    }
+
+
+def _simulated_lysara_response(action: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    return {
+        "status": "simulated",
+        "simulated": True,
+        "action": action,
+        "payload": payload or {},
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 def _get_lysara_status_snapshot() -> Dict[str, Any]:
     client = _get_lysara_client()
     if client is None:
@@ -1925,7 +1953,7 @@ def _get_lysara_status_snapshot() -> Dict[str, Any]:
     try:
         payload = client.get_status()
         state.lysara_last_status = payload
-        return {"available": True, **payload}
+        return {"available": True, "simulation_mode": _lysara_simulation_enabled(), **payload}
     except LysaraOpsError as exc:
         return {"available": False, "error": exc.message, "status_code": exc.status_code}
 
@@ -3305,6 +3333,7 @@ def _autonomous_guard_status(symbol: str = "", market: str = "", side: str = "")
             reasons.append("loss_streak_cooldown_active")
     return {
         "ok": not reasons,
+        "simulation_mode": _lysara_simulation_enabled(),
         "reasons": reasons,
         "portfolio_value": round(portfolio_value, 2),
         "peak_portfolio_value": round(peak_value, 2),
@@ -9141,6 +9170,13 @@ def _lysara_client_or_503() -> LysaraOpsClient:
 
 def _lysara_proxy(callable_name: str, *args, **kwargs) -> Dict[str, Any]:
     client = _lysara_client_or_503()
+    if callable_name in _lysara_mutation_names() and _lysara_simulation_enabled():
+        payload: Dict[str, Any] = {}
+        if args:
+            payload["args"] = list(args)
+        if kwargs:
+            payload["kwargs"] = kwargs
+        return _simulated_lysara_response(callable_name, payload)
     try:
         fn = getattr(client, callable_name)
         payload = fn(*args, **kwargs)
@@ -9230,6 +9266,27 @@ def _submit_lysara_trade_intent_with_policy(
             "stale_reason": stale_reason,
         }
 
+    if _lysara_simulation_enabled():
+        execution = _simulated_lysara_response(
+            "submit_trade_intent",
+            {
+                "trade_payload": trade_payload,
+                "risk": risk,
+                "approval_note_id": approval_note_id,
+                "autonomous": autonomous,
+            },
+        )
+        execution["status"] = "would_execute"
+        if approval_note_id:
+            _update_proactive_note_execution(approval_note_id, "submitted")
+        return {
+            "status": "would_execute",
+            "requires_approval": False,
+            "risk": risk,
+            "execution": execution,
+            "simulated": True,
+        }
+
     try:
         execution = client.submit_trade_intent(trade_payload)
     except LysaraOpsError as exc:
@@ -9270,6 +9327,26 @@ def _lysara_research_summary(query: str, payload: Dict[str, Any]) -> Dict[str, A
     }
 
 
+def _lysara_record_research(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if _lysara_simulation_enabled():
+        return _simulated_lysara_response("record_research", payload)
+    client = _lysara_client_or_503()
+    try:
+        return client.record_research(payload)
+    except LysaraOpsError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+
+
+def _lysara_record_journal(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if _lysara_simulation_enabled():
+        return _simulated_lysara_response("record_journal", payload)
+    client = _lysara_client_or_503()
+    try:
+        return client.record_journal(payload)
+    except LysaraOpsError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+
+
 async def _run_lysara_operator_cycle() -> None:
     client = _get_lysara_client()
     if client is None:
@@ -9279,7 +9356,7 @@ async def _run_lysara_operator_cycle() -> None:
         state.lysara_last_status = status
         guard = _autonomous_guard_status()
         if not guard["ok"]:
-            client.record_journal(
+            _lysara_record_journal(
                 {
                     "mode": "autonomous",
                     "action": "autonomous_blocked",
@@ -9299,7 +9376,7 @@ async def _run_lysara_operator_cycle() -> None:
             query = f"{symbol} latest market news trend"
             search_payload = await asyncio.to_thread(_run_web_search, query, 4)
             research = _lysara_research_summary(query, search_payload)
-            client.record_research(
+            _lysara_record_research(
                 {
                     "actor": "sylana",
                     "market": "crypto" if "-" in symbol else "stocks",
@@ -9340,7 +9417,7 @@ async def _run_lysara_operator_cycle() -> None:
                 journal_payload["action"] = "submit_trade_intent"
                 journal_payload["status"] = str(execution.get("status") or "submitted")
                 journal_payload["details"]["execution"] = execution
-            client.record_journal(journal_payload)
+            _lysara_record_journal(journal_payload)
     except Exception as exc:
         logger.warning("Lysara operator cycle failed: %s", exc)
 
@@ -9395,12 +9472,23 @@ async def lysara_journal(limit: int = 50):
 async def lysara_risk_policy():
     state.workspace_prompts = _load_workspace_prompt_files()
     state.lysara_risk_config = _parse_risk_config((state.workspace_prompts or {}).get("risk", ""))
-    return JSONResponse(content={"risk_policy": state.lysara_risk_config, "source_file": "RISK.md"})
+    return JSONResponse(content={"risk_policy": state.lysara_risk_config, "source_file": "RISK.md", "simulation_mode": _lysara_simulation_enabled()})
 
 
 @lysara_router.get("/guard-status")
 async def lysara_guard_status(symbol: str = "", market: str = "", side: str = ""):
     return JSONResponse(content=_autonomous_guard_status(symbol=symbol.strip().upper(), market=market.strip().lower(), side=side.strip().lower()))
+
+
+@lysara_router.get("/runtime-mode")
+async def lysara_runtime_mode():
+    return JSONResponse(
+        content={
+            "simulation_mode": _lysara_simulation_enabled(),
+            "autonomous_enabled": bool(os.getenv("LYSARA_AUTONOMOUS_ENABLED", "false").strip().lower() == "true"),
+            "live_autonomous_trading_enabled": bool(state.lysara_risk_config.get("live_autonomous_trading_enabled")),
+        }
+    )
 
 
 @lysara_router.get("/performance")
