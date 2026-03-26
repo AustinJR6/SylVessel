@@ -98,6 +98,21 @@ class LysaraOpsClient:
     def get_recent_trades(self, limit: int = 20, market: Optional[str] = None) -> Dict[str, Any]:
         return self._request("GET", "/api/v1/ops/trades/recent", params={"limit": limit, "market": market}, expected={200})
 
+    def get_trade_by_id(self, trade_id: str) -> Dict[str, Any]:
+        trade_id = str(trade_id or "").strip()
+        if not trade_id:
+            raise LysaraOpsError(400, "trade_id is required")
+        try:
+            return self._request("GET", f"/api/v1/ops/trades/{trade_id}", expected={200})
+        except LysaraOpsError:
+            recent = self.get_recent_trades(limit=200)
+            rows = recent.get("trades") or recent.get("items") or []
+            for row in rows:
+                row_trade_id = str((row or {}).get("trade_id") or (row or {}).get("id") or "").strip()
+                if row_trade_id == trade_id:
+                    return row or {}
+            raise
+
     def get_market_snapshot(self, symbols: Optional[str] = None) -> Dict[str, Any]:
         return self._request("GET", "/api/v1/ops/market-snapshot", params={"symbols": symbols}, expected={200})
 

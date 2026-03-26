@@ -199,11 +199,18 @@ def _parse_risk_config(text: str) -> Dict[str, Any]:
         "max_drawdown_pct": 8.0,
         "max_sector_exposure_pct": 35.0,
         "max_single_position_pct": 20.0,
+        "max_total_gross_exposure_pct": 100.0,
         "allowed_markets": ["stocks", "crypto"],
         "auto_adjust_regime_params": False,
         "regime_volatility_warn": 2.5,
         "regime_volatility_high": 4.0,
         "requires_approval_above_notional": 1000.0,
+        "data_freshness_seconds": 180,
+        "approval_ttl_minutes": 30,
+        "duplicate_trade_window_seconds": 600,
+        "loss_streak_cooldown_trades": 3,
+        "loss_streak_cooldown_minutes": 120,
+        "live_autonomous_trading_enabled": False,
     }
     if not text:
         return cfg
@@ -2627,6 +2634,9 @@ def ensure_proactive_runtime_tables():
                 approved_by TEXT,
                 approved_at TIMESTAMPTZ,
                 approval_reason TEXT,
+                execution_status TEXT NOT NULL DEFAULT 'not_executed',
+                executed_at TIMESTAMPTZ,
+                stale_reason TEXT,
                 metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
                 visible_after TIMESTAMPTZ,
                 expires_at TIMESTAMPTZ,
@@ -2656,9 +2666,14 @@ def ensure_proactive_runtime_tables():
                 strategy_name TEXT,
                 sector TEXT,
                 regime_label TEXT,
+                entry_price REAL,
+                exit_price REAL,
+                quantity REAL,
+                fees REAL,
                 pnl REAL NOT NULL DEFAULT 0,
                 pnl_pct REAL,
                 win BOOLEAN,
+                reconciled_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 closed_at TIMESTAMPTZ NOT NULL,
                 metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -2684,11 +2699,20 @@ def ensure_proactive_runtime_tables():
         cur.execute("ALTER TABLE proactive_notes ADD COLUMN IF NOT EXISTS approved_by TEXT")
         cur.execute("ALTER TABLE proactive_notes ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ")
         cur.execute("ALTER TABLE proactive_notes ADD COLUMN IF NOT EXISTS approval_reason TEXT")
+        cur.execute("ALTER TABLE proactive_notes ADD COLUMN IF NOT EXISTS execution_status TEXT NOT NULL DEFAULT 'not_executed'")
+        cur.execute("ALTER TABLE proactive_notes ADD COLUMN IF NOT EXISTS executed_at TIMESTAMPTZ")
+        cur.execute("ALTER TABLE proactive_notes ADD COLUMN IF NOT EXISTS stale_reason TEXT")
+        cur.execute("ALTER TABLE lysara_trade_performance ADD COLUMN IF NOT EXISTS entry_price REAL")
+        cur.execute("ALTER TABLE lysara_trade_performance ADD COLUMN IF NOT EXISTS exit_price REAL")
+        cur.execute("ALTER TABLE lysara_trade_performance ADD COLUMN IF NOT EXISTS quantity REAL")
+        cur.execute("ALTER TABLE lysara_trade_performance ADD COLUMN IF NOT EXISTS fees REAL")
+        cur.execute("ALTER TABLE lysara_trade_performance ADD COLUMN IF NOT EXISTS reconciled_at TIMESTAMPTZ NOT NULL DEFAULT NOW()")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_proactive_notes_status_visible ON proactive_notes(status, created_at DESC)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_runtime_hooks_event_enabled ON runtime_hooks(event_name, enabled)")
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_proactive_notes_dedupe_pending ON proactive_notes(dedupe_key) WHERE dedupe_key IS NOT NULL AND status = 'pending'")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_lysara_trade_performance_closed_at ON lysara_trade_performance(closed_at DESC)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_lysara_market_regimes_market_obs ON lysara_market_regimes(market, observed_at DESC)")
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_lysara_trade_performance_trade_id_unique ON lysara_trade_performance(trade_id) WHERE trade_id IS NOT NULL")
         conn.commit()
     except Exception as e:
         _safe_rollback(conn, "ensure_proactive_runtime_tables")
@@ -2745,11 +2769,14 @@ def _serialize_proactive_note_row(row: Any) -> Dict[str, Any]:
         "approved_by": row[12],
         "approved_at": row[13].isoformat() if row[13] else None,
         "approval_reason": row[14],
-        "metadata": row[15] or {},
-        "visible_after": row[16].isoformat() if row[16] else None,
-        "expires_at": row[17].isoformat() if row[17] else None,
-        "processed_at": row[18].isoformat() if row[18] else None,
-        "created_at": row[19].isoformat() if row[19] else None,
+        "execution_status": row[15] or "not_executed",
+        "executed_at": row[16].isoformat() if row[16] else None,
+        "stale_reason": row[17],
+        "metadata": row[18] or {},
+        "visible_after": row[19].isoformat() if row[19] else None,
+        "expires_at": row[20].isoformat() if row[20] else None,
+        "processed_at": row[21].isoformat() if row[21] else None,
+        "created_at": row[22].isoformat() if row[22] else None,
     }
 
 
@@ -2787,7 +2814,7 @@ def _list_proactive_notes(limit: int = 50, status: Optional[str] = None) -> List
         cur.execute(f"""
             SELECT note_id, source, source_id, session_id, title, body, severity, status, dedupe_key,
                    announce_policy, requires_approval, approval_status, approved_by, approved_at, approval_reason,
-                   metadata, visible_after, expires_at, processed_at, created_at
+                   execution_status, executed_at, stale_reason, metadata, visible_after, expires_at, processed_at, created_at
             FROM proactive_notes
             {where}
             ORDER BY created_at DESC
@@ -2832,7 +2859,7 @@ def _enqueue_proactive_note(
             ON CONFLICT DO NOTHING
             RETURNING note_id, source, source_id, session_id, title, body, severity, status, dedupe_key,
                       announce_policy, requires_approval, approval_status, approved_by, approved_at, approval_reason,
-                      metadata, visible_after, expires_at, processed_at, created_at
+                      execution_status, executed_at, stale_reason, metadata, visible_after, expires_at, processed_at, created_at
         """, (
             source,
             source_id,
@@ -2867,7 +2894,7 @@ def _get_due_proactive_notes(limit: int = 20) -> List[Dict[str, Any]]:
         cur.execute("""
             SELECT note_id, source, source_id, session_id, title, body, severity, status, dedupe_key,
                    announce_policy, requires_approval, approval_status, approved_by, approved_at, approval_reason,
-                   metadata, visible_after, expires_at, processed_at, created_at
+                   execution_status, executed_at, stale_reason, metadata, visible_after, expires_at, processed_at, created_at
             FROM proactive_notes
             WHERE status = 'pending'
               AND (visible_after IS NULL OR visible_after <= NOW())
@@ -2914,7 +2941,7 @@ def _set_proactive_note_approval(note_id: str, approved: bool, actor: str, reaso
             WHERE note_id = %s::uuid
             RETURNING note_id, source, source_id, session_id, title, body, severity, status, dedupe_key,
                       announce_policy, requires_approval, approval_status, approved_by, approved_at, approval_reason,
-                      metadata, visible_after, expires_at, processed_at, created_at
+                      execution_status, executed_at, stale_reason, metadata, visible_after, expires_at, processed_at, created_at
         """, (next_status, actor, reason, next_note_status, note_id))
         row = cur.fetchone()
         conn.commit()
@@ -2922,6 +2949,53 @@ def _set_proactive_note_approval(note_id: str, approved: bool, actor: str, reaso
     except Exception as e:
         _safe_rollback(conn, "_set_proactive_note_approval")
         logger.warning("Failed to update proactive note approval: %s", e)
+        return None
+
+
+def _get_proactive_note(note_id: str) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT note_id, source, source_id, session_id, title, body, severity, status, dedupe_key,
+                   announce_policy, requires_approval, approval_status, approved_by, approved_at, approval_reason,
+                   execution_status, executed_at, stale_reason, metadata, visible_after, expires_at, processed_at, created_at
+            FROM proactive_notes
+            WHERE note_id = %s::uuid
+            LIMIT 1
+        """, (note_id,))
+        row = cur.fetchone()
+        return _serialize_proactive_note_row(row) if row else None
+    except Exception as e:
+        logger.warning("Failed to fetch proactive note: %s", e)
+        return None
+
+
+def _update_proactive_note_execution(note_id: str, execution_status: str, *, stale_reason: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            UPDATE proactive_notes
+            SET execution_status = %s,
+                executed_at = CASE WHEN %s IN ('executed', 'submitted') THEN NOW() ELSE executed_at END,
+                stale_reason = COALESCE(%s, stale_reason),
+                status = CASE
+                    WHEN %s IN ('executed', 'submitted') THEN 'surfaced'
+                    WHEN %s IN ('stale', 'blocked') THEN 'rejected'
+                    ELSE status
+                END
+            WHERE note_id = %s::uuid
+            RETURNING note_id, source, source_id, session_id, title, body, severity, status, dedupe_key,
+                      announce_policy, requires_approval, approval_status, approved_by, approved_at, approval_reason,
+                      execution_status, executed_at, stale_reason, metadata, visible_after, expires_at, processed_at, created_at
+        """, (execution_status, execution_status, stale_reason, execution_status, execution_status, note_id))
+        row = cur.fetchone()
+        conn.commit()
+        return _serialize_proactive_note_row(row) if row else None
+    except Exception as e:
+        _safe_rollback(conn, "_update_proactive_note_execution")
+        logger.warning("Failed to update proactive note execution: %s", e)
         return None
 
 
@@ -2940,6 +3014,200 @@ def _extract_portfolio_notional(portfolio: Dict[str, Any]) -> float:
         except Exception:
             continue
     return 0.0
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _extract_position_notional(row: Dict[str, Any]) -> float:
+    candidates = [
+        row.get("notional"),
+        row.get("market_value"),
+        row.get("position_value"),
+        row.get("current_value"),
+        row.get("value"),
+    ]
+    for candidate in candidates:
+        value = _safe_float(candidate, default=float("nan"))
+        if value == value:
+            return abs(value)
+    qty = abs(_safe_float(row.get("quantity") or row.get("qty") or row.get("size"), 0.0))
+    price = _safe_float(row.get("mark_price") or row.get("current_price") or row.get("price"), 0.0)
+    return abs(qty * price)
+
+
+def _extract_timestamp(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        normalized = text.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(normalized)
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def _latest_status_timestamp(status: Dict[str, Any]) -> Optional[datetime]:
+    keys = [
+        "updated_at",
+        "timestamp",
+        "as_of",
+        "fetched_at",
+    ]
+    for key in keys:
+        dt = _extract_timestamp(status.get(key))
+        if dt:
+            return dt
+    for section_key in ["summary", "health", "data"]:
+        section = status.get(section_key)
+        if isinstance(section, dict):
+            for key in keys:
+                dt = _extract_timestamp(section.get(key))
+                if dt:
+                    return dt
+    return None
+
+
+def _is_trading_paused(status: Dict[str, Any]) -> bool:
+    if not isinstance(status, dict):
+        return False
+    candidates = [
+        status.get("paused"),
+        status.get("trading_paused"),
+        (status.get("summary") or {}).get("paused") if isinstance(status.get("summary"), dict) else None,
+        (status.get("controls") or {}).get("paused") if isinstance(status.get("controls"), dict) else None,
+    ]
+    return any(bool(c) for c in candidates)
+
+
+def _has_critical_incidents(client: Optional[LysaraOpsClient]) -> bool:
+    if client is None:
+        return False
+    try:
+        incidents = client.get_incidents(status="open", limit=50)
+    except Exception:
+        return False
+    rows = incidents.get("incidents") or incidents.get("items") or []
+    for row in rows:
+        severity = str((row or {}).get("severity") or "").strip().lower()
+        if severity == "critical":
+            return True
+    return False
+
+
+def _sum_realized_pnl_today() -> float:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT COALESCE(SUM(pnl), 0)
+            FROM lysara_trade_performance
+            WHERE closed_at >= date_trunc('day', NOW())
+        """)
+        row = cur.fetchone()
+        return _safe_float((row or [0])[0], 0.0)
+    except Exception:
+        return 0.0
+
+
+def _current_loss_streak() -> int:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT pnl
+            FROM lysara_trade_performance
+            ORDER BY closed_at DESC
+            LIMIT 20
+        """)
+        streak = 0
+        for row in cur.fetchall():
+            pnl = _safe_float((row or [0])[0], 0.0)
+            if pnl < 0:
+                streak += 1
+            else:
+                break
+        return streak
+    except Exception:
+        return 0
+
+
+def _last_closed_trade_at() -> Optional[datetime]:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT closed_at FROM lysara_trade_performance ORDER BY closed_at DESC LIMIT 1")
+        row = cur.fetchone()
+        return row[0] if row and row[0] else None
+    except Exception:
+        return None
+
+
+def _peak_portfolio_value() -> float:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT jsonb_extract_path_text(metadata, 'portfolio_snapshot', 'portfolio_value') AS payload
+            FROM lysara_trade_performance
+            UNION ALL
+            SELECT jsonb_extract_path_text(metadata, 'portfolio_snapshot', 'portfolio_value') AS payload
+            FROM proactive_notes
+        """)
+        values = [_safe_float((row or [0])[0], 0.0) for row in cur.fetchall()]
+        return max(values) if values else 0.0
+    except Exception:
+        return 0.0
+
+
+def _has_pending_trade_approval(symbol: str, market: str) -> bool:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT 1
+            FROM proactive_notes
+            WHERE requires_approval = TRUE
+              AND approval_status = 'pending_approval'
+              AND COALESCE(metadata->'trade_payload'->>'symbol', '') = %s
+              AND COALESCE(metadata->'trade_payload'->>'market', '') = %s
+              AND (expires_at IS NULL OR expires_at > NOW())
+            LIMIT 1
+        """, (symbol, market))
+        return cur.fetchone() is not None
+    except Exception:
+        return False
+
+
+def _is_duplicate_trade_intent(symbol: str, market: str, side: str, window_seconds: int) -> bool:
+    client = _get_lysara_client()
+    if client is None:
+        return False
+    try:
+        recent = client.get_recent_trades(limit=50, market=market)
+    except Exception:
+        return False
+    rows = recent.get("trades") or recent.get("items") or []
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=max(1, int(window_seconds)))
+    for row in rows:
+        row = row or {}
+        row_symbol = str(row.get("symbol") or "").strip().upper()
+        row_side = str(row.get("side") or "").strip().lower()
+        opened_at = _extract_timestamp(row.get("created_at") or row.get("opened_at") or row.get("timestamp"))
+        if row_symbol == symbol and row_side == side and opened_at and opened_at >= cutoff:
+            return True
+    return False
 
 
 def _infer_market_sector(symbol: str, market: str) -> str:
@@ -2966,6 +3234,89 @@ def _estimate_trade_notional(payload: Dict[str, Any], portfolio: Dict[str, Any])
     return 0.0
 
 
+def _projected_exposure_summary(payload: Dict[str, Any], portfolio: Dict[str, Any], positions: Dict[str, Any]) -> Dict[str, Any]:
+    market = str(payload.get("market") or "").strip().lower()
+    symbol = str(payload.get("symbol") or "").strip().upper()
+    sector = _infer_market_sector(symbol, market)
+    rows = []
+    if isinstance(positions, dict):
+        rows = positions.get("positions") or positions.get("items") or []
+    portfolio_value = _extract_portfolio_notional(portfolio)
+    total_existing = sum(_extract_position_notional(row or {}) for row in rows)
+    trade_notional = _estimate_trade_notional(payload, portfolio)
+    symbol_existing = 0.0
+    sector_existing = 0.0
+    for row in rows:
+        row = row or {}
+        row_symbol = str(row.get("symbol") or "").strip().upper()
+        row_sector = _infer_market_sector(row_symbol, market)
+        row_notional = _extract_position_notional(row)
+        if row_symbol == symbol:
+            symbol_existing += row_notional
+        if row_sector == sector:
+            sector_existing += row_notional
+    denom = portfolio_value if portfolio_value > 0 else max(total_existing + trade_notional, 1.0)
+    return {
+        "portfolio_value": round(portfolio_value, 2),
+        "total_gross_exposure_pct": round(((total_existing + trade_notional) / denom) * 100.0, 4),
+        "single_position_pct": round(((symbol_existing + trade_notional) / denom) * 100.0, 4),
+        "sector_exposure_pct": round(((sector_existing + trade_notional) / denom) * 100.0, 4),
+        "estimated_notional": round(trade_notional, 2),
+        "sector": sector,
+    }
+
+
+def _autonomous_guard_status(symbol: str = "", market: str = "", side: str = "") -> Dict[str, Any]:
+    cfg = state.lysara_risk_config or {}
+    client = _get_lysara_client()
+    reasons: List[str] = []
+    status = client.get_status() if client is not None else {}
+    portfolio = client.get_portfolio() if client is not None else {}
+    portfolio_value = _extract_portfolio_notional(portfolio)
+    latest_status_ts = _latest_status_timestamp(status)
+    if _is_trading_paused(status):
+        reasons.append("trading_paused")
+    if _has_critical_incidents(client):
+        reasons.append("critical_incident_open")
+    if latest_status_ts is None or (datetime.now(timezone.utc) - latest_status_ts).total_seconds() > int(cfg.get("data_freshness_seconds") or 180):
+        reasons.append("status_data_stale")
+    peak_value = _peak_portfolio_value()
+    if peak_value > 0 and portfolio_value > 0:
+        drawdown_pct = max(0.0, ((peak_value - portfolio_value) / peak_value) * 100.0)
+        if drawdown_pct > float(cfg.get("max_drawdown_pct") or 100.0):
+            reasons.append("max_drawdown_exceeded")
+    daily_loss_pct = 0.0
+    realized_today = _sum_realized_pnl_today()
+    if portfolio_value > 0 and realized_today < 0:
+        daily_loss_pct = abs(realized_today) / portfolio_value * 100.0
+        if daily_loss_pct > float(cfg.get("max_daily_loss_pct") or 100.0):
+            reasons.append("max_daily_loss_exceeded")
+    if symbol and market and _has_pending_trade_approval(symbol, market):
+        reasons.append("pending_approval_same_symbol")
+    if symbol and market and side and _is_duplicate_trade_intent(symbol, market, side, int(cfg.get("duplicate_trade_window_seconds") or 600)):
+        reasons.append("duplicate_trade_window_active")
+    streak = _current_loss_streak()
+    cooldown_trades = int(cfg.get("loss_streak_cooldown_trades") or 9999)
+    cooldown_minutes = int(cfg.get("loss_streak_cooldown_minutes") or 0)
+    last_closed_at = _last_closed_trade_at()
+    if streak >= cooldown_trades and last_closed_at:
+        age_minutes = (datetime.now(timezone.utc) - last_closed_at).total_seconds() / 60.0
+        if age_minutes < max(0, cooldown_minutes):
+            reasons.append("loss_streak_cooldown_active")
+    return {
+        "ok": not reasons,
+        "reasons": reasons,
+        "portfolio_value": round(portfolio_value, 2),
+        "peak_portfolio_value": round(peak_value, 2),
+        "daily_realized_pnl": round(realized_today, 2),
+        "daily_loss_pct": round(daily_loss_pct, 4),
+        "loss_streak": streak,
+        "last_closed_trade_at": last_closed_at.isoformat() if last_closed_at else None,
+        "status_timestamp": latest_status_ts.isoformat() if latest_status_ts else None,
+        "status_snapshot": status,
+    }
+
+
 def _evaluate_trade_risk(payload: Dict[str, Any]) -> Dict[str, Any]:
     cfg = state.lysara_risk_config or {}
     client = _get_lysara_client()
@@ -2974,17 +3325,12 @@ def _evaluate_trade_risk(payload: Dict[str, Any]) -> Dict[str, Any]:
     market = str(payload.get("market") or "").strip().lower()
     symbol = str(payload.get("symbol") or "").strip().upper()
     confidence = float(payload.get("confidence") or 0.0)
-    notional = _estimate_trade_notional(payload, portfolio)
     side = str(payload.get("side") or "").strip().lower()
     reasons: List[str] = []
 
     allowed_markets = [str(x).strip().lower() for x in (cfg.get("allowed_markets") or [])]
     if allowed_markets and market and market not in allowed_markets:
         reasons.append(f"market {market} not allowed by risk policy")
-
-    auto_approve_threshold = float(cfg.get("requires_approval_above_notional") or cfg.get("max_notional_auto_approve") or 0.0)
-    if auto_approve_threshold > 0 and notional > auto_approve_threshold:
-        reasons.append(f"estimated notional {round(notional, 2)} exceeds auto-approval limit {round(auto_approve_threshold, 2)}")
 
     max_size_hint = float(cfg.get("max_size_hint_auto_approve") or 0.0)
     try:
@@ -2997,53 +3343,135 @@ def _evaluate_trade_risk(payload: Dict[str, Any]) -> Dict[str, Any]:
     if confidence > float(cfg.get("max_confidence_auto_execute") or 0.95):
         reasons.append(f"confidence {confidence} exceeds auto-execution cap")
 
-    positions_rows = []
-    if isinstance(positions, dict):
-        positions_rows = positions.get("positions") or positions.get("items") or []
-    sector = _infer_market_sector(symbol, market)
-    sector_count = sum(1 for row in positions_rows if _infer_market_sector(str((row or {}).get("symbol") or ""), market) == sector)
-    if positions_rows and sector_count / max(1, len(positions_rows)) * 100.0 > float(cfg.get("max_sector_exposure_pct") or 100.0):
-        reasons.append(f"sector exposure for {sector} exceeds configured limit")
+    exposure = _projected_exposure_summary(payload, portfolio, positions)
+    auto_approve_threshold = float(cfg.get("requires_approval_above_notional") or cfg.get("max_notional_auto_approve") or 0.0)
+    if auto_approve_threshold > 0 and exposure["estimated_notional"] > auto_approve_threshold:
+        reasons.append(
+            f"estimated notional {exposure['estimated_notional']} exceeds auto-approval limit {round(auto_approve_threshold, 2)}"
+        )
+    if exposure["single_position_pct"] > float(cfg.get("max_single_position_pct") or 100.0):
+        reasons.append(f"projected single-position exposure {exposure['single_position_pct']}% exceeds limit")
+    if exposure["sector_exposure_pct"] > float(cfg.get("max_sector_exposure_pct") or 100.0):
+        reasons.append(f"projected sector exposure {exposure['sector_exposure_pct']}% exceeds limit")
+    if exposure["total_gross_exposure_pct"] > float(cfg.get("max_total_gross_exposure_pct") or 100.0):
+        reasons.append(f"projected gross exposure {exposure['total_gross_exposure_pct']}% exceeds limit")
+
+    guard = _autonomous_guard_status(symbol=symbol, market=market, side=side)
+    if not guard["ok"]:
+        reasons.extend([f"kill_switch:{reason}" for reason in guard["reasons"]])
 
     requires_approval = bool(reasons)
     return {
         "requires_approval": requires_approval,
         "reasons": reasons,
-        "estimated_notional": round(notional, 2),
-        "portfolio_value": round(_extract_portfolio_notional(portfolio), 2),
-        "sector": sector,
+        "estimated_notional": exposure["estimated_notional"],
+        "portfolio_value": exposure["portfolio_value"],
+        "sector": exposure["sector"],
         "market": market,
         "symbol": symbol,
         "side": side,
+        "single_position_pct": exposure["single_position_pct"],
+        "sector_exposure_pct": exposure["sector_exposure_pct"],
+        "gross_exposure_pct": exposure["total_gross_exposure_pct"],
+        "guard": guard,
     }
 
 
 def _record_trade_close_event(payload: Dict[str, Any]) -> Dict[str, Any]:
-    market = str(payload.get("market") or "").strip().lower() or "unknown"
-    symbol = str(payload.get("symbol") or "").strip().upper()
+    trade_id = str(payload.get("trade_id") or "").strip()
+    if not trade_id:
+        raise HTTPException(status_code=400, detail="trade_id is required")
+    client = _lysara_client_or_503()
+    try:
+        trade = client.get_trade_by_id(trade_id)
+    except LysaraOpsError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+
+    market = str(trade.get("market") or payload.get("market") or "").strip().lower() or "unknown"
+    symbol = str(trade.get("symbol") or payload.get("symbol") or "").strip().upper()
     if not symbol:
         raise HTTPException(status_code=400, detail="symbol is required")
-    pnl = float(payload.get("pnl") or 0.0)
-    pnl_pct = payload.get("pnl_pct")
-    pnl_pct_value = float(pnl_pct) if pnl_pct is not None else None
-    strategy_name = str(payload.get("strategy_name") or "").strip() or None
-    sector = str(payload.get("sector") or _infer_market_sector(symbol, market))
+    pnl = _safe_float(
+        trade.get("realized_pnl", trade.get("pnl", trade.get("realizedPnL", payload.get("pnl")))),
+        0.0,
+    )
+    pnl_pct_value = _safe_float(trade.get("pnl_pct", trade.get("return_pct", payload.get("pnl_pct"))), default=float("nan"))
+    if pnl_pct_value != pnl_pct_value:
+        pnl_pct_value = None
+    strategy_name = str(trade.get("strategy_name") or payload.get("strategy_name") or "").strip() or None
+    sector = str(trade.get("sector") or payload.get("sector") or _infer_market_sector(symbol, market))
     regime_label = str(payload.get("regime_label") or "").strip() or None
-    closed_at = payload.get("closed_at") or datetime.now(timezone.utc).isoformat()
+    closed_at = (
+        trade.get("closed_at")
+        or trade.get("exit_time")
+        or trade.get("timestamp")
+        or payload.get("closed_at")
+        or datetime.now(timezone.utc).isoformat()
+    )
+    entry_price = _safe_float(trade.get("entry_price") or trade.get("avg_entry_price"), default=float("nan"))
+    if entry_price != entry_price:
+        entry_price = None
+    exit_price = _safe_float(trade.get("exit_price") or trade.get("avg_exit_price"), default=float("nan"))
+    if exit_price != exit_price:
+        exit_price = None
+    quantity = _safe_float(trade.get("quantity") or trade.get("qty") or trade.get("size"), default=float("nan"))
+    if quantity != quantity:
+        quantity = None
+    fees = _safe_float(trade.get("fees") or trade.get("commission"), default=float("nan"))
+    if fees != fees:
+        fees = None
     metadata = payload.get("metadata") or {}
-    trade_id = str(payload.get("trade_id") or "").strip() or None
+    metadata = {
+        **metadata,
+        "caller_payload": payload,
+        "lysara_trade_payload": trade,
+        "portfolio_snapshot": {
+            "portfolio_value": _extract_portfolio_notional(client.get_portfolio()),
+        },
+    }
 
     conn = get_connection()
     cur = conn.cursor()
     try:
         cur.execute("""
             INSERT INTO lysara_trade_performance (
-                trade_id, market, symbol, strategy_name, sector, regime_label, pnl, pnl_pct, win, closed_at, metadata
+                trade_id, market, symbol, strategy_name, sector, regime_label,
+                entry_price, exit_price, quantity, fees, pnl, pnl_pct, win, reconciled_at, closed_at, metadata
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::timestamptz, %s::jsonb)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s::timestamptz, %s::jsonb)
+            ON CONFLICT (trade_id) DO UPDATE
+            SET market = EXCLUDED.market,
+                symbol = EXCLUDED.symbol,
+                strategy_name = EXCLUDED.strategy_name,
+                sector = EXCLUDED.sector,
+                regime_label = EXCLUDED.regime_label,
+                entry_price = EXCLUDED.entry_price,
+                exit_price = EXCLUDED.exit_price,
+                quantity = EXCLUDED.quantity,
+                fees = EXCLUDED.fees,
+                pnl = EXCLUDED.pnl,
+                pnl_pct = EXCLUDED.pnl_pct,
+                win = EXCLUDED.win,
+                reconciled_at = NOW(),
+                closed_at = EXCLUDED.closed_at,
+                metadata = EXCLUDED.metadata
             RETURNING metric_id, created_at
         """, (
-            trade_id, market, symbol, strategy_name, sector, regime_label, pnl, pnl_pct_value, pnl > 0, closed_at, json.dumps(metadata),
+            trade_id,
+            market,
+            symbol,
+            strategy_name,
+            sector,
+            regime_label,
+            entry_price,
+            exit_price,
+            quantity,
+            fees,
+            pnl,
+            pnl_pct_value,
+            pnl > 0,
+            closed_at,
+            json.dumps(metadata),
         ))
         metric_row = cur.fetchone()
         conn.commit()
@@ -3063,6 +3491,10 @@ def _record_trade_close_event(payload: Dict[str, Any]) -> Dict[str, Any]:
         "pnl": pnl,
         "pnl_pct": pnl_pct_value,
         "win": pnl > 0,
+        "entry_price": entry_price,
+        "exit_price": exit_price,
+        "quantity": quantity,
+        "fees": fees,
     }
     _fire_runtime_hooks(HOOK_EVENT_TRADE_CLOSE, {"trade_close": event})
     return event
@@ -3093,6 +3525,8 @@ def _get_lysara_performance_summary(limit: int = 100) -> Dict[str, Any]:
         "win_rate": round((wins / trade_count) if trade_count else 0.0, 4),
         "top_strategies": strategies.most_common(3),
         "top_regimes": regimes.most_common(3),
+        "daily_realized_pnl": round(_sum_realized_pnl_today(), 2),
+        "loss_streak": _current_loss_streak(),
     }
 
 
@@ -6725,11 +7159,11 @@ class ProactiveNoteApprovalRequest(BaseModel):
 
 
 class LysaraTradeCloseRequest(BaseModel):
-    market: str
-    symbol: str
-    pnl: float
+    trade_id: str
+    market: Optional[str] = None
+    symbol: Optional[str] = None
+    pnl: Optional[float] = None
     pnl_pct: Optional[float] = None
-    trade_id: Optional[str] = None
     strategy_name: Optional[str] = None
     sector: Optional[str] = None
     regime_label: Optional[str] = None
@@ -7404,6 +7838,9 @@ async def create_proactive_note(payload: ProactiveNoteCreateRequest):
 
 @sessions_router.post("/proactive/notes/{note_id}/approval")
 async def update_proactive_note_approval(note_id: str, payload: ProactiveNoteApprovalRequest):
+    existing = _get_proactive_note(note_id)
+    if not existing:
+        raise HTTPException(status_code=404, detail="Proactive note not found")
     note = _set_proactive_note_approval(
         note_id=note_id,
         approved=bool(payload.approved),
@@ -7413,10 +7850,15 @@ async def update_proactive_note_approval(note_id: str, payload: ProactiveNoteApp
     if not note:
         raise HTTPException(status_code=404, detail="Proactive note not found")
     if payload.approved:
-        trade_payload = ((note.get("metadata") or {}).get("trade_payload") or {})
+        trade_payload = ((existing.get("metadata") or {}).get("trade_payload") or {})
         if trade_payload:
-            execution = _submit_lysara_trade_intent_with_policy(trade_payload, allow_approval_bypass=True)
-            return JSONResponse(content={"note": note, "execution": execution})
+            execution = _submit_lysara_trade_intent_with_policy(
+                trade_payload,
+                allow_approval_bypass=True,
+                approval_note_id=note_id,
+            )
+            refreshed = _get_proactive_note(note_id) or note
+            return JSONResponse(content={"note": refreshed, "execution": execution})
     return JSONResponse(content={"note": note})
 
 
@@ -8709,7 +9151,13 @@ def _lysara_proxy(callable_name: str, *args, **kwargs) -> Dict[str, Any]:
         raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
 
 
-def _submit_lysara_trade_intent_with_policy(payload: Dict[str, Any], allow_approval_bypass: bool = False) -> Dict[str, Any]:
+def _submit_lysara_trade_intent_with_policy(
+    payload: Dict[str, Any],
+    allow_approval_bypass: bool = False,
+    *,
+    approval_note_id: Optional[str] = None,
+    autonomous: bool = False,
+) -> Dict[str, Any]:
     client = _lysara_client_or_503()
     trade_payload = {
         "market": str(payload.get("market") or "").strip().lower(),
@@ -8726,8 +9174,26 @@ def _submit_lysara_trade_intent_with_policy(payload: Dict[str, Any], allow_appro
     if not all([trade_payload["market"], trade_payload["symbol"], trade_payload["side"], trade_payload["thesis"]]):
         raise HTTPException(status_code=400, detail="market, symbol, side, and thesis are required")
 
+    if autonomous and not bool(state.lysara_risk_config.get("live_autonomous_trading_enabled")):
+        return {
+            "status": "autonomous_live_disabled",
+            "requires_approval": False,
+            "risk": {"requires_approval": False, "reasons": ["live_autonomous_trading_disabled"]},
+        }
+
     risk = _evaluate_trade_risk(trade_payload)
+    if approval_note_id:
+        note = _get_proactive_note(approval_note_id)
+        expires_at = _extract_timestamp((note or {}).get("expires_at"))
+        if expires_at and expires_at <= datetime.now(timezone.utc):
+            _update_proactive_note_execution(approval_note_id, "stale", stale_reason="approval_expired")
+            return {
+                "status": "approval_expired",
+                "requires_approval": True,
+                "risk": risk,
+            }
     if risk["requires_approval"] and not allow_approval_bypass:
+        approval_ttl = max(1, int(state.lysara_risk_config.get("approval_ttl_minutes") or 30))
         title = f"Trade approval required for {trade_payload['symbol']} {trade_payload['side']}"
         body = "; ".join(risk["reasons"]) or "Trade exceeds configured policy thresholds."
         note = _enqueue_proactive_note(
@@ -8738,8 +9204,13 @@ def _submit_lysara_trade_intent_with_policy(payload: Dict[str, Any], allow_appro
             announce_policy="always",
             requires_approval=True,
             dedupe_key=f"trade-approval:{trade_payload['market']}:{trade_payload['symbol']}:{trade_payload['side']}:{hashlib.sha1(json.dumps(trade_payload, sort_keys=True).encode('utf-8')).hexdigest()[:12]}",
-            metadata={"trade_payload": trade_payload, "risk": risk},
-            expires_at=datetime.now(timezone.utc) + timedelta(hours=12),
+            metadata={
+                "trade_payload": trade_payload,
+                "risk_snapshot": risk,
+                "portfolio_snapshot": {"portfolio_value": risk.get("portfolio_value")},
+                "market_snapshot": {"market": trade_payload["market"], "symbol": trade_payload["symbol"]},
+            },
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=approval_ttl),
         )
         _fire_runtime_hooks(HOOK_EVENT_TRADE_APPROVAL_REQUIRED, {"note": note, "trade_payload": trade_payload, "risk": risk})
         return {
@@ -8748,11 +9219,25 @@ def _submit_lysara_trade_intent_with_policy(payload: Dict[str, Any], allow_appro
             "risk": risk,
             "approval_note": note,
         }
+    if risk["requires_approval"] and allow_approval_bypass:
+        stale_reason = "conditions_changed_since_approval"
+        if approval_note_id:
+            _update_proactive_note_execution(approval_note_id, "stale", stale_reason=stale_reason)
+        return {
+            "status": "blocked_after_recheck",
+            "requires_approval": True,
+            "risk": risk,
+            "stale_reason": stale_reason,
+        }
 
     try:
         execution = client.submit_trade_intent(trade_payload)
     except LysaraOpsError as exc:
+        if approval_note_id:
+            _update_proactive_note_execution(approval_note_id, "blocked", stale_reason=exc.message)
         raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+    if approval_note_id:
+        _update_proactive_note_execution(approval_note_id, str(execution.get("status") or "submitted"))
     return {
         "status": str(execution.get("status") or "submitted"),
         "requires_approval": False,
@@ -8792,6 +9277,19 @@ async def _run_lysara_operator_cycle() -> None:
     try:
         status = client.get_status()
         state.lysara_last_status = status
+        guard = _autonomous_guard_status()
+        if not guard["ok"]:
+            client.record_journal(
+                {
+                    "mode": "autonomous",
+                    "action": "autonomous_blocked",
+                    "status": "blocked",
+                    "market": "all",
+                    "summary": "Autonomous trading blocked by guard",
+                    "details": {"reasons": guard["reasons"], "guard": guard},
+                }
+            )
+            return
         market_snapshot = client.get_market_snapshot()
         prices = (market_snapshot or {}).get("prices") or {}
         candidate_symbols = list(prices.keys())[:3]
@@ -8836,7 +9334,8 @@ async def _run_lysara_operator_cycle() -> None:
                         "thesis": research["summary"],
                         "confidence": research["confidence"],
                         "time_horizon": "intraday",
-                    }
+                    },
+                    autonomous=True,
                 )
                 journal_payload["action"] = "submit_trade_intent"
                 journal_payload["status"] = str(execution.get("status") or "submitted")
@@ -8897,6 +9396,11 @@ async def lysara_risk_policy():
     state.workspace_prompts = _load_workspace_prompt_files()
     state.lysara_risk_config = _parse_risk_config((state.workspace_prompts or {}).get("risk", ""))
     return JSONResponse(content={"risk_policy": state.lysara_risk_config, "source_file": "RISK.md"})
+
+
+@lysara_router.get("/guard-status")
+async def lysara_guard_status(symbol: str = "", market: str = "", side: str = ""):
+    return JSONResponse(content=_autonomous_guard_status(symbol=symbol.strip().upper(), market=market.strip().lower(), side=side.strip().lower()))
 
 
 @lysara_router.get("/performance")
