@@ -1218,6 +1218,7 @@ AVAILABLE_TOOLS: List[Dict[str, str]] = [
     {"key": "photos", "display_name": "Photos", "icon": "image", "description": "Reference tagged photo memories and moments."},
     {"key": "memories", "display_name": "Memories", "icon": "brain", "description": "Use long-term conversation memory and context."},
     {"key": "outreach", "display_name": "Outreach", "icon": "mail", "description": "Access prospecting, drafts, and outreach performance."},
+    {"key": "lysara", "display_name": "Lysara", "icon": "line-chart", "description": "Control and monitor the Lysara trading engine."},
 ]
 AVAILABLE_TOOL_KEYS = {t["key"] for t in AVAILABLE_TOOLS}
 

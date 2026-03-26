@@ -17,6 +17,7 @@ from core.memory.memory_repository import SupabaseMemoryRepository
 from core.memory.memory_types import MemoryRecord, MemoryType, RetrievalQuery
 from core.telemetry.vitals_engine import VitalsEngine
 from tools.analytics.reporting import Reporting
+from tools.lysara.lysara_tool import lysara_handler
 from tools.outreach.contact_resolver import ContactResolver
 from tools.outreach.email_generator import EmailGenerator
 from tools.outreach.lead_collector import LeadCollector
@@ -96,6 +97,7 @@ class Brain:
         registry.register("outreach", outreach_handler)
         registry.register("trading", trading_handler)
         registry.register("analytics", analytics_handler)
+        registry.register("lysara", lysara_handler)
 
         inference = InferenceEngine(mode=mode)
         return cls(
@@ -136,6 +138,21 @@ class Brain:
             return ToolRequest("trading", "open_positions", {})
         if any(k in low for k in ["report", "analytics summary", "metrics summary"]):
             return ToolRequest("analytics", "summary", {})
+
+        # Lysara Investments — Tier 2 strategic commands
+        if any(k in low for k in ["lysara online", "trading engine", "is lysara", "lysara status", "lysara health"]):
+            return ToolRequest("lysara", "health_check", {})
+        if any(k in low for k in ["trading status", "market status", "how is trading", "how are the markets", "system status"]):
+            return ToolRequest("lysara", "get_status", {})
+        if any(k in low for k in ["trading performance", "trade performance", "pnl", "profit and loss", "win rate", "how have trades"]):
+            return ToolRequest("lysara", "get_performance", {})
+        if any(k in low for k in ["recent trades", "last trades", "latest trades", "what trades", "show trades"]):
+            return ToolRequest("lysara", "get_recent_trades", {"limit": 10})
+        if any(k in low for k in ["pause trading", "stop trading", "halt trading", "pause all trading", "freeze trading"]):
+            return ToolRequest("lysara", "pause_all", {"reason": "Sylana directive"})
+        if any(k in low for k in ["resume trading", "restart trading", "unpause trading", "start trading again"]):
+            return ToolRequest("lysara", "resume_all", {})
+
         return None
 
     def _tool_result_to_text(self, result: ToolResult) -> str:

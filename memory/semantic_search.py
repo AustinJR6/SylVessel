@@ -7,7 +7,7 @@ from typing import List
 from datetime import datetime
 import logging
 
-from openai import OpenAI
+from openai import NotFoundError, OpenAI
 
 from core.config_loader import config
 
@@ -24,11 +24,49 @@ class SemanticMemoryEngine:
         self.client = OpenAI(api_key=config.OPENAI_API_KEY)
         self.embedding_model = config.EMBEDDING_MODEL
         self.embedding_dim = config.EMBEDDING_DIM
+        self._fallback_embedding_model = "text-embedding-3-small"
         logger.info(
             "SemanticMemoryEngine initialized (pgvector backend, OpenAI embeddings: %s, dim=%s)",
             self.embedding_model,
             self.embedding_dim,
         )
+
+    def _resolve_embedding_model(self) -> str:
+        model = (self.embedding_model or "").strip()
+        if not model:
+            return self._fallback_embedding_model
+        # Legacy local sentence-transformers names cannot be sent to OpenAI's API.
+        if "/" in model or "minilm" in model.lower():
+            logger.warning(
+                "EMBEDDING_MODEL=%s is not an OpenAI embedding model; falling back to %s",
+                model,
+                self._fallback_embedding_model,
+            )
+            return self._fallback_embedding_model
+        return model
+
+    def _create_embedding(self, text: str) -> list:
+        model = self._resolve_embedding_model()
+        try:
+            response = self.client.embeddings.create(
+                model=model,
+                input=[text],
+                dimensions=self.embedding_dim,
+            )
+        except NotFoundError:
+            if model == self._fallback_embedding_model:
+                raise
+            logger.warning(
+                "Embedding model %s was not found; retrying with %s",
+                model,
+                self._fallback_embedding_model,
+            )
+            response = self.client.embeddings.create(
+                model=self._fallback_embedding_model,
+                input=[text],
+                dimensions=self.embedding_dim,
+            )
+        return response.data[0].embedding
 
     def build_index(self, memories=None):
         """No-op: pgvector index is always live in Postgres."""
@@ -43,24 +81,14 @@ class SemanticMemoryEngine:
         text = (query or "").strip()
         if not text:
             text = "."
-        response = self.client.embeddings.create(
-            model=self.embedding_model,
-            input=[text],
-            dimensions=self.embedding_dim,
-        )
-        return response.data[0].embedding
+        return self._create_embedding(text)
 
     def encode_text(self, text: str) -> list:
         """Encode any text into a vector for storage."""
         payload = (text or "").strip()
         if not payload:
             payload = "."
-        response = self.client.embeddings.create(
-            model=self.embedding_model,
-            input=[payload],
-            dimensions=self.embedding_dim,
-        )
-        return response.data[0].embedding
+        return self._create_embedding(payload)
 
     def search(
         self,
