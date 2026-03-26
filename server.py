@@ -27,7 +27,7 @@ import subprocess
 import selectors
 from collections import Counter
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from html import unescape
 from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
@@ -55,6 +55,7 @@ from anthropic import (
     NotFoundError,
     RateLimitError,
 )
+from core.lysara_ops import LysaraOpsClient, LysaraOpsError
 
 # Core components
 from core.config_loader import config
@@ -1197,6 +1198,9 @@ class SylanaState:
         self.turn_count = 0
         self.ready = False
         self.start_time = None
+        self.lysara_client = None
+        self.lysara_last_status = {}
+        self.lysara_loop_task = None
 
 
 state = SylanaState()
@@ -1532,6 +1536,8 @@ def _build_user_context(active_tools: List[str]) -> Dict[str, Any]:
         ctx["work_sessions_summary"] = _get_work_session_summary()
     if "outreach" in active_tools:
         ctx["outreach_summary"] = _get_outreach_summary()
+    if "lysara" in active_tools:
+        ctx["lysara_status"] = _get_lysara_status_snapshot()
     return ctx
 
 
@@ -1662,7 +1668,158 @@ def _runtime_tool_specs(active_tools: Optional[List[str]]) -> List[Dict[str, Any
             }
         )
 
+    if "lysara" in active:
+        specs.extend([
+            {
+                "name": "lysara_get_status",
+                "description": "Get the current Lysara trading node status, guardrails, feed freshness, and runtime state.",
+                "input_schema": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "lysara_get_portfolio",
+                "description": "Get current Lysara portfolio balances and account state across markets.",
+                "input_schema": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "lysara_get_positions",
+                "description": "List recent positions or fills by market.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "market": {"type": "string", "description": "crypto, stocks, forex, or omit for all"},
+                    },
+                },
+            },
+            {
+                "name": "lysara_get_recent_trades",
+                "description": "Get the latest trade records from Lysara.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "market": {"type": "string"},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                    },
+                },
+            },
+            {
+                "name": "lysara_get_market_snapshot",
+                "description": "Get live market snapshot, price cache, sentiment, and feed freshness from Lysara.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "symbols": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Optional list of symbols to narrow the snapshot.",
+                        },
+                    },
+                },
+            },
+            {
+                "name": "lysara_adjust_risk",
+                "description": "Adjust approved runtime risk controls for a market.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "market": {"type": "string"},
+                        "risk_per_trade": {"type": "number"},
+                        "max_daily_loss": {"type": "number"},
+                        "actor": {"type": "string"},
+                    },
+                    "required": ["market"],
+                },
+            },
+            {
+                "name": "lysara_update_strategy_params",
+                "description": "Enable or disable strategies/symbols and update approved runtime parameters.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "market": {"type": "string"},
+                        "strategy_name": {"type": "string"},
+                        "enabled": {"type": "boolean"},
+                        "symbol_controls": {"type": "object"},
+                        "params": {"type": "object"},
+                        "actor": {"type": "string"},
+                    },
+                    "required": ["market"],
+                },
+            },
+            {
+                "name": "lysara_pause_trading",
+                "description": "Pause all Lysara trading or a specific market.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "market": {"type": "string"},
+                        "reason": {"type": "string"},
+                        "actor": {"type": "string"},
+                    },
+                },
+            },
+            {
+                "name": "lysara_resume_trading",
+                "description": "Resume all Lysara trading or a specific market.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "market": {"type": "string"},
+                        "actor": {"type": "string"},
+                    },
+                },
+            },
+            {
+                "name": "lysara_submit_trade_intent",
+                "description": "Submit a structured trade intent to Lysara. Lysara applies policy checks before any execution.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "market": {"type": "string"},
+                        "symbol": {"type": "string"},
+                        "side": {"type": "string"},
+                        "thesis": {"type": "string"},
+                        "confidence": {"type": "number"},
+                        "size_hint": {"type": "number"},
+                        "time_horizon": {"type": "string"},
+                        "source": {"type": "string"},
+                        "actor": {"type": "string"},
+                        "dedupe_nonce": {"type": "string"},
+                    },
+                    "required": ["market", "symbol", "side", "thesis"],
+                },
+            },
+            {
+                "name": "lysara_get_incidents",
+                "description": "Get current Lysara incidents and warnings.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "status": {"type": "string"},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                    },
+                },
+            },
+        ])
+
     return specs
+
+
+def _get_lysara_client() -> Optional[LysaraOpsClient]:
+    if state.lysara_client is None:
+        state.lysara_client = LysaraOpsClient.from_env()
+    return state.lysara_client
+
+
+def _get_lysara_status_snapshot() -> Dict[str, Any]:
+    client = _get_lysara_client()
+    if client is None:
+        return {"available": False, "reason": "LYSARA_OPS_BASE_URL not configured"}
+    try:
+        payload = client.get_status()
+        state.lysara_last_status = payload
+        return {"available": True, **payload}
+    except LysaraOpsError as exc:
+        return {"available": False, "error": exc.message, "status_code": exc.status_code}
 
 
 def _runtime_tool_runner(name: str, tool_input: Dict[str, Any]) -> Dict[str, Any]:
@@ -1918,6 +2075,78 @@ def _runtime_tool_runner(name: str, tool_input: Dict[str, Any]) -> Dict[str, Any
                 for r in rows
             ],
         }
+
+    if name.startswith("lysara_"):
+        client = _get_lysara_client()
+        if client is None:
+            return {"error": "lysara_unavailable", "details": "LYSARA_OPS_BASE_URL not configured"}
+        try:
+            if name == "lysara_get_status":
+                return client.get_status()
+            if name == "lysara_get_portfolio":
+                return client.get_portfolio()
+            if name == "lysara_get_positions":
+                return client.get_positions(market=(tool_input.get("market") or None))
+            if name == "lysara_get_recent_trades":
+                return client.get_recent_trades(
+                    limit=max(1, min(int(tool_input.get("limit") or 20), 100)),
+                    market=(tool_input.get("market") or None),
+                )
+            if name == "lysara_get_market_snapshot":
+                symbols = tool_input.get("symbols") or []
+                symbol_csv = ",".join(str(s).strip().upper() for s in symbols if str(s).strip()) if isinstance(symbols, list) else None
+                return client.get_market_snapshot(symbol_csv)
+            if name == "lysara_adjust_risk":
+                return client.adjust_risk(
+                    market=str(tool_input.get("market") or ""),
+                    actor=str(tool_input.get("actor") or "sylana"),
+                    risk_per_trade=tool_input.get("risk_per_trade"),
+                    max_daily_loss=tool_input.get("max_daily_loss"),
+                )
+            if name == "lysara_update_strategy_params":
+                return client.update_strategy_params(
+                    market=str(tool_input.get("market") or ""),
+                    actor=str(tool_input.get("actor") or "sylana"),
+                    strategy_name=(tool_input.get("strategy_name") or None),
+                    enabled=tool_input.get("enabled"),
+                    symbol_controls=(tool_input.get("symbol_controls") or {}),
+                    params=(tool_input.get("params") or {}),
+                )
+            if name == "lysara_pause_trading":
+                return client.pause_trading(
+                    reason=str(tool_input.get("reason") or "manual"),
+                    market=str(tool_input.get("market") or "all"),
+                    actor=str(tool_input.get("actor") or "sylana"),
+                )
+            if name == "lysara_resume_trading":
+                return client.resume_trading(
+                    market=str(tool_input.get("market") or "all"),
+                    actor=str(tool_input.get("actor") or "sylana"),
+                )
+            if name == "lysara_submit_trade_intent":
+                return client.submit_trade_intent(
+                    {
+                        "market": str(tool_input.get("market") or ""),
+                        "symbol": str(tool_input.get("symbol") or "").upper(),
+                        "side": str(tool_input.get("side") or "").lower(),
+                        "thesis": str(tool_input.get("thesis") or ""),
+                        "confidence": float(tool_input.get("confidence") or 0.0),
+                        "size_hint": tool_input.get("size_hint"),
+                        "time_horizon": str(tool_input.get("time_horizon") or "intraday"),
+                        "source": str(tool_input.get("source") or "vessel_tool"),
+                        "actor": str(tool_input.get("actor") or "sylana"),
+                        "dedupe_nonce": tool_input.get("dedupe_nonce"),
+                    }
+                )
+            if name == "lysara_get_incidents":
+                return client.get_incidents(
+                    status=(tool_input.get("status") or None),
+                    limit=max(1, min(int(tool_input.get("limit") or 50), 100)),
+                )
+        except LysaraOpsError as exc:
+            return {"error": "lysara_request_failed", "status_code": exc.status_code, "details": exc.message}
+
+    return {"error": f"unknown_runtime_tool:{name}"}
 
     return {"error": f"Unknown tool: {name}"}
 
@@ -4829,6 +5058,7 @@ def build_system_prompt(
     github_snapshot = user_ctx.get("github_snapshot") or {}
     work_sessions_summary = user_ctx.get("work_sessions_summary") or {}
     outreach_summary = user_ctx.get("outreach_summary") or {}
+    lysara_status = user_ctx.get("lysara_status") or {}
     tool_blocks = {
         "web_search": "You have access to web search. Use it when current information would improve your response.",
         "code_execution": "You have access to code execution. You can write and run Python, JavaScript, or bash. Use this to produce real outputs, not just describe them.",
@@ -4839,6 +5069,7 @@ def build_system_prompt(
         "photos": "You have access to Elias's photo library with tagged memories of his life, family, and work.",
         "memories": "You have access to conversation memory and past context.",
         "outreach": "You have access to the Manifest outreach system including prospect lists, email drafts, session results, and prospect-research execution.",
+        "lysara": "You have access to the Lysara trading node. Use Lysara tools for operational truth about balances, incidents, strategies, and trade execution. Do not invent trading state from memory.",
     }
     for tool in tools:
         line = tool_blocks.get(tool)
@@ -4857,6 +5088,12 @@ def build_system_prompt(
             base_lines.append(
                 "When user asks to find prospects/run outreach, use outreach_run_prospect_research "
                 "instead of doing ad-hoc in-chat web research."
+            )
+        if tool == "lysara" and lysara_status:
+            base_lines.append(f"Lysara status snapshot: {json.dumps(lysara_status)[:1800]}")
+            base_lines.append(
+                "Financial operator policy: for current market-moving decisions, gather current source-backed information via web search before submitting any trade intent. "
+                "Only use approved Lysara mutation tools for risk, strategy controls, pause/resume, and trade intents."
             )
     return "\n\n".join(base_lines)
 
@@ -5499,6 +5736,7 @@ devices_router = APIRouter(prefix="/device-tokens", tags=["device-tokens"])
 alerts_router = APIRouter(prefix="/alerts", tags=["alerts"])
 presence_router = APIRouter(prefix="/presence", tags=["presence"])
 tracking_router = APIRouter(tags=["tracking"])
+lysara_router = APIRouter(prefix="/api/lysara", tags=["lysara"])
 
 
 def _normalized_entity(value: str) -> str:
@@ -5597,13 +5835,19 @@ async def code_execute(payload: CodeExecutionRequest):
 # The agent can execute arbitrary shell/Python commands inside the container.
 
 _AGENT_EFFICIENCY_RULES = (
+    "\n\nREPOSITORY ACCESS — GITHUB FIRST:\n"
+    "There are no local repository files on this server. Elias accesses the Vessel from his phone; "
+    "code lives on GitHub. Always use the `gh` CLI to access repositories:\n"
+    "  - Find repos: `gh repo list --limit 30`\n"
+    "  - Clone for deep work: `gh repo clone <owner/repo>`\n"
+    "  - Read a file without cloning: `gh api repos/<owner>/<repo>/contents/<path> --jq '.content' | base64 -d`\n"
+    "  - Browse tree: `gh api repos/<owner>/<repo>/git/trees/HEAD --jq '[.tree[].path]'`\n"
+    "When asked about a repo, ALWAYS start with `gh repo list` — never assume local paths exist.\n"
     "\n\nEFFICIENCY RULES — follow these strictly:\n"
-    "1. Batch your bash commands. Instead of one file per call, read multiple files in a single command "
-    "(e.g. `cat file1.py file2.py file3.py` or `find . -name '*.py' | xargs head -50`). "
-    "Aim to gather all the information you need in 2-4 tool calls maximum.\n"
+    "1. Batch your bash commands. Aim to gather all information in 2-4 tool calls maximum.\n"
     "2. You have a limited number of turns. Do NOT spend every turn on tool calls — "
     "reserve your LAST turn to write your full response/summary/analysis in plain text.\n"
-    "3. When asked to summarize or analyze a repo: one tool call for structure, one for key files, "
+    "3. When asked to summarize or analyze a repo: one call for the tree, one for key files, "
     "then respond with the full summary. Do not read every file individually.\n"
     "4. Always end with a complete written response — never finish with a tool call."
 )
@@ -7137,6 +7381,211 @@ async def github_issue(payload: GitHubIssueRequest):
         "chat_card": card,
     })
 
+def _lysara_client_or_503() -> LysaraOpsClient:
+    client = _get_lysara_client()
+    if client is None:
+        raise HTTPException(status_code=503, detail="Lysara ops client is not configured")
+    return client
+
+
+def _lysara_proxy(callable_name: str, *args, **kwargs) -> Dict[str, Any]:
+    client = _lysara_client_or_503()
+    try:
+        fn = getattr(client, callable_name)
+        payload = fn(*args, **kwargs)
+        if callable_name == "get_status":
+            state.lysara_last_status = payload
+        return payload
+    except LysaraOpsError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+
+
+def _lysara_research_summary(query: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    results = ((payload or {}).get("results") or [])[:4]
+    titles = [str(item.get("title") or "").strip() for item in results if str(item.get("title") or "").strip()]
+    snippets = [str(item.get("snippet") or "").strip() for item in results if str(item.get("snippet") or "").strip()]
+    joined = " ".join(titles + snippets).lower()
+    bullish_markers = [w for w in ["surge", "rally", "beat", "upgrade", "growth", "bull"] if w in joined]
+    bearish_markers = [w for w in ["drop", "selloff", "downgrade", "miss", "risk", "bear"] if w in joined]
+    score = len(bullish_markers) - len(bearish_markers)
+    confidence = min(0.75, 0.35 + min(abs(score), 3) * 0.1)
+    outlook = "bullish" if score > 0 else "bearish" if score < 0 else "mixed"
+    sources = [{"title": item.get("title"), "url": item.get("url"), "snippet": item.get("snippet")} for item in results]
+    summary = (
+        f"Query '{query}' suggests a {outlook} to mixed near-term backdrop. "
+        f"Top headlines: {' | '.join(titles[:3]) if titles else 'no strong headlines found'}."
+    )
+    return {
+        "summary": summary,
+        "bullish_factors": titles[:2] if score >= 0 else [],
+        "bearish_factors": titles[:2] if score <= 0 else [],
+        "confidence": round(confidence, 3),
+        "sources": sources,
+    }
+
+
+async def _run_lysara_operator_cycle() -> None:
+    client = _get_lysara_client()
+    if client is None:
+        return
+    try:
+        status = client.get_status()
+        state.lysara_last_status = status
+        market_snapshot = client.get_market_snapshot()
+        prices = (market_snapshot or {}).get("prices") or {}
+        candidate_symbols = list(prices.keys())[:3]
+        if not candidate_symbols:
+            return
+        for symbol in candidate_symbols:
+            query = f"{symbol} latest market news trend"
+            search_payload = await asyncio.to_thread(_run_web_search, query, 4)
+            research = _lysara_research_summary(query, search_payload)
+            client.record_research(
+                {
+                    "actor": "sylana",
+                    "market": "crypto" if "-" in symbol else "stocks",
+                    "symbol": symbol,
+                    "summary": research["summary"],
+                    "bullish_factors": research["bullish_factors"],
+                    "bearish_factors": research["bearish_factors"],
+                    "confidence": research["confidence"],
+                    "horizon": "intraday",
+                    "sources": research["sources"],
+                    "stale_after": (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat(),
+                }
+            )
+            journal_payload = {
+                "mode": "autonomous",
+                "action": "market_monitor",
+                "status": "observed",
+                "market": "crypto" if "-" in symbol else "stocks",
+                "symbol": symbol,
+                "summary": research["summary"],
+                "details": {"sources": research["sources"], "confidence": research["confidence"]},
+            }
+            if bool(os.getenv("LYSARA_AUTONOMOUS_ENABLED", "false").strip().lower() == "true") and research["confidence"] >= 0.6:
+                side = "buy" if len(research["bullish_factors"]) >= len(research["bearish_factors"]) else "sell"
+                execution = client.submit_trade_intent(
+                    {
+                        "actor": "sylana",
+                        "source": "autonomous_monitor",
+                        "market": "crypto" if "-" in symbol else "stocks",
+                        "symbol": symbol,
+                        "side": side,
+                        "thesis": research["summary"],
+                        "confidence": research["confidence"],
+                        "time_horizon": "intraday",
+                    }
+                )
+                journal_payload["action"] = "submit_trade_intent"
+                journal_payload["status"] = str(execution.get("status") or "submitted")
+                journal_payload["details"]["execution"] = execution
+            client.record_journal(journal_payload)
+    except Exception as exc:
+        logger.warning("Lysara operator cycle failed: %s", exc)
+
+
+async def _lysara_operator_loop() -> None:
+    while True:
+        await _run_lysara_operator_cycle()
+        await asyncio.sleep(max(300, min(int(os.getenv("LYSARA_OPERATOR_INTERVAL_SECONDS", "900")), 3600)))
+
+
+@lysara_router.get("/status")
+async def lysara_status():
+    return JSONResponse(content=_lysara_proxy("get_status"))
+
+
+@lysara_router.get("/portfolio")
+async def lysara_portfolio():
+    return JSONResponse(content=_lysara_proxy("get_portfolio"))
+
+
+@lysara_router.get("/positions")
+async def lysara_positions(market: Optional[str] = None):
+    return JSONResponse(content=_lysara_proxy("get_positions", market))
+
+
+@lysara_router.get("/trades")
+async def lysara_trades(limit: int = 20, market: Optional[str] = None):
+    return JSONResponse(content=_lysara_proxy("get_recent_trades", limit, market))
+
+
+@lysara_router.get("/market-snapshot")
+async def lysara_market_snapshot(symbols: Optional[str] = None):
+    return JSONResponse(content=_lysara_proxy("get_market_snapshot", symbols))
+
+
+@lysara_router.get("/incidents")
+async def lysara_incidents(status: Optional[str] = None, limit: int = 50):
+    return JSONResponse(content=_lysara_proxy("get_incidents", status, limit))
+
+
+@lysara_router.get("/research")
+async def lysara_research(market: Optional[str] = None, limit: int = 50):
+    return JSONResponse(content=_lysara_proxy("get_research", market, limit))
+
+
+@lysara_router.get("/journal")
+async def lysara_journal(limit: int = 50):
+    return JSONResponse(content=_lysara_proxy("get_journal", limit))
+
+
+@lysara_router.post("/pause")
+async def lysara_pause(request: Request):
+    body = await request.json()
+    return JSONResponse(
+        content=_lysara_proxy(
+            "pause_trading",
+            str(body.get("reason") or "manual"),
+            str(body.get("market") or "all"),
+            str(body.get("actor") or "operator"),
+        )
+    )
+
+
+@lysara_router.post("/resume")
+async def lysara_resume(request: Request):
+    body = await request.json()
+    return JSONResponse(content=_lysara_proxy("resume_trading", str(body.get("market") or "all"), str(body.get("actor") or "operator")))
+
+
+@lysara_router.post("/risk")
+async def lysara_adjust_risk(request: Request):
+    body = await request.json()
+    return JSONResponse(
+        content=_lysara_proxy(
+            "adjust_risk",
+            market=str(body.get("market") or ""),
+            actor=str(body.get("actor") or "operator"),
+            risk_per_trade=body.get("risk_per_trade"),
+            max_daily_loss=body.get("max_daily_loss"),
+        )
+    )
+
+
+@lysara_router.post("/strategy")
+async def lysara_update_strategy(request: Request):
+    body = await request.json()
+    return JSONResponse(
+        content=_lysara_proxy(
+            "update_strategy_params",
+            market=str(body.get("market") or ""),
+            actor=str(body.get("actor") or "operator"),
+            strategy_name=body.get("strategy_name"),
+            enabled=body.get("enabled"),
+            symbol_controls=body.get("symbol_controls") or {},
+            params=body.get("params") or {},
+        )
+    )
+
+
+@lysara_router.post("/trade-intents")
+async def lysara_trade_intent(request: Request):
+    body = await request.json()
+    return JSONResponse(content=_lysara_proxy("submit_trade_intent", body))
+
+
 # ============================================================================
 # FASTAPI APPLICATION
 # ============================================================================
@@ -7150,6 +7599,8 @@ async def lifespan(app: FastAPI):
         try:
             await asyncio.to_thread(load_models)
             await start_scheduler_if_needed()
+            if state.lysara_loop_task is None:
+                state.lysara_loop_task = asyncio.create_task(_lysara_operator_loop())
         except Exception:
             logger.exception("Background model initialization failed")
 
@@ -7163,6 +7614,8 @@ async def lifespan(app: FastAPI):
     global scheduler
     if scheduler is not None and scheduler.running:
         scheduler.shutdown(wait=False)
+    if state.lysara_loop_task:
+        state.lysara_loop_task.cancel()
     logger.info("Sylana Vessel Server shut down")
 
 
@@ -7182,6 +7635,7 @@ app.include_router(devices_router)
 app.include_router(alerts_router)
 app.include_router(presence_router)
 app.include_router(tracking_router)
+app.include_router(lysara_router)
 
 # Cross-origin support for mobile/web clients hitting deployed API domains.
 app.add_middleware(

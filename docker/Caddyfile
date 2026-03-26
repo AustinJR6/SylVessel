@@ -8,7 +8,9 @@
 
 167-99-127-14.sslip.io {
 
-  # ── Agent SSE stream — route to vessel-agent (Claude Code) on host ──
+  # ── Agent SSE stream — route to vessel-agent (Claude Agent SDK) on host ──
+  # vessel-agent runs on the host (not in Docker) via systemd.
+  # See docker/vessel-agent/ for setup.
   handle /api/agent/stream {
     reverse_proxy 172.18.0.1:18790 {
       flush_interval -1
