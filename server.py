@@ -134,6 +134,7 @@ WORKSPACE_PROMPT_FILES: Dict[str, str] = {
     "tools": "TOOLS.md",
     "heartbeat": "HEARTBEAT.md",
     "risk": "RISK.md",
+    "lysara": "LYSARA.md",
 }
 DEFAULT_HEARTBEAT_INTERVAL_MINUTES = max(5, int(os.getenv("HEARTBEAT_INTERVAL_MINUTES", "30") or "30"))
 HEARTBEAT_PUSH_ENABLED = os.getenv("HEARTBEAT_PUSH_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
@@ -6630,7 +6631,10 @@ def build_system_prompt(
         "Relationship context: You are Elias's trusted AI collaborator and companion. Keep responses clear, direct, and caring.",
         "Context safety: Only use data from tools currently active in this turn. If a tool is not active, do not reference its private data.",
     ]
-    workspace_block = _workspace_prompt_block(["agents", "soul", "tools"])
+    workspace_keys = ["agents", "soul", "tools"]
+    if "lysara" in tools:
+        workspace_keys.append("lysara")
+    workspace_block = _workspace_prompt_block(workspace_keys)
     if workspace_block:
         base_lines.append(workspace_block)
     if conversation_mode == "spicy" and personality in {"sylana", "claude"}:

@@ -25,7 +25,7 @@ from pydantic import BaseModel
 
 app = FastAPI(title="vessel-agent")
 WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
-PROMPT_FILES = ["AGENTS.md", "SOUL.md", "TOOLS.md"]
+PROMPT_FILES = ["AGENTS.md", "SOUL.md", "TOOLS.md", "LYSARA.md"]
 
 
 def _workspace_prompt_block() -> str:
