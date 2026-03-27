@@ -3190,19 +3190,82 @@ def _update_proactive_note_execution(note_id: str, execution_status: str, *, sta
 
 
 def _extract_portfolio_notional(portfolio: Dict[str, Any]) -> float:
-    candidates = [
-        portfolio.get("total_equity"),
-        portfolio.get("equity"),
-        portfolio.get("net_liquidation"),
-        portfolio.get("portfolio_value"),
-        ((portfolio.get("summary") or {}).get("total_equity") if isinstance(portfolio.get("summary"), dict) else None),
+    def _read_numeric(*values: Any) -> Optional[float]:
+        for candidate in values:
+            try:
+                if candidate is not None and candidate != "":
+                    return abs(float(candidate))
+            except Exception:
+                continue
+        return None
+
+    direct_sections: List[Optional[Dict[str, Any]]] = [
+        portfolio,
+        portfolio.get("simulation_portfolio") if isinstance(portfolio.get("simulation_portfolio"), dict) else None,
+        portfolio.get("summary") if isinstance(portfolio.get("summary"), dict) else None,
     ]
-    for candidate in candidates:
-        try:
-            if candidate is not None:
-                return abs(float(candidate))
-        except Exception:
+    for section in direct_sections:
+        if not isinstance(section, dict):
             continue
+        value = _read_numeric(
+            section.get("total_equity"),
+            section.get("equity"),
+            section.get("net_liquidation"),
+            section.get("portfolio_value"),
+            section.get("balance"),
+            section.get("cash"),
+        )
+        if value is not None:
+            return value
+
+    markets = portfolio.get("markets")
+    if isinstance(markets, dict):
+        total = 0.0
+        found = False
+        for market_payload in markets.values():
+            if not isinstance(market_payload, dict):
+                continue
+            account = market_payload.get("account")
+            if isinstance(account, dict):
+                account_value = _read_numeric(
+                    account.get("total_equity"),
+                    account.get("equity"),
+                    account.get("net_liquidation"),
+                    account.get("portfolio_value"),
+                    account.get("buying_power"),
+                    account.get("cash"),
+                )
+                if account_value is not None:
+                    total += account_value
+                    found = True
+                    continue
+            positions = market_payload.get("positions")
+            rows: List[Dict[str, Any]] = []
+            if isinstance(positions, dict):
+                rows = positions.get("positions") or positions.get("items") or []
+            elif isinstance(positions, list):
+                rows = positions
+            if rows:
+                total += sum(_extract_position_notional(row or {}) for row in rows)
+                found = True
+        if found:
+            return total
+    return 0.0
+
+
+def _extract_portfolio_baseline(portfolio: Dict[str, Any]) -> float:
+    sections: List[Optional[Dict[str, Any]]] = [
+        portfolio,
+        portfolio.get("simulation_portfolio") if isinstance(portfolio.get("simulation_portfolio"), dict) else None,
+        portfolio.get("summary") if isinstance(portfolio.get("summary"), dict) else None,
+    ]
+    for section in sections:
+        if not isinstance(section, dict):
+            continue
+        for key in ["starting_balance", "starting_equity", "initial_equity", "baseline_equity"]:
+            value = _safe_float(section.get(key), default=float("nan"))
+            if value == value and value > 0:
+                return value
     return 0.0
 
 
@@ -3478,6 +3541,7 @@ def _autonomous_guard_status(symbol: str = "", market: str = "", side: str = "")
     status = client.get_status() if client is not None else {}
     portfolio = client.get_portfolio() if client is not None else {}
     portfolio_value = _extract_portfolio_notional(portfolio)
+    baseline_value = _extract_portfolio_baseline(portfolio)
     latest_status_ts = _latest_status_timestamp(status)
     if _is_trading_paused(status):
         reasons.append("trading_paused")
@@ -3485,7 +3549,7 @@ def _autonomous_guard_status(symbol: str = "", market: str = "", side: str = "")
         reasons.append("critical_incident_open")
     if latest_status_ts is None or (datetime.now(timezone.utc) - latest_status_ts).total_seconds() > int(cfg.get("data_freshness_seconds") or 180):
         reasons.append("status_data_stale")
-    peak_value = _peak_portfolio_value()
+    peak_value = max(_peak_portfolio_value(), baseline_value, portfolio_value)
     if peak_value > 0 and portfolio_value > 0:
         drawdown_pct = max(0.0, ((peak_value - portfolio_value) / peak_value) * 100.0)
         if drawdown_pct > float(cfg.get("max_drawdown_pct") or 100.0):
