@@ -54,6 +54,76 @@ def test_guard_status_pause() -> None:
     assert_true("trading_paused" in guard["reasons"], "pause reason missing from guard status")
 
 
+def test_sentiment_endpoint_health() -> None:
+    mock_post("/__scenario/reset", {})
+    payload = vessel_get("/api/lysara/sentiment?symbols=BTC-USD")
+    rows = payload.get("symbols") or []
+    assert_true(bool(payload.get("configured_sources")), "sentiment should report configured sources")
+    assert_true(bool(rows), "sentiment should return at least one symbol row")
+    assert_true(rows[0].get("symbol") == "BTC-USD", "sentiment should return the requested symbol")
+    assert_true(rows[0].get("confidence") is not None, "sentiment row should include confidence")
+
+
+def test_confluence_endpoint_health() -> None:
+    mock_post("/__scenario/reset", {})
+    payload = vessel_get("/api/lysara/confluence?symbols=BTC-USD")
+    rows = payload.get("symbols") or []
+    assert_true(bool(payload.get("timeframes")), "confluence should report timeframes")
+    assert_true(bool(rows), "confluence should return at least one symbol row")
+    assert_true(rows[0].get("symbol") == "BTC-USD", "confluence should return the requested symbol")
+    assert_true(rows[0].get("confluence_score") is not None, "confluence row should include a score")
+
+
+def test_event_risk_endpoint_health() -> None:
+    mock_post("/__scenario/reset", {})
+    payload = vessel_get("/api/lysara/event-risk?symbols=BTC-USD")
+    rows = payload.get("symbols") or []
+    assert_true(payload.get("lookahead_hours") is not None, "event risk should report lookahead window")
+    assert_true(bool(rows), "event risk should return at least one symbol row")
+    assert_true(rows[0].get("symbol") == "BTC-USD", "event risk should return the requested symbol")
+    assert_true(rows[0].get("action") is not None, "event risk row should include an action")
+
+
+def test_override_lifecycle() -> None:
+    mock_post("/__scenario/reset", {})
+    enabled = vessel_post(
+        "/api/lysara/override",
+        {
+            "actor": "validator",
+            "reason": "phase 5 validation",
+            "ttl_minutes": 5,
+            "allowed_controls": ["confidence_minimum", "event_risk_warning"],
+        },
+    )
+    assert_true(enabled.get("enabled") is True, "override should enable")
+    assert_true("confidence_minimum" in (enabled.get("allowed_controls") or []), "override should keep requested controls")
+
+    status = vessel_get("/api/lysara/override/status")
+    assert_true(status.get("enabled") is True, "override status should report enabled")
+    assert_true(status.get("actor") == "validator", "override actor mismatch")
+
+    cleared = vessel_post("/api/lysara/override/clear", {"actor": "validator", "reason": "validation complete"})
+    assert_true(cleared.get("enabled") is False, "override should clear")
+    assert_true(cleared.get("last_cleared_at"), "override clear should stamp last_cleared_at")
+
+
+def test_hard_breaker_non_bypassable() -> None:
+    mock_post("/__scenario/reset", {})
+    vessel_post(
+        "/api/lysara/override",
+        {
+            "actor": "validator",
+            "reason": "check hard breakers",
+            "ttl_minutes": 5,
+            "allowed_controls": ["confidence_minimum", "event_risk_warning", "trade_cooldown"],
+        },
+    )
+    mock_post("/__scenario", {"status": {"paused": True, "pause_reason": "hard breaker validation"}})
+    guard = vessel_get("/api/lysara/guard-status")
+    assert_true(not guard["ok"], "guard should remain blocked even with override enabled")
+    assert_true("trading_paused" in guard["reasons"], "pause should remain a non-bypassable breaker")
+
+
 def test_trade_approval_and_recheck() -> None:
     mock_post("/__scenario/reset", {})
     trade = vessel_post(
@@ -125,6 +195,11 @@ def test_trade_close_reconciliation() -> None:
 def main() -> int:
     tests = [
         ("guard_status_pause", test_guard_status_pause),
+        ("sentiment_endpoint_health", test_sentiment_endpoint_health),
+        ("confluence_endpoint_health", test_confluence_endpoint_health),
+        ("event_risk_endpoint_health", test_event_risk_endpoint_health),
+        ("override_lifecycle", test_override_lifecycle),
+        ("hard_breaker_non_bypassable", test_hard_breaker_non_bypassable),
         ("trade_approval_and_recheck", test_trade_approval_and_recheck),
         ("trade_close_reconciliation", test_trade_close_reconciliation),
     ]
