@@ -1648,6 +1648,7 @@ def _build_user_context(active_tools: List[str]) -> Dict[str, Any]:
         ctx["lysara_risk"] = state.lysara_risk_config or {}
         ctx["lysara_performance"] = _get_lysara_performance_summary(limit=50)
         ctx["lysara_sentiment"] = _get_lysara_sentiment_snapshot(limit=6)
+        ctx["lysara_confluence"] = _get_lysara_confluence_snapshot(limit=6)
     ctx["last_heartbeat_result"] = state.last_heartbeat_result or {}
     return ctx
 
@@ -1836,6 +1837,20 @@ def _runtime_tool_specs(active_tools: Optional[List[str]]) -> List[Dict[str, Any
                             "type": "array",
                             "items": {"type": "string"},
                             "description": "Optional list of symbols to narrow the radar.",
+                        },
+                    },
+                },
+            },
+            {
+                "name": "lysara_get_confluence",
+                "description": "Get the Lysara crypto multi-timeframe confluence feed by symbol, including alignment, key levels, and breakout probabilities.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "symbols": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Optional list of symbols to narrow the confluence feed.",
                         },
                     },
                 },
@@ -2095,6 +2110,23 @@ def _get_lysara_sentiment_snapshot(limit: int = 6) -> Dict[str, Any]:
             "available": True,
             "updated_at": payload.get("updated_at"),
             "configured_sources": payload.get("configured_sources") or [],
+            "symbols": items[: max(1, min(int(limit or 6), 12))],
+        }
+    except LysaraOpsError as exc:
+        return {"available": False, "error": exc.message, "status_code": exc.status_code}
+
+
+def _get_lysara_confluence_snapshot(limit: int = 6) -> Dict[str, Any]:
+    client = _get_lysara_client()
+    if client is None:
+        return {"available": False, "reason": "LYSARA_OPS_BASE_URL not configured"}
+    try:
+        payload = client.get_confluence()
+        items = payload.get("symbols") or []
+        return {
+            "available": True,
+            "updated_at": payload.get("updated_at"),
+            "timeframes": payload.get("timeframes") or [],
             "symbols": items[: max(1, min(int(limit or 6), 12))],
         }
     except LysaraOpsError as exc:
@@ -2381,6 +2413,10 @@ def _runtime_tool_runner(name: str, tool_input: Dict[str, Any]) -> Dict[str, Any
                 symbols = tool_input.get("symbols") or []
                 symbol_csv = ",".join(str(s).strip().upper() for s in symbols if str(s).strip()) if isinstance(symbols, list) else None
                 return client.get_sentiment_radar(symbol_csv)
+            if name == "lysara_get_confluence":
+                symbols = tool_input.get("symbols") or []
+                symbol_csv = ",".join(str(s).strip().upper() for s in symbols if str(s).strip()) if isinstance(symbols, list) else None
+                return client.get_confluence(symbol_csv)
             if name == "lysara_adjust_risk":
                 return client.adjust_risk(
                     market=str(tool_input.get("market") or ""),
@@ -6766,6 +6802,7 @@ def build_system_prompt(
     lysara_risk = user_ctx.get("lysara_risk") or {}
     lysara_performance = user_ctx.get("lysara_performance") or {}
     lysara_sentiment = user_ctx.get("lysara_sentiment") or {}
+    lysara_confluence = user_ctx.get("lysara_confluence") or {}
     heartbeat_result = user_ctx.get("last_heartbeat_result") or {}
     tool_blocks = {
         "web_search": "You have access to web search. Use it when current information would improve your response.",
@@ -6805,6 +6842,8 @@ def build_system_prompt(
                 base_lines.append(f"Lysara performance snapshot: {json.dumps(lysara_performance)[:1200]}")
             if lysara_sentiment:
                 base_lines.append(f"Lysara sentiment radar: {json.dumps(lysara_sentiment)[:1400]}")
+            if lysara_confluence:
+                base_lines.append(f"Lysara confluence: {json.dumps(lysara_confluence)[:1400]}")
             base_lines.append(
                 "Financial operator policy: for current market-moving decisions, gather current source-backed information via web search before submitting any trade intent. "
                 "Only use approved Lysara mutation tools for risk, strategy controls, pause/resume, and trade intents."
@@ -9744,6 +9783,11 @@ async def lysara_market_snapshot(symbols: Optional[str] = None):
 @lysara_router.get("/sentiment")
 async def lysara_sentiment(symbols: Optional[str] = None):
     return JSONResponse(content=_lysara_proxy("get_sentiment_radar", symbols))
+
+
+@lysara_router.get("/confluence")
+async def lysara_confluence(symbols: Optional[str] = None):
+    return JSONResponse(content=_lysara_proxy("get_confluence", symbols))
 
 
 @lysara_router.get("/incidents")
