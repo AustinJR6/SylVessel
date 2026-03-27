@@ -116,6 +116,9 @@ class LysaraOpsClient:
     def get_market_snapshot(self, symbols: Optional[str] = None) -> Dict[str, Any]:
         return self._request("GET", "/api/v1/ops/market-snapshot", params={"symbols": symbols}, expected={200})
 
+    def get_sentiment_radar(self, symbols: Optional[str] = None) -> Dict[str, Any]:
+        return self._request("GET", "/api/v1/ops/sentiment", params={"symbols": symbols}, expected={200})
+
     def get_incidents(self, status: Optional[str] = None, limit: int = 50) -> Dict[str, Any]:
         return self._request("GET", "/api/v1/ops/incidents", params={"status": status, "limit": limit}, expected={200})
 
