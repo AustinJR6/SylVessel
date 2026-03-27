@@ -3254,6 +3254,8 @@ def _latest_status_timestamp(status: Dict[str, Any]) -> Optional[datetime]:
         "timestamp",
         "as_of",
         "fetched_at",
+        "last_heartbeat_at",
+        "heartbeat_at",
     ]
     for key in keys:
         dt = _extract_timestamp(status.get(key))
@@ -3266,6 +3268,19 @@ def _latest_status_timestamp(status: Dict[str, Any]) -> Optional[datetime]:
                 dt = _extract_timestamp(section.get(key))
                 if dt:
                     return dt
+    heartbeat_ago_candidates = [
+        status.get("last_heartbeat_ago"),
+        (status.get("summary") or {}).get("last_heartbeat_ago") if isinstance(status.get("summary"), dict) else None,
+        (status.get("health") or {}).get("last_heartbeat_ago") if isinstance(status.get("health"), dict) else None,
+        (status.get("data") or {}).get("last_heartbeat_ago") if isinstance(status.get("data"), dict) else None,
+    ]
+    for candidate in heartbeat_ago_candidates:
+        try:
+            seconds = float(candidate)
+        except Exception:
+            continue
+        if seconds >= 0:
+            return datetime.now(timezone.utc) - timedelta(seconds=seconds)
     return None
 
 
