@@ -122,6 +122,40 @@ class LysaraOpsClient:
     def get_confluence(self, symbols: Optional[str] = None) -> Dict[str, Any]:
         return self._request("GET", "/api/v1/ops/confluence", params={"symbols": symbols}, expected={200})
 
+    def get_exposure(self, market: str = "crypto") -> Dict[str, Any]:
+        return self._request("GET", "/api/v1/ops/exposure", params={"market": market}, expected={200})
+
+    def get_override_status(self) -> Dict[str, Any]:
+        return self._request("GET", "/api/v1/ops/override/status", expected={200})
+
+    def activate_override(
+        self,
+        *,
+        actor: str = "operator",
+        reason: str,
+        ttl_minutes: Optional[int] = None,
+        allowed_controls: Optional[list[str]] = None,
+    ) -> Dict[str, Any]:
+        return self._request(
+            "POST",
+            "/api/v1/ops/override",
+            payload={
+                "actor": actor,
+                "reason": reason,
+                "ttl_minutes": ttl_minutes,
+                "allowed_controls": allowed_controls or [],
+            },
+            expected={200},
+        )
+
+    def clear_override(self, *, actor: str = "operator", reason: str = "") -> Dict[str, Any]:
+        return self._request(
+            "POST",
+            "/api/v1/ops/override/clear",
+            payload={"actor": actor, "reason": reason},
+            expected={200},
+        )
+
     def get_incidents(self, status: Optional[str] = None, limit: int = 50) -> Dict[str, Any]:
         return self._request("GET", "/api/v1/ops/incidents", params={"status": status, "limit": limit}, expected={200})
 

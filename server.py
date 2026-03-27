@@ -1649,6 +1649,8 @@ def _build_user_context(active_tools: List[str]) -> Dict[str, Any]:
         ctx["lysara_performance"] = _get_lysara_performance_summary(limit=50)
         ctx["lysara_sentiment"] = _get_lysara_sentiment_snapshot(limit=6)
         ctx["lysara_confluence"] = _get_lysara_confluence_snapshot(limit=6)
+        ctx["lysara_exposure"] = _get_lysara_exposure_snapshot(limit=6)
+        ctx["lysara_override"] = _get_lysara_override_snapshot()
     ctx["last_heartbeat_result"] = state.last_heartbeat_result or {}
     return ctx
 
@@ -1852,6 +1854,46 @@ def _runtime_tool_specs(active_tools: Optional[List[str]]) -> List[Dict[str, Any
                             "items": {"type": "string"},
                             "description": "Optional list of symbols to narrow the confluence feed.",
                         },
+                    },
+                },
+            },
+            {
+                "name": "lysara_get_exposure",
+                "description": "Get the current Lysara crypto exposure snapshot, including concentration, portfolio heat, and per-position effective weights.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "market": {"type": "string", "description": "Optional market override. Defaults to crypto."},
+                    },
+                },
+            },
+            {
+                "name": "lysara_get_override_status",
+                "description": "Get the current Lysara operator override state, TTL, actor, and allowed soft controls.",
+                "input_schema": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "lysara_set_override",
+                "description": "Enable the Lysara operator override window for allowed soft controls only. Hard circuit breakers still remain active.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "reason": {"type": "string"},
+                        "ttl_minutes": {"type": "integer", "minimum": 1, "maximum": 120},
+                        "allowed_controls": {"type": "array", "items": {"type": "string"}},
+                        "actor": {"type": "string"},
+                    },
+                    "required": ["reason"],
+                },
+            },
+            {
+                "name": "lysara_clear_override",
+                "description": "Clear the current Lysara operator override window.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "reason": {"type": "string"},
+                        "actor": {"type": "string"},
                     },
                 },
             },
@@ -2128,6 +2170,44 @@ def _get_lysara_confluence_snapshot(limit: int = 6) -> Dict[str, Any]:
             "updated_at": payload.get("updated_at"),
             "timeframes": payload.get("timeframes") or [],
             "symbols": items[: max(1, min(int(limit or 6), 12))],
+        }
+    except LysaraOpsError as exc:
+        return {"available": False, "error": exc.message, "status_code": exc.status_code}
+
+
+def _get_lysara_exposure_snapshot(limit: int = 6) -> Dict[str, Any]:
+    client = _get_lysara_client()
+    if client is None:
+        return {"available": False, "reason": "LYSARA_OPS_BASE_URL not configured"}
+    try:
+        payload = client.get_exposure("crypto")
+        items = payload.get("positions") or []
+        return {
+            "available": True,
+            "portfolio_value": payload.get("portfolio_value"),
+            "gross_exposure_pct": payload.get("gross_exposure_pct"),
+            "heat_score": payload.get("heat_score"),
+            "total_effective_heat_pct": payload.get("total_effective_heat_pct"),
+            "positions": items[: max(1, min(int(limit or 6), 12))],
+        }
+    except LysaraOpsError as exc:
+        return {"available": False, "error": exc.message, "status_code": exc.status_code}
+
+
+def _get_lysara_override_snapshot() -> Dict[str, Any]:
+    client = _get_lysara_client()
+    if client is None:
+        return {"available": False, "reason": "LYSARA_OPS_BASE_URL not configured"}
+    try:
+        payload = client.get_override_status()
+        return {
+            "available": True,
+            "enabled": payload.get("enabled"),
+            "actor": payload.get("actor"),
+            "reason": payload.get("reason"),
+            "allowed_controls": payload.get("allowed_controls") or [],
+            "expires_at": payload.get("expires_at"),
+            "ttl_seconds": payload.get("ttl_seconds"),
         }
     except LysaraOpsError as exc:
         return {"available": False, "error": exc.message, "status_code": exc.status_code}
@@ -2417,6 +2497,22 @@ def _runtime_tool_runner(name: str, tool_input: Dict[str, Any]) -> Dict[str, Any
                 symbols = tool_input.get("symbols") or []
                 symbol_csv = ",".join(str(s).strip().upper() for s in symbols if str(s).strip()) if isinstance(symbols, list) else None
                 return client.get_confluence(symbol_csv)
+            if name == "lysara_get_exposure":
+                return client.get_exposure(str(tool_input.get("market") or "crypto"))
+            if name == "lysara_get_override_status":
+                return client.get_override_status()
+            if name == "lysara_set_override":
+                return client.activate_override(
+                    actor=str(tool_input.get("actor") or "sylana"),
+                    reason=str(tool_input.get("reason") or "operator override"),
+                    ttl_minutes=(int(tool_input.get("ttl_minutes")) if tool_input.get("ttl_minutes") is not None else None),
+                    allowed_controls=[str(item).strip() for item in (tool_input.get("allowed_controls") or []) if str(item).strip()],
+                )
+            if name == "lysara_clear_override":
+                return client.clear_override(
+                    actor=str(tool_input.get("actor") or "sylana"),
+                    reason=str(tool_input.get("reason") or ""),
+                )
             if name == "lysara_adjust_risk":
                 return client.adjust_risk(
                     market=str(tool_input.get("market") or ""),
@@ -6803,6 +6899,8 @@ def build_system_prompt(
     lysara_performance = user_ctx.get("lysara_performance") or {}
     lysara_sentiment = user_ctx.get("lysara_sentiment") or {}
     lysara_confluence = user_ctx.get("lysara_confluence") or {}
+    lysara_exposure = user_ctx.get("lysara_exposure") or {}
+    lysara_override = user_ctx.get("lysara_override") or {}
     heartbeat_result = user_ctx.get("last_heartbeat_result") or {}
     tool_blocks = {
         "web_search": "You have access to web search. Use it when current information would improve your response.",
@@ -6844,6 +6942,10 @@ def build_system_prompt(
                 base_lines.append(f"Lysara sentiment radar: {json.dumps(lysara_sentiment)[:1400]}")
             if lysara_confluence:
                 base_lines.append(f"Lysara confluence: {json.dumps(lysara_confluence)[:1400]}")
+            if lysara_exposure:
+                base_lines.append(f"Lysara exposure snapshot: {json.dumps(lysara_exposure)[:1200]}")
+            if lysara_override:
+                base_lines.append(f"Lysara override state: {json.dumps(lysara_override)[:900]}")
             base_lines.append(
                 "Financial operator policy: for current market-moving decisions, gather current source-backed information via web search before submitting any trade intent. "
                 "Only use approved Lysara mutation tools for risk, strategy controls, pause/resume, and trade intents."
@@ -9790,6 +9892,16 @@ async def lysara_confluence(symbols: Optional[str] = None):
     return JSONResponse(content=_lysara_proxy("get_confluence", symbols))
 
 
+@lysara_router.get("/exposure")
+async def lysara_exposure(market: str = "crypto"):
+    return JSONResponse(content=_lysara_proxy("get_exposure", market))
+
+
+@lysara_router.get("/override/status")
+async def lysara_override_status():
+    return JSONResponse(content=_lysara_proxy("get_override_status"))
+
+
 @lysara_router.get("/incidents")
 async def lysara_incidents(status: Optional[str] = None, limit: int = 50):
     return JSONResponse(content=_lysara_proxy("get_incidents", status, limit))
@@ -9923,6 +10035,32 @@ async def lysara_update_strategy(request: Request):
             enabled=body.get("enabled"),
             symbol_controls=body.get("symbol_controls") or {},
             params=body.get("params") or {},
+        )
+    )
+
+
+@lysara_router.post("/override")
+async def lysara_override(request: Request):
+    body = await request.json()
+    return JSONResponse(
+        content=_lysara_proxy(
+            "activate_override",
+            actor=str(body.get("actor") or "operator"),
+            reason=str(body.get("reason") or "manual override"),
+            ttl_minutes=(int(body.get("ttl_minutes")) if body.get("ttl_minutes") is not None else None),
+            allowed_controls=[str(item).strip() for item in (body.get("allowed_controls") or []) if str(item).strip()],
+        )
+    )
+
+
+@lysara_router.post("/override/clear")
+async def lysara_override_clear(request: Request):
+    body = await request.json()
+    return JSONResponse(
+        content=_lysara_proxy(
+            "clear_override",
+            actor=str(body.get("actor") or "operator"),
+            reason=str(body.get("reason") or ""),
         )
     )
 

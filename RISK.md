@@ -19,3 +19,6 @@ DUPLICATE_TRADE_WINDOW_SECONDS: 600
 LOSS_STREAK_COOLDOWN_TRADES: 3
 LOSS_STREAK_COOLDOWN_MINUTES: 120
 LIVE_AUTONOMOUS_TRADING_ENABLED: false
+OVERRIDE_DEFAULT_TTL_MINUTES: 15
+SOFT_OVERRIDE_CONTROLS: trade_cooldown, confidence_minimum, approval_requirement, event_risk_warning, sentiment_threshold
+NON_BYPASSABLE_BREAKERS: daily_loss_limit, max_single_position_pct, max_total_gross_exposure_pct, stale_market_data, disconnected_broker, insufficient_funds, insufficient_position, malformed_order, simulation_live_mismatch
