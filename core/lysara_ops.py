@@ -122,6 +122,9 @@ class LysaraOpsClient:
     def get_confluence(self, symbols: Optional[str] = None) -> Dict[str, Any]:
         return self._request("GET", "/api/v1/ops/confluence", params={"symbols": symbols}, expected={200})
 
+    def get_event_risk(self, symbols: Optional[str] = None) -> Dict[str, Any]:
+        return self._request("GET", "/api/v1/ops/event-risk", params={"symbols": symbols}, expected={200})
+
     def get_exposure(self, market: str = "crypto") -> Dict[str, Any]:
         return self._request("GET", "/api/v1/ops/exposure", params={"market": market}, expected={200})
 

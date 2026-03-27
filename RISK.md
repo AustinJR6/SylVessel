@@ -22,3 +22,7 @@ LIVE_AUTONOMOUS_TRADING_ENABLED: false
 OVERRIDE_DEFAULT_TTL_MINUTES: 15
 SOFT_OVERRIDE_CONTROLS: trade_cooldown, confidence_minimum, approval_requirement, event_risk_warning, sentiment_threshold
 NON_BYPASSABLE_BREAKERS: daily_loss_limit, max_single_position_pct, max_total_gross_exposure_pct, stale_market_data, disconnected_broker, insufficient_funds, insufficient_position, malformed_order, simulation_live_mismatch
+EVENT_RISK_WARNING_THRESHOLD: 0.45
+EVENT_RISK_BLOCK_THRESHOLD: 0.70
+EVENT_RISK_REDUCTION_THRESHOLD: 0.85
+EVENT_RISK_REDUCTION_FACTOR: 0.50

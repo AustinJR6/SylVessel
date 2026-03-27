@@ -1649,6 +1649,7 @@ def _build_user_context(active_tools: List[str]) -> Dict[str, Any]:
         ctx["lysara_performance"] = _get_lysara_performance_summary(limit=50)
         ctx["lysara_sentiment"] = _get_lysara_sentiment_snapshot(limit=6)
         ctx["lysara_confluence"] = _get_lysara_confluence_snapshot(limit=6)
+        ctx["lysara_event_risk"] = _get_lysara_event_risk_snapshot(limit=6)
         ctx["lysara_exposure"] = _get_lysara_exposure_snapshot(limit=6)
         ctx["lysara_override"] = _get_lysara_override_snapshot()
     ctx["last_heartbeat_result"] = state.last_heartbeat_result or {}
@@ -1853,6 +1854,20 @@ def _runtime_tool_specs(active_tools: Optional[List[str]]) -> List[Dict[str, Any
                             "type": "array",
                             "items": {"type": "string"},
                             "description": "Optional list of symbols to narrow the confluence feed.",
+                        },
+                    },
+                },
+            },
+            {
+                "name": "lysara_get_event_risk",
+                "description": "Get the Lysara crypto event-risk feed by symbol, including upcoming events, block windows, and pre-event reduction signals.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "symbols": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Optional list of symbols to narrow the event-risk feed.",
                         },
                     },
                 },
@@ -2170,6 +2185,25 @@ def _get_lysara_confluence_snapshot(limit: int = 6) -> Dict[str, Any]:
             "updated_at": payload.get("updated_at"),
             "timeframes": payload.get("timeframes") or [],
             "symbols": items[: max(1, min(int(limit or 6), 12))],
+        }
+    except LysaraOpsError as exc:
+        return {"available": False, "error": exc.message, "status_code": exc.status_code}
+
+
+def _get_lysara_event_risk_snapshot(limit: int = 6) -> Dict[str, Any]:
+    client = _get_lysara_client()
+    if client is None:
+        return {"available": False, "reason": "LYSARA_OPS_BASE_URL not configured"}
+    try:
+        payload = client.get_event_risk()
+        items = payload.get("symbols") or []
+        return {
+            "available": True,
+            "updated_at": payload.get("updated_at"),
+            "configured_providers": payload.get("configured_providers") or [],
+            "lookahead_hours": payload.get("lookahead_hours"),
+            "symbols": items[: max(1, min(int(limit or 6), 12))],
+            "events": (payload.get("events") or [])[: max(1, min(int(limit or 6), 12))],
         }
     except LysaraOpsError as exc:
         return {"available": False, "error": exc.message, "status_code": exc.status_code}
@@ -2497,6 +2531,10 @@ def _runtime_tool_runner(name: str, tool_input: Dict[str, Any]) -> Dict[str, Any
                 symbols = tool_input.get("symbols") or []
                 symbol_csv = ",".join(str(s).strip().upper() for s in symbols if str(s).strip()) if isinstance(symbols, list) else None
                 return client.get_confluence(symbol_csv)
+            if name == "lysara_get_event_risk":
+                symbols = tool_input.get("symbols") or []
+                symbol_csv = ",".join(str(s).strip().upper() for s in symbols if str(s).strip()) if isinstance(symbols, list) else None
+                return client.get_event_risk(symbol_csv)
             if name == "lysara_get_exposure":
                 return client.get_exposure(str(tool_input.get("market") or "crypto"))
             if name == "lysara_get_override_status":
@@ -6899,6 +6937,7 @@ def build_system_prompt(
     lysara_performance = user_ctx.get("lysara_performance") or {}
     lysara_sentiment = user_ctx.get("lysara_sentiment") or {}
     lysara_confluence = user_ctx.get("lysara_confluence") or {}
+    lysara_event_risk = user_ctx.get("lysara_event_risk") or {}
     lysara_exposure = user_ctx.get("lysara_exposure") or {}
     lysara_override = user_ctx.get("lysara_override") or {}
     heartbeat_result = user_ctx.get("last_heartbeat_result") or {}
@@ -6942,6 +6981,8 @@ def build_system_prompt(
                 base_lines.append(f"Lysara sentiment radar: {json.dumps(lysara_sentiment)[:1400]}")
             if lysara_confluence:
                 base_lines.append(f"Lysara confluence: {json.dumps(lysara_confluence)[:1400]}")
+            if lysara_event_risk:
+                base_lines.append(f"Lysara event risk: {json.dumps(lysara_event_risk)[:1300]}")
             if lysara_exposure:
                 base_lines.append(f"Lysara exposure snapshot: {json.dumps(lysara_exposure)[:1200]}")
             if lysara_override:
@@ -9890,6 +9931,11 @@ async def lysara_sentiment(symbols: Optional[str] = None):
 @lysara_router.get("/confluence")
 async def lysara_confluence(symbols: Optional[str] = None):
     return JSONResponse(content=_lysara_proxy("get_confluence", symbols))
+
+
+@lysara_router.get("/event-risk")
+async def lysara_event_risk(symbols: Optional[str] = None):
+    return JSONResponse(content=_lysara_proxy("get_event_risk", symbols))
 
 
 @lysara_router.get("/exposure")
