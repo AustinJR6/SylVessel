@@ -189,3 +189,11 @@ class LysaraOpsClient:
 
     def resolve_incident(self, incident_id: int, actor: str = "operator") -> Dict[str, Any]:
         return self._request("POST", f"/api/v1/ops/incidents/{incident_id}/resolve", payload={"actor": actor}, expected={200})
+
+    def reset_simulation(self, starting_balance: float = 1000.0, actor: str = "operator") -> Dict[str, Any]:
+        return self._request(
+            "POST",
+            "/api/v1/ops/simulation/reset",
+            payload={"starting_balance": starting_balance, "actor": actor},
+            expected={200},
+        )

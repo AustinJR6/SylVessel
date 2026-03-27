@@ -1908,6 +1908,99 @@ def _runtime_tool_specs(active_tools: Optional[List[str]]) -> List[Dict[str, Any
                     },
                 },
             },
+            {
+                "name": "lysara_get_research",
+                "description": "Get recorded Lysara research notes.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "market": {"type": "string"},
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                    },
+                },
+            },
+            {
+                "name": "lysara_get_journal",
+                "description": "Get the Lysara decision journal.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                    },
+                },
+            },
+            {
+                "name": "lysara_record_research",
+                "description": "Record a structured Lysara research note.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "market": {"type": "string"},
+                        "symbol": {"type": "string"},
+                        "summary": {"type": "string"},
+                        "bullish_factors": {"type": "array", "items": {"type": "string"}},
+                        "bearish_factors": {"type": "array", "items": {"type": "string"}},
+                        "confidence": {"type": "number"},
+                        "horizon": {"type": "string"},
+                        "sources": {"type": "array", "items": {"type": "object"}},
+                        "actor": {"type": "string"},
+                    },
+                    "required": ["market", "summary"],
+                },
+            },
+            {
+                "name": "lysara_record_journal",
+                "description": "Record a structured decision journal entry in Lysara.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "mode": {"type": "string"},
+                        "action": {"type": "string"},
+                        "status": {"type": "string"},
+                        "market": {"type": "string"},
+                        "symbol": {"type": "string"},
+                        "summary": {"type": "string"},
+                        "details": {"type": "object"},
+                        "trade_intent_id": {"type": "integer"},
+                    },
+                    "required": ["action", "summary"],
+                },
+            },
+            {
+                "name": "lysara_acknowledge_incident",
+                "description": "Acknowledge a specific Lysara incident.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "incident_id": {"type": "integer"},
+                        "actor": {"type": "string"},
+                    },
+                    "required": ["incident_id"],
+                },
+            },
+            {
+                "name": "lysara_resolve_incident",
+                "description": "Resolve a specific Lysara incident.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "incident_id": {"type": "integer"},
+                        "actor": {"type": "string"},
+                    },
+                    "required": ["incident_id"],
+                },
+            },
+            {
+                "name": "lysara_reset_simulation",
+                "description": "Reset the Lysara simulation portfolio to a fresh starting balance.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "starting_balance": {"type": "number"},
+                        "actor": {"type": "string"},
+                    },
+                },
+            },
         ])
 
     return specs
@@ -2297,6 +2390,57 @@ def _runtime_tool_runner(name: str, tool_input: Dict[str, Any]) -> Dict[str, Any
                 return client.get_incidents(
                     status=(tool_input.get("status") or None),
                     limit=max(1, min(int(tool_input.get("limit") or 50), 100)),
+                )
+            if name == "lysara_get_research":
+                return client.get_research(
+                    market=(tool_input.get("market") or None),
+                    limit=max(1, min(int(tool_input.get("limit") or 50), 100)),
+                )
+            if name == "lysara_get_journal":
+                return client.get_journal(
+                    limit=max(1, min(int(tool_input.get("limit") or 50), 100)),
+                )
+            if name == "lysara_record_research":
+                return client.record_research(
+                    {
+                        "actor": str(tool_input.get("actor") or "sylana"),
+                        "market": str(tool_input.get("market") or ""),
+                        "symbol": (tool_input.get("symbol") or None),
+                        "summary": str(tool_input.get("summary") or ""),
+                        "bullish_factors": list(tool_input.get("bullish_factors") or []),
+                        "bearish_factors": list(tool_input.get("bearish_factors") or []),
+                        "confidence": float(tool_input.get("confidence") or 0.0),
+                        "horizon": str(tool_input.get("horizon") or "intraday"),
+                        "sources": list(tool_input.get("sources") or []),
+                    }
+                )
+            if name == "lysara_record_journal":
+                return client.record_journal(
+                    {
+                        "mode": str(tool_input.get("mode") or "direct_ops"),
+                        "action": str(tool_input.get("action") or ""),
+                        "status": str(tool_input.get("status") or "recorded"),
+                        "market": (tool_input.get("market") or None),
+                        "symbol": (tool_input.get("symbol") or None),
+                        "summary": str(tool_input.get("summary") or ""),
+                        "details": dict(tool_input.get("details") or {}),
+                        "trade_intent_id": tool_input.get("trade_intent_id"),
+                    }
+                )
+            if name == "lysara_acknowledge_incident":
+                return client.acknowledge_incident(
+                    int(tool_input.get("incident_id") or 0),
+                    actor=str(tool_input.get("actor") or "sylana"),
+                )
+            if name == "lysara_resolve_incident":
+                return client.resolve_incident(
+                    int(tool_input.get("incident_id") or 0),
+                    actor=str(tool_input.get("actor") or "sylana"),
+                )
+            if name == "lysara_reset_simulation":
+                return client.reset_simulation(
+                    starting_balance=float(tool_input.get("starting_balance") or 1000.0),
+                    actor=str(tool_input.get("actor") or "sylana"),
                 )
         except LysaraOpsError as exc:
             return {"error": "lysara_request_failed", "status_code": exc.status_code, "details": exc.message}
@@ -9608,6 +9752,18 @@ async def lysara_update_strategy(request: Request):
             enabled=body.get("enabled"),
             symbol_controls=body.get("symbol_controls") or {},
             params=body.get("params") or {},
+        )
+    )
+
+
+@lysara_router.post("/simulation/reset")
+async def lysara_reset_simulation(request: Request):
+    body = await request.json()
+    return JSONResponse(
+        content=_lysara_proxy(
+            "reset_simulation",
+            starting_balance=float(body.get("starting_balance") or 1000.0),
+            actor=str(body.get("actor") or "operator"),
         )
     )
 
