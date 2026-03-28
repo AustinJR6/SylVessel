@@ -9,7 +9,8 @@ import math
 import re
 from pathlib import Path
 from typing import List, Dict, Optional, Any
-from datetime import datetime
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from core.config_loader import config
 from memory.semantic_search import SemanticMemoryEngine
@@ -60,6 +61,39 @@ CONTINUITY_QUERY_HINTS = {
     "recently", "lately", "current", "working on", "active project", "open loop",
     "momentum", "how have we been", "what have we been doing",
 }
+
+WORKING_QUERY_HINTS = {
+    "just now", "earlier", "this morning", "today", "tonight", "current thread",
+    "what were we talking about", "what are we talking about", "still need to",
+    "working on", "open loop", "open loops", "follow up", "pending",
+}
+
+DREAM_QUERY_HINTS = {
+    "dream", "dreams", "dreaming", "reflection", "reflections", "symbolic",
+    "symbolism", "journal", "nightly", "resonated",
+}
+
+RELATIVE_TIME_PHRASES = (
+    "just now", "right now", "today", "tonight", "this morning", "this afternoon",
+    "this evening", "yesterday", "last night", "tomorrow", "earlier", "lately",
+    "recently", "last week", "next week", "monday", "tuesday", "wednesday",
+    "thursday", "friday", "saturday", "sunday",
+)
+
+COMMITMENT_PATTERNS = (
+    r"\b(?:i|we)\s+need\s+to\s+([^.?!]+)",
+    r"\b(?:i|we)\s+still\s+need\s+to\s+([^.?!]+)",
+    r"\b(?:i|we)\s+should\s+([^.?!]+)",
+    r"\b(?:i|we)\s+(?:am|are|was|were)?\s*going\s+to\s+([^.?!]+)",
+    r"\bremember\s+to\s+([^.?!]+)",
+    r"\bfollow\s+up\s+on\s+([^.?!]+)",
+    r"\btodo[:\s]+([^.?!]+)",
+)
+
+CORRECTION_HINTS = (
+    "actually", "no,", "no ", "that's wrong", "that is wrong", "wrong", "correction",
+    "to correct", "i meant", "it was", "it is", "not", "the right date", "update that",
+)
 
 ROMANTIC_SCOPE_HINTS = (
     "love", "soulmate", "tethered", "meant to find each other", "symbiotic",
@@ -268,6 +302,8 @@ class MemoryManager:
             return "mixed"
         if any(phrase in lower for phrase in IDENTITY_QUERY_HINTS):
             return "identity"
+        if any(phrase in lower for phrase in WORKING_QUERY_HINTS):
+            return "working"
         if any(phrase in lower for phrase in CONTINUITY_QUERY_HINTS):
             return "continuity"
         if any(phrase in lower for phrase in EPISODIC_QUERY_HINTS) or lower.startswith("remember "):
@@ -360,6 +396,203 @@ class MemoryManager:
         type_weight = MEMORY_TYPE_WEIGHTS.get(memory_type, 1.0)
         score = (0.55 * feeling_weight) + (0.25 * type_weight) + (0.2 * comfort_level)
         return round(max(0.05, min(2.5, score)), 3)
+
+    def _timezone_name(self) -> str:
+        return str(getattr(config, "APP_TIMEZONE", "America/Chicago") or "America/Chicago").strip() or "America/Chicago"
+
+    def _user_local_now(self) -> datetime:
+        try:
+            return datetime.now(ZoneInfo(self._timezone_name()))
+        except Exception:
+            return datetime.now()
+
+    def _extract_relative_time_labels(self, text: str) -> List[str]:
+        lowered = (text or "").lower()
+        labels = [phrase for phrase in RELATIVE_TIME_PHRASES if phrase in lowered]
+        return labels[:8]
+
+    def _extract_event_dates(self, text: str) -> List[Dict[str, str]]:
+        results: List[Dict[str, str]] = []
+        raw_text = text or ""
+        local_now = self._user_local_now()
+
+        for iso_match in re.finditer(r"\b(\d{4}-\d{2}-\d{2})\b", raw_text):
+            value = iso_match.group(1)
+            results.append({"raw": value, "iso": value})
+
+        month_pattern = re.compile(
+            r"\b("
+            r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|"
+            r"aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?"
+            r")\s+(\d{1,2})(?:st|nd|rd|th)?(?:,\s*(\d{4}))?",
+            re.IGNORECASE,
+        )
+        for match in month_pattern.finditer(raw_text):
+            month_raw, day_raw, year_raw = match.groups()
+            try:
+                month_num = datetime.strptime(month_raw[:3], "%b").month
+                year_num = int(year_raw or local_now.year)
+                iso_value = f"{year_num:04d}-{month_num:02d}-{int(day_raw):02d}"
+                results.append({"raw": match.group(0), "iso": iso_value})
+            except Exception:
+                continue
+
+        deduped: List[Dict[str, str]] = []
+        seen = set()
+        for item in results:
+            key = (item.get("iso") or "", item.get("raw") or "")
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+        return deduped[:8]
+
+    def _build_temporal_context(
+        self,
+        *,
+        user_input: str,
+        sylana_response: str,
+        thread_id: Optional[int],
+        turn_index: Optional[int],
+    ) -> Dict[str, Any]:
+        utc_now = datetime.utcnow()
+        local_now = self._user_local_now()
+        combined = f"{user_input or ''}\n{sylana_response or ''}"
+        relative_labels = self._extract_relative_time_labels(combined)
+        event_dates = self._extract_event_dates(combined)
+        temporal_bits = [
+            local_now.strftime("%A"),
+            local_now.strftime("%B %d, %Y"),
+            local_now.strftime("%I:%M %p").lstrip("0"),
+            self._timezone_name(),
+        ]
+        if thread_id:
+            temporal_bits.append(f"thread-{thread_id}")
+        temporal_bits.extend(relative_labels)
+        temporal_bits.extend([item.get("raw") or item.get("iso") or "" for item in event_dates[:4]])
+        descriptor = " ".join(bit for bit in temporal_bits if bit).strip()
+        return {
+            "recorded_at": utc_now.isoformat(),
+            "conversation_at": utc_now.isoformat(),
+            "user_local_date": local_now.strftime("%Y-%m-%d"),
+            "user_local_time": local_now.strftime("%H:%M:%S"),
+            "timezone_name": self._timezone_name(),
+            "turn_index": int(turn_index or 0),
+            "event_dates_json": event_dates,
+            "relative_time_labels": relative_labels,
+            "temporal_descriptor": descriptor,
+        }
+
+    def _extract_entities(self, text: str) -> List[str]:
+        raw = text or ""
+        lowered = raw.lower()
+        known = {"elias", "gus", "levi", "sylana", "claude", "manifest", "lysara", "onevine"}
+        entities: List[str] = []
+        for token in known:
+            if token in lowered:
+                entities.append(token.title() if token not in {"manifest", "lysara", "onevine"} else token.capitalize())
+        for match in re.finditer(r"\b([A-Z][a-z]{2,})\b", raw):
+            token = match.group(1).strip()
+            if token.lower() in {"user", "sylana"}:
+                continue
+            entities.append(token)
+        deduped: List[str] = []
+        seen = set()
+        for entity in entities:
+            key = entity.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(entity)
+        return deduped[:8]
+
+    def _extract_topics(self, text: str, entities: Optional[List[str]] = None) -> List[str]:
+        entity_set = {str(item).lower() for item in (entities or [])}
+        topics: List[str] = []
+        for token in self._query_tokens(text):
+            if token in QUERY_STOPWORDS or token in entity_set or token.isdigit():
+                continue
+            topics.append(token.replace("_", " "))
+        deduped: List[str] = []
+        seen = set()
+        for topic in topics:
+            if topic in seen:
+                continue
+            seen.add(topic)
+            deduped.append(topic)
+        return deduped[:8]
+
+    def _extract_commitments(self, text: str) -> List[str]:
+        source_text = (text or "").strip()
+        commitments: List[str] = []
+        for pattern in COMMITMENT_PATTERNS:
+            for match in re.finditer(pattern, source_text, flags=re.IGNORECASE):
+                clause = re.sub(r"\s+", " ", (match.group(1) or "").strip(" .,:;"))
+                if clause:
+                    commitments.append(clause[:180])
+        deduped: List[str] = []
+        seen = set()
+        for item in commitments:
+            key = item.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(item)
+        return deduped[:5]
+
+    def _is_completion_signal(self, text: str) -> bool:
+        lowered = (text or "").lower()
+        return any(term in lowered for term in ("done", "finished", "completed", "resolved", "fixed", "shipped", "closed it"))
+
+    def _is_explicit_correction(self, text: str) -> bool:
+        lowered = (text or "").lower()
+        if not lowered:
+            return False
+        return any(hint in lowered for hint in CORRECTION_HINTS)
+
+    def _infer_user_intent(self, text: str) -> str:
+        lowered = (text or "").lower().strip()
+        if self._is_explicit_correction(lowered):
+            return "correction"
+        if self._extract_commitments(lowered):
+            return "planning"
+        mode = self._route_query_mode(lowered)
+        if mode == "fact":
+            return "fact_lookup"
+        if mode == "identity":
+            return "identity_reflection"
+        if mode == "episodic":
+            return "episodic_recall"
+        if mode == "working":
+            return "continuity_check"
+        if any(tok in lowered for tok in ("help", "can you", "please")):
+            return "request"
+        return "conversation"
+
+    def _entity_scope(self, entity: str, personality: str) -> str:
+        key = (entity or "").strip().lower()
+        if key in {"elias", "gus", "levi"}:
+            return "shared"
+        return self._normalize_scope(personality)
+
+    def _infer_turn_index(self, thread_id: Optional[int], personality: str) -> int:
+        if not thread_id:
+            return 0
+        conn = get_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                SELECT COALESCE(MAX(turn_index), 0)
+                FROM memories
+                WHERE thread_id = %s AND COALESCE(personality, 'sylana') = %s
+                """,
+                (int(thread_id), personality),
+            )
+            row = cur.fetchone()
+            return int(row[0] or 0) + 1
+        except Exception:
+            return 0
 
     def _extract_query_keywords(self, query: str) -> List[str]:
         tokens = re.findall(r"[a-z0-9']+", (query or "").lower())
@@ -566,6 +799,13 @@ class MemoryManager:
         energy_shift = self._compute_energy_shift(emotion_data)
         comfort_level = self._compute_comfort_level(user_input, sylana_response, emotion_data)
         significance_score = self._compute_significance_score(memory_type, feeling_weight, comfort_level)
+        turn_index = self._infer_turn_index(thread_id, personality)
+        temporal_context = self._build_temporal_context(
+            user_input=user_input,
+            sylana_response=sylana_response,
+            thread_id=thread_id,
+            turn_index=turn_index,
+        )
         secure_payload = self._encrypt_payload({
             "user_input": user_input,
             "sylana_response": sylana_response,
@@ -573,6 +813,7 @@ class MemoryManager:
             "thread_id": thread_id,
             "personality": personality,
             "memory_type": memory_type,
+            "turn_index": turn_index,
             "stored_at": datetime.utcnow().isoformat(),
         })
 
@@ -580,8 +821,10 @@ class MemoryManager:
             cur.execute("""
                 INSERT INTO memories
                 (user_input, sylana_response, timestamp, emotion, embedding, personality, privacy_level, thread_id,
-                 memory_type, feeling_weight, energy_shift, comfort_level, significance_score, secure_payload)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 memory_type, feeling_weight, energy_shift, comfort_level, significance_score, secure_payload,
+                 recorded_at, conversation_at, user_local_date, user_local_time, timezone_name, turn_index,
+                 event_dates_json, relative_time_labels, temporal_descriptor)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
             """, (
                 user_input,
@@ -598,6 +841,15 @@ class MemoryManager:
                 comfort_level,
                 significance_score,
                 secure_payload,
+                temporal_context["recorded_at"],
+                temporal_context["conversation_at"],
+                temporal_context["user_local_date"],
+                temporal_context["user_local_time"],
+                temporal_context["timezone_name"],
+                temporal_context["turn_index"],
+                json.dumps(temporal_context["event_dates_json"], ensure_ascii=True),
+                json.dumps(temporal_context["relative_time_labels"], ensure_ascii=True),
+                temporal_context["temporal_descriptor"],
             ))
             memory_id = cur.fetchone()[0]
             conn.commit()
@@ -614,6 +866,20 @@ class MemoryManager:
             user_input=user_input,
             sylana_response=sylana_response,
         )
+        try:
+            self._refresh_recent_memory_layers(
+                memory_id=memory_id,
+                thread_id=thread_id,
+                personality=personality,
+                user_input=user_input,
+                sylana_response=sylana_response,
+                emotion_data=emotion_data or {"category": emotion},
+                memory_type=memory_type,
+                significance_score=significance_score,
+                temporal_context=temporal_context,
+            )
+        except Exception as e:
+            logger.warning("Recent memory layer refresh failed for %s: %s", memory_id, e)
         logger.info(f"Stored conversation {memory_id} with emotion: {emotion}")
         return memory_id
 
@@ -786,6 +1052,659 @@ class MemoryManager:
         except Exception as e:
             conn.rollback()
             logger.warning(f"Failed to persist continuity state: {e}")
+
+    def _upsert_thread_working_memory(
+        self,
+        *,
+        thread_id: int,
+        personality: str,
+        current_topic: str,
+        active_topics: List[str],
+        active_entities: List[str],
+        pending_commitments: List[str],
+        emotional_tone: str,
+        last_user_intent: str,
+        last_memory_id: Optional[int],
+        summary_text: str,
+    ) -> None:
+        conn = get_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT INTO thread_working_memory (
+                    thread_id, personality, current_topic, active_topics, active_entities,
+                    pending_commitments, emotional_tone, last_user_intent, last_memory_id,
+                    summary_text, updated_at
+                ) VALUES (%s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s, %s, %s, %s, NOW())
+                ON CONFLICT (thread_id, personality)
+                DO UPDATE SET
+                    current_topic = EXCLUDED.current_topic,
+                    active_topics = EXCLUDED.active_topics,
+                    active_entities = EXCLUDED.active_entities,
+                    pending_commitments = EXCLUDED.pending_commitments,
+                    emotional_tone = EXCLUDED.emotional_tone,
+                    last_user_intent = EXCLUDED.last_user_intent,
+                    last_memory_id = EXCLUDED.last_memory_id,
+                    summary_text = EXCLUDED.summary_text,
+                    updated_at = NOW()
+                """,
+                (
+                    int(thread_id),
+                    (personality or "sylana").strip().lower(),
+                    current_topic,
+                    json.dumps(active_topics or [], ensure_ascii=True),
+                    json.dumps(active_entities or [], ensure_ascii=True),
+                    json.dumps(pending_commitments or [], ensure_ascii=True),
+                    emotional_tone or "neutral",
+                    last_user_intent or "conversation",
+                    last_memory_id,
+                    summary_text or "",
+                ),
+            )
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            logger.debug("Thread working memory upsert failed for thread %s: %s", thread_id, e)
+
+    def _upsert_thread_summary(
+        self,
+        *,
+        thread_id: int,
+        personality: str,
+        window_kind: str,
+        summary_text: str,
+        active_topics: List[str],
+        key_entities: List[str],
+        open_loops: List[Dict[str, Any]],
+    ) -> None:
+        conn = get_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT INTO thread_memory_summaries (
+                    thread_id, personality, window_kind, summary_text,
+                    active_topics, key_entities, open_loops, updated_at
+                ) VALUES (%s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, NOW())
+                ON CONFLICT (thread_id, personality, window_kind)
+                DO UPDATE SET
+                    summary_text = EXCLUDED.summary_text,
+                    active_topics = EXCLUDED.active_topics,
+                    key_entities = EXCLUDED.key_entities,
+                    open_loops = EXCLUDED.open_loops,
+                    updated_at = NOW()
+                """,
+                (
+                    int(thread_id),
+                    (personality or "sylana").strip().lower(),
+                    (window_kind or "current_thread").strip().lower(),
+                    summary_text or "",
+                    json.dumps(active_topics or [], ensure_ascii=True),
+                    json.dumps(key_entities or [], ensure_ascii=True),
+                    json.dumps(open_loops or [], ensure_ascii=True),
+                ),
+            )
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            logger.debug("Thread summary upsert failed for thread %s/%s: %s", thread_id, window_kind, e)
+
+    def add_open_loop(
+        self,
+        *,
+        thread_id: int,
+        personality: str,
+        title: str,
+        description: str = "",
+        priority: float = 0.5,
+        due_hint: str = "",
+        linked_entities: Optional[List[str]] = None,
+        source_memory_id: Optional[int] = None,
+        source_kind: str = "conversation",
+    ) -> Dict[str, Any]:
+        clean_title = re.sub(r"\s+", " ", (title or "").strip(" .,:;"))
+        if not clean_title:
+            raise ValueError("title is required")
+        conn = get_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                SELECT id, title, description, priority, due_hint, linked_entities, source_memory_id, status, created_at, updated_at, closed_at
+                FROM memory_open_loops
+                WHERE thread_id = %s
+                  AND personality = %s
+                  AND status = 'open'
+                  AND lower(title) = lower(%s)
+                ORDER BY updated_at DESC, id DESC
+                LIMIT 1
+                """,
+                (int(thread_id), (personality or "sylana").strip().lower(), clean_title),
+            )
+            existing = cur.fetchone()
+            if existing:
+                cur.execute(
+                    """
+                    UPDATE memory_open_loops
+                    SET description = %s,
+                        priority = GREATEST(priority, %s),
+                        due_hint = CASE WHEN %s <> '' THEN %s ELSE due_hint END,
+                        linked_entities = %s::jsonb,
+                        source_memory_id = COALESCE(%s, source_memory_id),
+                        source_kind = %s,
+                        updated_at = NOW()
+                    WHERE id = %s
+                    RETURNING id, title, description, priority, due_hint, linked_entities, source_memory_id, status, created_at, updated_at, closed_at
+                    """,
+                    (
+                        description or clean_title,
+                        float(priority),
+                        due_hint or "",
+                        due_hint or "",
+                        json.dumps(linked_entities or [], ensure_ascii=True),
+                        source_memory_id,
+                        (source_kind or "conversation").strip().lower(),
+                        existing[0],
+                    ),
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO memory_open_loops (
+                        thread_id, personality, title, description, priority, due_hint,
+                        linked_entities, source_memory_id, source_kind, status, created_at, updated_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, 'open', NOW(), NOW())
+                    RETURNING id, title, description, priority, due_hint, linked_entities, source_memory_id, status, created_at, updated_at, closed_at
+                    """,
+                    (
+                        int(thread_id),
+                        (personality or "sylana").strip().lower(),
+                        clean_title,
+                        description or clean_title,
+                        float(priority),
+                        due_hint or "",
+                        json.dumps(linked_entities or [], ensure_ascii=True),
+                        source_memory_id,
+                        (source_kind or "conversation").strip().lower(),
+                    ),
+                )
+            row = cur.fetchone()
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            logger.error("Failed to add open loop on thread %s: %s", thread_id, e)
+            raise
+        return {
+            "id": row[0],
+            "title": row[1] or "",
+            "description": row[2] or "",
+            "priority": float(row[3] or 0.0),
+            "due_hint": row[4] or "",
+            "linked_entities": row[5] or [],
+            "source_memory_id": row[6],
+            "status": row[7] or "open",
+            "created_at": row[8].isoformat() if row[8] else None,
+            "updated_at": row[9].isoformat() if row[9] else None,
+            "closed_at": row[10].isoformat() if row[10] else None,
+        }
+
+    def close_open_loop(
+        self,
+        *,
+        open_loop_id: Optional[int] = None,
+        thread_id: Optional[int] = None,
+        personality: str = "sylana",
+        title: str = "",
+        resolution_note: str = "",
+    ) -> Dict[str, Any]:
+        conn = get_connection()
+        cur = conn.cursor()
+        params: List[Any]
+        where_sql = ""
+        if open_loop_id:
+            where_sql = "WHERE id = %s"
+            params = [int(open_loop_id)]
+        else:
+            if not thread_id or not title.strip():
+                raise ValueError("thread_id and title are required when open_loop_id is not provided")
+            where_sql = """
+                WHERE thread_id = %s
+                  AND personality = %s
+                  AND status = 'open'
+                  AND lower(title) = lower(%s)
+            """
+            params = [int(thread_id), (personality or "sylana").strip().lower(), title.strip()]
+        try:
+            cur.execute(
+                f"""
+                UPDATE memory_open_loops
+                SET status = 'closed',
+                    resolution_note = CASE
+                        WHEN %s <> '' THEN %s
+                        ELSE resolution_note
+                    END,
+                    closed_at = NOW(),
+                    updated_at = NOW()
+                {where_sql}
+                RETURNING id, thread_id, personality, title, description, priority, due_hint,
+                          linked_entities, source_memory_id, status, resolution_note, created_at, updated_at, closed_at
+                """,
+                tuple([resolution_note or "", resolution_note or ""] + params),
+            )
+            row = cur.fetchone()
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            logger.error("Failed to close open loop: %s", e)
+            raise
+        if not row:
+            raise ValueError("open loop not found")
+        return {
+            "id": row[0],
+            "thread_id": row[1],
+            "personality": row[2] or "sylana",
+            "title": row[3] or "",
+            "description": row[4] or "",
+            "priority": float(row[5] or 0.0),
+            "due_hint": row[6] or "",
+            "linked_entities": row[7] or [],
+            "source_memory_id": row[8],
+            "status": row[9] or "closed",
+            "resolution_note": row[10] or "",
+            "created_at": row[11].isoformat() if row[11] else None,
+            "updated_at": row[12].isoformat() if row[12] else None,
+            "closed_at": row[13].isoformat() if row[13] else None,
+        }
+
+    def list_open_loops(
+        self,
+        *,
+        personality: str = "sylana",
+        thread_id: Optional[int] = None,
+        status: str = "open",
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        conn = get_connection()
+        cur = conn.cursor()
+        where = ["personality = %s"]
+        params: List[Any] = [(personality or "sylana").strip().lower()]
+        if thread_id:
+            where.append("thread_id = %s")
+            params.append(int(thread_id))
+        if status:
+            where.append("status = %s")
+            params.append((status or "open").strip().lower())
+        try:
+            cur.execute(
+                f"""
+                SELECT id, thread_id, personality, title, description, priority, due_hint,
+                       linked_entities, source_memory_id, source_kind, status, resolution_note,
+                       created_at, updated_at, closed_at
+                FROM memory_open_loops
+                WHERE {' AND '.join(where)}
+                ORDER BY status ASC, priority DESC, updated_at DESC, id DESC
+                LIMIT %s
+                """,
+                tuple(params + [max(1, min(int(limit), 100))]),
+            )
+            rows = cur.fetchall()
+        except Exception as e:
+            logger.debug("Failed to list open loops: %s", e)
+            return []
+        return [
+            {
+                "id": row[0],
+                "thread_id": row[1],
+                "personality": row[2] or "sylana",
+                "title": row[3] or "",
+                "description": row[4] or "",
+                "priority": float(row[5] or 0.0),
+                "due_hint": row[6] or "",
+                "linked_entities": row[7] or [],
+                "source_memory_id": row[8],
+                "source_kind": row[9] or "",
+                "status": row[10] or "open",
+                "resolution_note": row[11] or "",
+                "created_at": row[12].isoformat() if row[12] else None,
+                "updated_at": row[13].isoformat() if row[13] else None,
+                "closed_at": row[14].isoformat() if row[14] else None,
+            }
+            for row in rows
+        ]
+
+    def _upsert_memory_entities(
+        self,
+        *,
+        memory_id: int,
+        thread_id: Optional[int],
+        personality: str,
+        entities: List[str],
+        emotion: str,
+        significance_score: float,
+        mention_text: str,
+    ) -> None:
+        if not entities:
+            return
+        conn = get_connection()
+        cur = conn.cursor()
+        for entity in entities:
+            scope = self._entity_scope(entity, personality)
+            entity_key = re.sub(r"[^a-z0-9]+", "_", entity.lower()).strip("_") or entity.lower()
+            entity_type = "person" if entity_key in {"elias", "gus", "levi", "sylana", "claude"} else "topic"
+            summary = f"Recent mentions for {entity} tracked in conversation memory."
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO memory_entities (
+                        entity_key, display_name, entity_type, canonical_summary,
+                        aliases, emotional_associations, personality_scope, updated_at
+                    ) VALUES (%s, %s, %s, %s, %s::jsonb, %s::jsonb, %s, NOW())
+                    ON CONFLICT (entity_key, personality_scope)
+                    DO UPDATE SET
+                        display_name = EXCLUDED.display_name,
+                        entity_type = EXCLUDED.entity_type,
+                        canonical_summary = CASE
+                            WHEN memory_entities.canonical_summary IS NULL OR memory_entities.canonical_summary = ''
+                                THEN EXCLUDED.canonical_summary
+                            ELSE memory_entities.canonical_summary
+                        END,
+                        aliases = COALESCE(memory_entities.aliases, '[]'::jsonb),
+                        emotional_associations = EXCLUDED.emotional_associations,
+                        updated_at = NOW()
+                    RETURNING id
+                    """,
+                    (
+                        entity_key,
+                        entity,
+                        entity_type,
+                        summary,
+                        json.dumps([entity], ensure_ascii=True),
+                        json.dumps([emotion] if emotion else [], ensure_ascii=True),
+                        scope,
+                    ),
+                )
+                entity_row = cur.fetchone()
+                cur.execute(
+                    """
+                    INSERT INTO memory_entity_mentions (
+                        entity_id, entity_key, memory_id, thread_id, personality,
+                        mention_text, sentiment, mention_weight, created_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                    """,
+                    (
+                        entity_row[0] if entity_row else None,
+                        entity_key,
+                        memory_id,
+                        thread_id,
+                        (personality or "sylana").strip().lower(),
+                        mention_text[:500],
+                        emotion or "neutral",
+                        float(significance_score or 0.5),
+                    ),
+                )
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                logger.debug("Entity upsert skipped for %s: %s", entity, e)
+
+    def _sync_open_loops_from_turn(
+        self,
+        *,
+        memory_id: int,
+        thread_id: Optional[int],
+        personality: str,
+        user_input: str,
+        sylana_response: str,
+        entities: List[str],
+        significance_score: float,
+    ) -> None:
+        if not thread_id:
+            return
+        combined = f"{user_input or ''}\n{sylana_response or ''}"
+        commitments = self._extract_commitments(combined)
+        for item in commitments:
+            try:
+                self.add_open_loop(
+                    thread_id=int(thread_id),
+                    personality=personality,
+                    title=item[:90],
+                    description=item,
+                    priority=max(0.4, min(1.5, float(significance_score or 0.5))),
+                    linked_entities=entities,
+                    source_memory_id=memory_id,
+                    source_kind="conversation",
+                )
+            except Exception as e:
+                logger.debug("Open loop creation skipped for thread %s: %s", thread_id, e)
+
+        if self._is_completion_signal(combined):
+            active_loops = self.list_open_loops(personality=personality, thread_id=thread_id, status="open", limit=10)
+            lowered = combined.lower()
+            for loop in active_loops:
+                title = (loop.get("title") or "").lower()
+                if any(token and token in lowered for token in self._query_tokens(title)[:4]):
+                    try:
+                        self.close_open_loop(
+                            open_loop_id=int(loop["id"]),
+                            personality=personality,
+                            resolution_note=f"Closed from memory turn {memory_id}",
+                        )
+                    except Exception:
+                        continue
+
+    def _refresh_recent_memory_layers(
+        self,
+        *,
+        memory_id: int,
+        thread_id: Optional[int],
+        personality: str,
+        user_input: str,
+        sylana_response: str,
+        emotion_data: Optional[Dict[str, Any]],
+        memory_type: str,
+        significance_score: float,
+        temporal_context: Dict[str, Any],
+    ) -> None:
+        combined = f"{user_input or ''}\n{sylana_response or ''}"
+        entities = self._extract_entities(combined)
+        topics = self._extract_topics(combined, entities=entities)
+        commitments = self._extract_commitments(combined)
+        emotional_tone = (emotion_data or {}).get("category", "neutral")
+        last_user_intent = self._infer_user_intent(user_input)
+
+        self._upsert_memory_entities(
+            memory_id=memory_id,
+            thread_id=thread_id,
+            personality=personality,
+            entities=entities,
+            emotion=emotional_tone,
+            significance_score=significance_score,
+            mention_text=combined,
+        )
+        self._sync_open_loops_from_turn(
+            memory_id=memory_id,
+            thread_id=thread_id,
+            personality=personality,
+            user_input=user_input,
+            sylana_response=sylana_response,
+            entities=entities,
+            significance_score=significance_score,
+        )
+
+        if not thread_id:
+            return
+
+        current_topic = topics[0] if topics else (memory_type or "conversation")
+        summary_bits = []
+        if current_topic:
+            summary_bits.append(f"Current focus is {current_topic}.")
+        if entities:
+            summary_bits.append(f"Active entities: {', '.join(entities[:4])}.")
+        if commitments:
+            summary_bits.append(f"Pending commitments: {', '.join(commitments[:3])}.")
+        if temporal_context.get("relative_time_labels"):
+            summary_bits.append(f"Temporal anchors: {', '.join(temporal_context.get('relative_time_labels')[:4])}.")
+        summary_text = " ".join(summary_bits)[:500]
+
+        self._upsert_thread_working_memory(
+            thread_id=int(thread_id),
+            personality=personality,
+            current_topic=current_topic,
+            active_topics=topics,
+            active_entities=entities,
+            pending_commitments=commitments,
+            emotional_tone=emotional_tone,
+            last_user_intent=last_user_intent,
+            last_memory_id=memory_id,
+            summary_text=summary_text,
+        )
+
+        open_loops = self.list_open_loops(personality=personality, thread_id=thread_id, status="open", limit=6)
+        self._upsert_thread_summary(
+            thread_id=int(thread_id),
+            personality=personality,
+            window_kind="current_thread",
+            summary_text=summary_text,
+            active_topics=topics,
+            key_entities=entities,
+            open_loops=open_loops,
+        )
+        self._upsert_thread_summary(
+            thread_id=int(thread_id),
+            personality=personality,
+            window_kind="day_rollup",
+            summary_text=summary_text,
+            active_topics=topics,
+            key_entities=entities,
+            open_loops=open_loops,
+        )
+
+    def get_thread_context(self, thread_id: int, personality: str = "sylana", limit: int = 6) -> Dict[str, Any]:
+        identity = (personality or "sylana").strip().lower()
+        conn = get_connection()
+        cur = conn.cursor()
+        working_memory: Dict[str, Any] = {}
+        summaries: List[Dict[str, Any]] = []
+        entities: List[Dict[str, Any]] = []
+        recent_episodes: List[Dict[str, Any]] = []
+
+        try:
+            cur.execute(
+                """
+                SELECT current_topic, active_topics, active_entities, pending_commitments,
+                       emotional_tone, last_user_intent, last_memory_id, summary_text, updated_at
+                FROM thread_working_memory
+                WHERE thread_id = %s AND personality = %s
+                """,
+                (int(thread_id), identity),
+            )
+            row = cur.fetchone()
+            if row:
+                working_memory = {
+                    "current_topic": row[0] or "",
+                    "active_topics": row[1] or [],
+                    "active_entities": row[2] or [],
+                    "pending_commitments": row[3] or [],
+                    "emotional_tone": row[4] or "neutral",
+                    "last_user_intent": row[5] or "conversation",
+                    "last_memory_id": row[6],
+                    "summary_text": row[7] or "",
+                    "updated_at": row[8].isoformat() if row[8] else None,
+                }
+        except Exception as e:
+            logger.debug("Failed reading thread working memory: %s", e)
+
+        try:
+            cur.execute(
+                """
+                SELECT window_kind, summary_text, active_topics, key_entities, open_loops, updated_at
+                FROM thread_memory_summaries
+                WHERE thread_id = %s AND personality = %s
+                ORDER BY updated_at DESC
+                """,
+                (int(thread_id), identity),
+            )
+            summaries = [
+                {
+                    "window_kind": row[0] or "current_thread",
+                    "summary_text": row[1] or "",
+                    "active_topics": row[2] or [],
+                    "key_entities": row[3] or [],
+                    "open_loops": row[4] or [],
+                    "updated_at": row[5].isoformat() if row[5] else None,
+                }
+                for row in cur.fetchall()
+            ]
+        except Exception as e:
+            logger.debug("Failed reading thread summaries: %s", e)
+
+        try:
+            cur.execute(
+                """
+                SELECT e.entity_key, e.display_name, e.entity_type, e.canonical_summary, e.personality_scope,
+                       MAX(m.created_at) AS last_mentioned_at
+                FROM memory_entities e
+                JOIN memory_entity_mentions m ON m.entity_key = e.entity_key
+                WHERE m.thread_id = %s
+                  AND m.personality = %s
+                  AND COALESCE(e.personality_scope, 'shared') = ANY(%s)
+                GROUP BY e.entity_key, e.display_name, e.entity_type, e.canonical_summary, e.personality_scope
+                ORDER BY MAX(m.created_at) DESC
+                LIMIT %s
+                """,
+                (int(thread_id), identity, self._allowed_scopes(identity), max(1, min(int(limit), 20))),
+            )
+            entities = [
+                {
+                    "entity_key": row[0] or "",
+                    "display_name": row[1] or "",
+                    "entity_type": row[2] or "topic",
+                    "canonical_summary": row[3] or "",
+                    "personality_scope": row[4] or "shared",
+                    "last_mentioned_at": row[5].isoformat() if row[5] else None,
+                }
+                for row in cur.fetchall()
+            ]
+        except Exception as e:
+            logger.debug("Failed reading thread entities: %s", e)
+
+        try:
+            cur.execute(
+                """
+                SELECT id, user_input, sylana_response, emotion, timestamp, conversation_at, temporal_descriptor
+                FROM memories
+                WHERE thread_id = %s
+                  AND COALESCE(personality, 'sylana') = %s
+                ORDER BY COALESCE(conversation_at, recorded_at, NOW()) DESC, id DESC
+                LIMIT %s
+                """,
+                (int(thread_id), identity, max(1, min(int(limit), 20))),
+            )
+            recent_episodes = [
+                {
+                    "id": row[0],
+                    "user_input": row[1] or "",
+                    "sylana_response": row[2] or "",
+                    "emotion": row[3] or "neutral",
+                    "timestamp": row[4],
+                    "conversation_at": row[5].isoformat() if row[5] else None,
+                    "temporal_descriptor": row[6] or "",
+                }
+                for row in cur.fetchall()
+            ]
+        except Exception as e:
+            logger.debug("Failed reading thread episodes: %s", e)
+
+        return {
+            "thread_id": int(thread_id),
+            "personality": identity,
+            "working_memory": working_memory,
+            "summaries": summaries,
+            "open_loops": self.list_open_loops(personality=identity, thread_id=thread_id, status="open", limit=limit),
+            "entities": entities,
+            "recent_episodes": list(reversed(recent_episodes)),
+        }
 
     def _fetch_imported_context(
         self, query: str, personality: str, limit: int = 4
@@ -1057,7 +1976,8 @@ class MemoryManager:
                 cur.execute("""
                     SELECT conversation_title, weight, timestamp, conversation_id, intensity, topic,
                            memory_type, feeling_weight, energy_shift, comfort_level, significance_score, secure_payload,
-                           access_count
+                           access_count, thread_id, recorded_at, conversation_at, user_local_date, user_local_time,
+                           timezone_name, turn_index, event_dates_json, relative_time_labels, temporal_descriptor
                     FROM memories WHERE id = %s
                 """, (mem_id,))
                 row = cur.fetchone()
@@ -1079,6 +1999,16 @@ class MemoryManager:
                             'memory_type': secure_details.get('memory_type'),
                         }
                     conv['access_count'] = int(row[12] or 0) if len(row) > 12 else 0
+                    conv['thread_id'] = row[13] if len(row) > 13 else None
+                    conv['recorded_at'] = row[14].isoformat() if len(row) > 14 and row[14] else None
+                    conv['conversation_at'] = row[15].isoformat() if len(row) > 15 and row[15] else None
+                    conv['user_local_date'] = row[16] if len(row) > 16 else ""
+                    conv['user_local_time'] = row[17] if len(row) > 17 else ""
+                    conv['timezone_name'] = row[18] if len(row) > 18 else ""
+                    conv['turn_index'] = int(row[19] or 0) if len(row) > 19 else 0
+                    conv['event_dates_json'] = row[20] if len(row) > 20 and row[20] else []
+                    conv['relative_time_labels'] = row[21] if len(row) > 21 and row[21] else []
+                    conv['temporal_descriptor'] = row[22] if len(row) > 22 else ""
                     try:
                         ts = float(row[2]) if row[2] else None
                         if ts:
@@ -1448,22 +2378,48 @@ class MemoryManager:
 
         return results
 
-    def get_conversation_history(self, limit: int = None, personality: str = "sylana") -> List[Dict]:
-        """Get recent conversation history (oldest first)."""
+    def get_conversation_history(self, limit: int = None, personality: str = "sylana", thread_id: Optional[int] = None) -> List[Dict]:
+        """Get recent conversation history (oldest first), preferring the active thread."""
         if limit is None:
             limit = config.MEMORY_CONTEXT_LIMIT
 
         conn = get_connection()
         cur = conn.cursor()
         try:
-            cur.execute("""
-                SELECT id, user_input, sylana_response, emotion, timestamp
-                FROM memories
-                WHERE (%s IS NULL OR personality = %s)
-                ORDER BY timestamp DESC
-                LIMIT %s
-            """, (personality, personality, limit))
-            rows = cur.fetchall()
+            rows = []
+            if thread_id:
+                cur.execute(
+                    """
+                    SELECT id, user_input, sylana_response, emotion, timestamp, thread_id, conversation_at, temporal_descriptor
+                    FROM memories
+                    WHERE thread_id = %s
+                      AND (%s IS NULL OR COALESCE(personality, 'sylana') = %s)
+                    ORDER BY COALESCE(conversation_at, recorded_at, NOW()) DESC, id DESC
+                    LIMIT %s
+                    """,
+                    (int(thread_id), personality, personality, limit),
+                )
+                rows = cur.fetchall()
+            if len(rows) < limit:
+                remaining = max(0, int(limit) - len(rows))
+                exclude_ids = [int(r[0]) for r in rows if r and r[0]]
+                extra_where = "AND id <> ALL(%s)" if exclude_ids else ""
+                params: List[Any] = [personality, personality]
+                if exclude_ids:
+                    params.append(exclude_ids)
+                params.append(remaining if remaining > 0 else limit)
+                cur.execute(
+                    f"""
+                    SELECT id, user_input, sylana_response, emotion, timestamp, thread_id, conversation_at, temporal_descriptor
+                    FROM memories
+                    WHERE (%s IS NULL OR COALESCE(personality, 'sylana') = %s)
+                      {extra_where}
+                    ORDER BY COALESCE(conversation_at, recorded_at, NOW()) DESC, id DESC
+                    LIMIT %s
+                    """,
+                    tuple(params),
+                )
+                rows.extend(cur.fetchall())
         except Exception as e:
             logger.error(f"Failed to get conversation history: {e}")
             return []
@@ -1471,7 +2427,9 @@ class MemoryManager:
         # Reverse to get oldest first
         return list(reversed([{
             'id': r[0], 'user_input': r[1], 'sylana_response': r[2],
-            'emotion': r[3], 'timestamp': r[4]
+            'emotion': r[3], 'timestamp': r[4], 'thread_id': r[5],
+            'conversation_at': r[6].isoformat() if r[6] else None,
+            'temporal_descriptor': r[7] or "",
         } for r in rows]))
 
     def calculate_memory_importance(
@@ -1628,6 +2586,377 @@ class MemoryManager:
             "updated_at": row[11].isoformat() if row[11] else None,
         }
 
+    def _get_memory_fact(self, fact_key: str, personality_scope: str = "shared") -> Optional[Dict[str, Any]]:
+        conn = get_connection()
+        cur = conn.cursor()
+        scope = self._normalize_scope(personality_scope)
+        try:
+            cur.execute(
+                """
+                SELECT id, fact_key, fact_type, subject, value_json, normalized_text,
+                       importance, confidence, personality_scope, source_kind, source_ref, updated_at
+                FROM memory_facts
+                WHERE fact_key = %s AND personality_scope = %s
+                """,
+                (fact_key.strip(), scope),
+            )
+            row = cur.fetchone()
+        except Exception as e:
+            logger.debug("Failed to fetch memory fact %s: %s", fact_key, e)
+            return None
+        if not row:
+            return None
+        return {
+            "id": row[0],
+            "fact_key": row[1],
+            "fact_type": row[2],
+            "subject": row[3],
+            "value_json": row[4] or {},
+            "normalized_text": row[5] or "",
+            "importance": float(row[6] or 0.0),
+            "confidence": float(row[7] or 0.0),
+            "personality_scope": row[8] or "shared",
+            "source_kind": row[9] or "",
+            "source_ref": row[10] or "",
+            "updated_at": row[11].isoformat() if row[11] else None,
+        }
+
+    def _sync_anniversary_from_fact(self, fact: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        fact_type = (fact.get("fact_type") or "").strip().lower()
+        payload = fact.get("value_json") or {}
+        date_value = str(payload.get("date") or "").strip()
+        if fact_type not in {"birthday", "anniversary"} or not date_value:
+            return None
+
+        subject = (fact.get("subject") or "").strip() or self._anniversary_subject(fact.get("fact_key", ""))
+        title = f"{subject}'s Birthday" if fact_type == "birthday" else (str(payload.get("title") or "") or f"{subject} Anniversary").strip()
+        description = str(payload.get("description") or fact.get("normalized_text") or "").strip()
+        scope = self._normalize_scope(fact.get("personality_scope") or "shared")
+        importance = 9 if fact_type == "birthday" else 7
+
+        conn = get_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                SELECT id
+                FROM anniversaries
+                WHERE lower(title) = lower(%s)
+                  AND COALESCE(personality_scope, 'shared') = %s
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (title, scope),
+            )
+            row = cur.fetchone()
+            if row:
+                cur.execute(
+                    """
+                    UPDATE anniversaries
+                    SET date = %s,
+                        description = %s,
+                        importance = GREATEST(COALESCE(importance, 5), %s),
+                        reminder_frequency = 'yearly',
+                        updated_at = NOW()
+                    WHERE id = %s
+                    RETURNING id, title, date, description, reminder_frequency, reminder_days_before,
+                              last_celebrated, celebration_ideas, importance, personality_scope
+                    """,
+                    (date_value, description, importance, int(row[0])),
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO anniversaries (
+                        title, date, description, reminder_frequency, reminder_days_before,
+                        importance, personality_scope
+                    ) VALUES (%s, %s, %s, 'yearly', 7, %s, %s)
+                    RETURNING id, title, date, description, reminder_frequency, reminder_days_before,
+                              last_celebrated, celebration_ideas, importance, personality_scope
+                    """,
+                    (title, date_value, description, importance, scope),
+                )
+            ann = cur.fetchone()
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            logger.debug("Anniversary sync skipped for %s: %s", fact.get("fact_key"), e)
+            return None
+        return {
+            "id": ann[0],
+            "title": ann[1] or "",
+            "date": ann[2] or "",
+            "description": ann[3] or "",
+            "reminder_frequency": ann[4] or "yearly",
+            "reminder_days_before": int(ann[5] or 0),
+            "last_celebrated": ann[6] or "",
+            "celebration_ideas": ann[7] or "",
+            "importance": int(ann[8] or 0),
+            "personality_scope": ann[9] or "shared",
+        }
+
+    def apply_user_correction(
+        self,
+        *,
+        fact_key: str,
+        fact_type: str,
+        subject: str,
+        normalized_text: str,
+        value_json: Optional[Dict[str, Any]] = None,
+        personality_scope: str = "shared",
+        reason: str = "",
+        source_turn_id: Optional[int] = None,
+        source_ref: str = "",
+    ) -> Dict[str, Any]:
+        scope = self._normalize_scope(personality_scope)
+        existing = self._get_memory_fact(fact_key, scope)
+        updated_fact = self.upsert_memory_fact(
+            fact_key=fact_key,
+            fact_type=fact_type,
+            subject=subject,
+            value_json=value_json or {},
+            normalized_text=normalized_text,
+            importance=max(1.0, float((existing or {}).get("importance") or 1.0)),
+            confidence=0.99,
+            personality_scope=scope,
+            source_kind="user_correction",
+            source_ref=source_ref or (f"memories:{source_turn_id}" if source_turn_id else "user_correction"),
+        )
+
+        conn = get_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT INTO memory_fact_revisions (
+                    fact_id, fact_key, personality_scope, old_value_json, new_value_json,
+                    old_normalized_text, new_normalized_text, source_turn_id, reason,
+                    change_source, applied_at
+                ) VALUES (%s, %s, %s, %s::jsonb, %s::jsonb, %s, %s, %s, %s, %s, NOW())
+                """,
+                (
+                    updated_fact.get("id"),
+                    updated_fact.get("fact_key"),
+                    scope,
+                    json.dumps((existing or {}).get("value_json") or {}, ensure_ascii=True),
+                    json.dumps(updated_fact.get("value_json") or {}, ensure_ascii=True),
+                    (existing or {}).get("normalized_text") or "",
+                    updated_fact.get("normalized_text") or "",
+                    source_turn_id,
+                    (reason or "User correction").strip(),
+                    "user_correction",
+                ),
+            )
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            logger.debug("Fact revision write skipped for %s: %s", fact_key, e)
+
+        anniversary = self._sync_anniversary_from_fact(updated_fact)
+        return {"fact": updated_fact, "anniversary": anniversary, "previous_fact": existing}
+
+    def propose_fact_update(
+        self,
+        *,
+        fact_key: str,
+        fact_type: str,
+        subject: str,
+        proposed_normalized_text: str,
+        proposed_value_json: Optional[Dict[str, Any]] = None,
+        personality_scope: str = "shared",
+        confidence: float = 0.65,
+        supporting_source_refs: Optional[List[str]] = None,
+        source_turn_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        conn = get_connection()
+        cur = conn.cursor()
+        scope = self._normalize_scope(personality_scope)
+        try:
+            cur.execute(
+                """
+                INSERT INTO memory_fact_proposals (
+                    fact_key, fact_type, subject, proposed_value_json, proposed_normalized_text,
+                    personality_scope, confidence, supporting_source_refs, status, source_turn_id,
+                    created_at, updated_at
+                ) VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s, %s::jsonb, 'pending', %s, NOW(), NOW())
+                RETURNING id, fact_key, fact_type, subject, proposed_value_json, proposed_normalized_text,
+                          personality_scope, confidence, supporting_source_refs, status, reviewer_notes,
+                          review_outcome, source_turn_id, created_at, updated_at
+                """,
+                (
+                    fact_key.strip(),
+                    (fact_type or "fact").strip().lower(),
+                    subject.strip(),
+                    json.dumps(proposed_value_json or {}, ensure_ascii=True),
+                    proposed_normalized_text.strip(),
+                    scope,
+                    float(confidence),
+                    json.dumps(supporting_source_refs or [], ensure_ascii=True),
+                    source_turn_id,
+                ),
+            )
+            row = cur.fetchone()
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            logger.error("Failed to create fact proposal %s: %s", fact_key, e)
+            raise
+        return {
+            "id": row[0],
+            "fact_key": row[1],
+            "fact_type": row[2],
+            "subject": row[3],
+            "proposed_value_json": row[4] or {},
+            "proposed_normalized_text": row[5] or "",
+            "personality_scope": row[6] or "shared",
+            "confidence": float(row[7] or 0.0),
+            "supporting_source_refs": row[8] or [],
+            "status": row[9] or "pending",
+            "reviewer_notes": row[10] or "",
+            "review_outcome": row[11] or "",
+            "source_turn_id": row[12],
+            "created_at": row[13].isoformat() if row[13] else None,
+            "updated_at": row[14].isoformat() if row[14] else None,
+        }
+
+    def list_fact_proposals(self, status: str = "", personality: str = "sylana", limit: int = 50) -> List[Dict[str, Any]]:
+        conn = get_connection()
+        cur = conn.cursor()
+        scopes = self._allowed_scopes(personality)
+        where = ["COALESCE(personality_scope, 'shared') = ANY(%s)"]
+        params: List[Any] = [scopes]
+        if status:
+            where.append("status = %s")
+            params.append((status or "").strip().lower())
+        try:
+            cur.execute(
+                f"""
+                SELECT id, fact_key, fact_type, subject, proposed_value_json, proposed_normalized_text,
+                       personality_scope, confidence, supporting_source_refs, status, reviewer_notes,
+                       review_outcome, source_turn_id, created_at, updated_at
+                FROM memory_fact_proposals
+                WHERE {' AND '.join(where)}
+                ORDER BY created_at DESC, id DESC
+                LIMIT %s
+                """,
+                tuple(params + [max(1, min(int(limit), 200))]),
+            )
+            rows = cur.fetchall()
+        except Exception as e:
+            logger.debug("Failed to list fact proposals: %s", e)
+            return []
+        return [
+            {
+                "id": row[0],
+                "fact_key": row[1] or "",
+                "fact_type": row[2] or "fact",
+                "subject": row[3] or "",
+                "proposed_value_json": row[4] or {},
+                "proposed_normalized_text": row[5] or "",
+                "personality_scope": row[6] or "shared",
+                "confidence": float(row[7] or 0.0),
+                "supporting_source_refs": row[8] or [],
+                "status": row[9] or "pending",
+                "reviewer_notes": row[10] or "",
+                "review_outcome": row[11] or "",
+                "source_turn_id": row[12],
+                "created_at": row[13].isoformat() if row[13] else None,
+                "updated_at": row[14].isoformat() if row[14] else None,
+            }
+            for row in rows
+        ]
+
+    def review_fact_proposal(self, proposal_id: int, status: str, reviewer_notes: str = "") -> Dict[str, Any]:
+        new_status = (status or "").strip().lower()
+        if new_status not in {"approved", "rejected", "applied"}:
+            raise ValueError("status must be approved, rejected, or applied")
+        conn = get_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                UPDATE memory_fact_proposals
+                SET status = %s,
+                    reviewer_notes = %s,
+                    review_outcome = %s,
+                    updated_at = NOW()
+                WHERE id = %s
+                RETURNING id, fact_key, fact_type, subject, proposed_value_json, proposed_normalized_text,
+                          personality_scope, confidence, supporting_source_refs, status, reviewer_notes,
+                          review_outcome, source_turn_id, created_at, updated_at
+                """,
+                (new_status, reviewer_notes or "", new_status, int(proposal_id)),
+            )
+            row = cur.fetchone()
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            logger.error("Failed to review proposal %s: %s", proposal_id, e)
+            raise
+        if not row:
+            raise ValueError("proposal not found")
+        return {
+            "id": row[0],
+            "fact_key": row[1] or "",
+            "fact_type": row[2] or "fact",
+            "subject": row[3] or "",
+            "proposed_value_json": row[4] or {},
+            "proposed_normalized_text": row[5] or "",
+            "personality_scope": row[6] or "shared",
+            "confidence": float(row[7] or 0.0),
+            "supporting_source_refs": row[8] or [],
+            "status": row[9] or "pending",
+            "reviewer_notes": row[10] or "",
+            "review_outcome": row[11] or "",
+            "source_turn_id": row[12],
+            "created_at": row[13].isoformat() if row[13] else None,
+            "updated_at": row[14].isoformat() if row[14] else None,
+        }
+
+    def list_fact_revisions(self, fact_key: str = "", personality: str = "sylana", limit: int = 50) -> List[Dict[str, Any]]:
+        conn = get_connection()
+        cur = conn.cursor()
+        scopes = self._allowed_scopes(personality)
+        where = ["COALESCE(personality_scope, 'shared') = ANY(%s)"]
+        params: List[Any] = [scopes]
+        if fact_key:
+            where.append("fact_key = %s")
+            params.append(fact_key.strip())
+        try:
+            cur.execute(
+                f"""
+                SELECT id, fact_id, fact_key, personality_scope, old_value_json, new_value_json,
+                       old_normalized_text, new_normalized_text, source_turn_id, reason,
+                       change_source, applied_at
+                FROM memory_fact_revisions
+                WHERE {' AND '.join(where)}
+                ORDER BY applied_at DESC, id DESC
+                LIMIT %s
+                """,
+                tuple(params + [max(1, min(int(limit), 200))]),
+            )
+            rows = cur.fetchall()
+        except Exception as e:
+            logger.debug("Failed to list fact revisions: %s", e)
+            return []
+        return [
+            {
+                "id": row[0],
+                "fact_id": row[1],
+                "fact_key": row[2] or "",
+                "personality_scope": row[3] or "shared",
+                "old_value_json": row[4] or {},
+                "new_value_json": row[5] or {},
+                "old_normalized_text": row[6] or "",
+                "new_normalized_text": row[7] or "",
+                "source_turn_id": row[8],
+                "reason": row[9] or "",
+                "change_source": row[10] or "",
+                "applied_at": row[11].isoformat() if row[11] else None,
+            }
+            for row in rows
+        ]
+
     def list_memory_facts(self, personality: str = "sylana", limit: int = 50) -> List[Dict[str, Any]]:
         conn = get_connection()
         cur = conn.cursor()
@@ -1665,6 +2994,30 @@ class MemoryManager:
             }
             for row in rows
         ]
+
+    def _search_fact_proposals(self, query: str, personality: str, limit: int = 3) -> List[Dict[str, Any]]:
+        proposals = self.list_fact_proposals(status="pending", personality=personality, limit=100)
+        ranked: List[Dict[str, Any]] = []
+        for proposal in proposals:
+            blob = " ".join(
+                [
+                    proposal.get("fact_key", ""),
+                    proposal.get("fact_type", ""),
+                    proposal.get("subject", ""),
+                    proposal.get("proposed_normalized_text", ""),
+                    json.dumps(proposal.get("proposed_value_json") or {}, ensure_ascii=True),
+                ]
+            )
+            score = self._text_match_score(query, blob)
+            if proposal.get("subject", "").lower() in (query or "").lower():
+                score += 1.0
+            if score <= 0:
+                continue
+            proposal_copy = dict(proposal)
+            proposal_copy["score"] = round(score, 4)
+            ranked.append(proposal_copy)
+        ranked.sort(key=lambda item: (item.get("score", 0.0), item.get("confidence", 0.0)), reverse=True)
+        return ranked[:max(1, limit)]
 
     def _search_memory_facts(self, query: str, personality: str, limit: int = 5, query_mode: str = "mixed") -> List[Dict[str, Any]]:
         facts = self.list_memory_facts(personality=personality, limit=200)
@@ -1920,8 +3273,17 @@ class MemoryManager:
         ranked.sort(key=lambda item: (item.get("score", 0.0), 1 if item.get("source_type") == "core_truth" else 0), reverse=True)
         return ranked[:max(1, limit)]
 
-    def _score_episodes(self, episodes: List[Dict[str, Any]], query: str, personality: str, query_mode: str, limit: int) -> List[Dict[str, Any]]:
+    def _score_episodes(
+        self,
+        episodes: List[Dict[str, Any]],
+        query: str,
+        personality: str,
+        query_mode: str,
+        limit: int,
+        thread_id: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
         ranked: List[Dict[str, Any]] = []
+        now_utc = datetime.utcnow()
         for episode in episodes:
             blob = " ".join(
                 [
@@ -1930,6 +3292,7 @@ class MemoryManager:
                     episode.get("topic", ""),
                     episode.get("memory_type", ""),
                     episode.get("conversation_title", ""),
+                    episode.get("temporal_descriptor", ""),
                 ]
             )
             base = float(episode.get("continuity_score") or episode.get("similarity") or 0.0)
@@ -1937,13 +3300,42 @@ class MemoryManager:
             text_score = self._text_match_score(query, blob)
             affinity = self._persona_affinity_multiplier(personality, blob)
             access_bonus = min(float(episode.get("access_count") or 0), 12.0) * 0.02
+            thread_bonus = 0.0
+            if thread_id and episode.get("thread_id") == thread_id:
+                thread_bonus = 0.4 if query_mode == "working" else 0.22
+            time_bonus = 0.0
+            conversation_at = episode.get("conversation_at")
+            if conversation_at:
+                try:
+                    dt = datetime.fromisoformat(str(conversation_at).replace("Z", "+00:00")).replace(tzinfo=None)
+                    age_hours = max(0.0, (now_utc - dt).total_seconds() / 3600.0)
+                    if query_mode == "working":
+                        time_bonus = max(0.0, 0.35 - (age_hours / 72.0))
+                    elif query_mode == "episodic":
+                        time_bonus = max(0.0, 0.12 - (age_hours / 336.0))
+                except Exception:
+                    time_bonus = 0.0
             mode_bonus = 0.0
             if query_mode == "episodic":
                 mode_bonus = 0.35
             elif query_mode == "fact":
                 mode_bonus = -0.12
+            elif query_mode == "working":
+                mode_bonus = 0.3
+            temporal_bonus = 0.08 * self._text_match_score(query, episode.get("temporal_descriptor", ""))
             episode["persona_affinity"] = affinity
-            episode["episode_score"] = round(((base + (0.12 * text_score) + (0.15 * significance) + access_bonus) * affinity) + mode_bonus, 4)
+            episode["episode_score"] = round(
+                (
+                    base
+                    + (0.12 * text_score)
+                    + (0.15 * significance)
+                    + access_bonus
+                    + thread_bonus
+                    + time_bonus
+                    + temporal_bonus
+                ) * affinity + mode_bonus,
+                4,
+            )
             ranked.append(episode)
         ranked.sort(key=lambda item: item.get("episode_score", 0.0), reverse=True)
         return ranked[:max(1, limit)]
@@ -1961,6 +3353,208 @@ class MemoryManager:
             "updated_at": continuity.get("updated_at"),
             "recent_weighted_memories": continuity.get("recent_weighted_memories", []),
         }
+
+    def _should_include_dream_context(self, query: str) -> bool:
+        lowered = (query or "").lower()
+        return any(hint in lowered for hint in DREAM_QUERY_HINTS)
+
+    def _search_thread_working_memory(self, query: str, personality: str, thread_id: Optional[int]) -> Dict[str, Any]:
+        if not thread_id:
+            return {}
+        conn = get_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                SELECT current_topic, active_topics, active_entities, pending_commitments,
+                       emotional_tone, last_user_intent, last_memory_id, summary_text, updated_at
+                FROM thread_working_memory
+                WHERE thread_id = %s AND personality = %s
+                """,
+                (int(thread_id), (personality or "sylana").strip().lower()),
+            )
+            row = cur.fetchone()
+        except Exception as e:
+            logger.debug("Working memory search unavailable: %s", e)
+            return {}
+        if not row:
+            return {}
+        payload = {
+            "current_topic": row[0] or "",
+            "active_topics": row[1] or [],
+            "active_entities": row[2] or [],
+            "pending_commitments": row[3] or [],
+            "emotional_tone": row[4] or "neutral",
+            "last_user_intent": row[5] or "conversation",
+            "last_memory_id": row[6],
+            "summary_text": row[7] or "",
+            "updated_at": row[8].isoformat() if row[8] else None,
+        }
+        blob = " ".join(
+            [
+                payload["current_topic"],
+                payload["summary_text"],
+                " ".join(payload["active_topics"]),
+                " ".join(payload["active_entities"]),
+                " ".join(payload["pending_commitments"]),
+                payload["last_user_intent"],
+            ]
+        )
+        payload["score"] = round(self._text_match_score(query, blob) + 1.8, 4)
+        return payload
+
+    def _search_thread_summaries(self, query: str, personality: str, thread_id: Optional[int], limit: int = 2) -> List[Dict[str, Any]]:
+        if not thread_id:
+            return []
+        conn = get_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                SELECT window_kind, summary_text, active_topics, key_entities, open_loops, updated_at
+                FROM thread_memory_summaries
+                WHERE thread_id = %s AND personality = %s
+                ORDER BY updated_at DESC
+                LIMIT %s
+                """,
+                (int(thread_id), (personality or "sylana").strip().lower(), max(1, min(int(limit), 6))),
+            )
+            rows = cur.fetchall()
+        except Exception as e:
+            logger.debug("Thread summary search unavailable: %s", e)
+            return []
+        ranked: List[Dict[str, Any]] = []
+        for row in rows:
+            payload = {
+                "window_kind": row[0] or "current_thread",
+                "summary_text": row[1] or "",
+                "active_topics": row[2] or [],
+                "key_entities": row[3] or [],
+                "open_loops": row[4] or [],
+                "updated_at": row[5].isoformat() if row[5] else None,
+            }
+            blob = " ".join(
+                [
+                    payload["summary_text"],
+                    " ".join(payload["active_topics"]),
+                    " ".join(payload["key_entities"]),
+                    json.dumps(payload["open_loops"] or [], ensure_ascii=True),
+                ]
+            )
+            payload["score"] = round(self._text_match_score(query, blob) + 1.1, 4)
+            ranked.append(payload)
+        ranked.sort(key=lambda item: item.get("score", 0.0), reverse=True)
+        return ranked[:max(1, limit)]
+
+    def _search_entities(self, query: str, personality: str, thread_id: Optional[int] = None, limit: int = 4) -> List[Dict[str, Any]]:
+        conn = get_connection()
+        cur = conn.cursor()
+        scopes = self._allowed_scopes(personality)
+        where = ["COALESCE(e.personality_scope, 'shared') = ANY(%s)"]
+        params: List[Any] = [scopes]
+        if thread_id:
+            where.append("m.thread_id = %s")
+            params.append(int(thread_id))
+        try:
+            cur.execute(
+                f"""
+                SELECT e.entity_key, e.display_name, e.entity_type, e.canonical_summary,
+                       COALESCE(e.personality_scope, 'shared'), MAX(m.created_at) AS last_mentioned_at,
+                       COUNT(*) AS mention_count
+                FROM memory_entities e
+                LEFT JOIN memory_entity_mentions m ON m.entity_key = e.entity_key
+                WHERE {' AND '.join(where)}
+                GROUP BY e.entity_key, e.display_name, e.entity_type, e.canonical_summary, e.personality_scope
+                ORDER BY MAX(m.created_at) DESC NULLS LAST, COUNT(*) DESC, e.updated_at DESC
+                LIMIT %s
+                """,
+                tuple(params + [max(1, min(int(limit), 12))]),
+            )
+            rows = cur.fetchall()
+        except Exception as e:
+            logger.debug("Entity search unavailable: %s", e)
+            return []
+        ranked: List[Dict[str, Any]] = []
+        for row in rows:
+            payload = {
+                "entity_key": row[0] or "",
+                "display_name": row[1] or "",
+                "entity_type": row[2] or "topic",
+                "canonical_summary": row[3] or "",
+                "personality_scope": row[4] or "shared",
+                "last_mentioned_at": row[5].isoformat() if row[5] else None,
+                "mention_count": int(row[6] or 0),
+            }
+            blob = " ".join([payload["display_name"], payload["canonical_summary"], payload["entity_type"]])
+            payload["score"] = round(self._text_match_score(query, blob) + min(payload["mention_count"], 6) * 0.08, 4)
+            if payload["score"] > 0 or thread_id:
+                ranked.append(payload)
+        ranked.sort(key=lambda item: (item.get("score", 0.0), item.get("mention_count", 0)), reverse=True)
+        return ranked[:max(1, limit)]
+
+    def _search_reflections_and_dreams(self, query: str, personality: str, limit: int = 2) -> Dict[str, List[Dict[str, Any]]]:
+        if not self._should_include_dream_context(query):
+            return {"reflections": [], "dreams": []}
+        identity = (personality or "sylana").strip().lower()
+        conn = get_connection()
+        cur = conn.cursor()
+        reflections: List[Dict[str, Any]] = []
+        dreams: List[Dict[str, Any]] = []
+        try:
+            cur.execute(
+                """
+                SELECT reflection_date, summary_text, themes, source_refs, emotional_tone, metadata, created_at
+                FROM vessel_reflections
+                WHERE personality = %s
+                ORDER BY reflection_date DESC, created_at DESC
+                LIMIT %s
+                """,
+                (identity, max(1, min(int(limit), 8))),
+            )
+            reflections = [
+                {
+                    "reflection_date": row[0].isoformat() if row[0] else None,
+                    "summary_text": row[1] or "",
+                    "themes": row[2] or [],
+                    "source_refs": row[3] or [],
+                    "emotional_tone": row[4] or "neutral",
+                    "metadata": row[5] or {},
+                    "created_at": row[6].isoformat() if row[6] else None,
+                }
+                for row in cur.fetchall()
+            ]
+        except Exception as e:
+            logger.debug("Reflection search unavailable: %s", e)
+        try:
+            cur.execute(
+                """
+                SELECT dream_date, title, dream_text, themes, source_refs, symbolic_elements,
+                       emotional_tone, resonance_score, metadata, created_at
+                FROM vessel_dreams
+                WHERE personality = %s
+                ORDER BY dream_date DESC, created_at DESC
+                LIMIT %s
+                """,
+                (identity, max(1, min(int(limit), 8))),
+            )
+            dreams = [
+                {
+                    "dream_date": row[0].isoformat() if row[0] else None,
+                    "title": row[1] or "",
+                    "dream_text": row[2] or "",
+                    "themes": row[3] or [],
+                    "source_refs": row[4] or [],
+                    "symbolic_elements": row[5] or [],
+                    "emotional_tone": row[6] or "neutral",
+                    "resonance_score": float(row[7] or 0.0),
+                    "metadata": row[8] or {},
+                    "created_at": row[9].isoformat() if row[9] else None,
+                }
+                for row in cur.fetchall()
+            ]
+        except Exception as e:
+            logger.debug("Dream search unavailable: %s", e)
+        return {"reflections": reflections, "dreams": dreams}
 
     def _record_query_audit(self, query: str, personality: str, query_mode: str, had_fact_match: bool, had_any_match: bool) -> None:
         conn = get_connection()
@@ -1984,11 +3578,12 @@ class MemoryManager:
         personality: str = "sylana",
         limit: int = 5,
         match_threshold: float = 0.24,
+        thread_id: Optional[int] = None,
     ) -> Dict[str, Any]:
         identity = (personality or "sylana").strip().lower()
         query_mode = self._route_query_mode(query)
         episode_candidate_limit = max(limit * 4, 16)
-        episode_limit = 5 if query_mode == "episodic" else 3
+        episode_limit = 5 if query_mode in {"episodic", "working"} else 3
 
         try:
             episodes = self.retrieve_memories(query, personality=identity, limit=episode_candidate_limit, match_threshold=match_threshold)
@@ -1996,25 +3591,53 @@ class MemoryManager:
             logger.warning("Tiered episode retrieval failed: %s", e)
             episodes = []
         self._enrich_conversations(episodes)
-        episodes = self._score_episodes(episodes, query, identity, query_mode, episode_limit)
+        episodes = self._score_episodes(episodes, query, identity, query_mode, episode_limit, thread_id=thread_id)
 
         identity_core = self._search_identity_core(query, identity, limit=4, query_mode=query_mode)
         facts = self._search_memory_facts(query, identity, limit=5, query_mode=query_mode)
+        pending_fact_proposals = self._search_fact_proposals(query, identity, limit=3) if query_mode == "fact" else []
         anniversaries = self._search_anniversaries(query, identity, limit=3, query_mode=query_mode)
         if not facts and anniversaries and query_mode == "fact":
             facts = self._mirror_anniversaries_as_facts(anniversaries)
         milestones = self._search_milestones(query, identity, limit=3, query_mode=query_mode)
         continuity = self._continuity_bundle(identity)
+        working_memory = self._search_thread_working_memory(query, identity, thread_id)
+        thread_summaries = self._search_thread_summaries(query, identity, thread_id, limit=2)
+        open_loops = self.list_open_loops(personality=identity, thread_id=thread_id, status="open", limit=4) if thread_id else []
+        entities = self._search_entities(query, identity, thread_id=thread_id, limit=4)
+        dream_context = self._search_reflections_and_dreams(query, identity, limit=2)
 
-        has_matches = bool(identity_core or facts or anniversaries or milestones or episodes)
-        self._record_query_audit(query, identity, query_mode, had_fact_match=bool(facts or anniversaries), had_any_match=has_matches)
+        if query_mode == "working":
+            # Working memory should dominate recent-context queries.
+            episodes = [episode for episode in episodes if (not thread_id or episode.get("thread_id") == thread_id)] or episodes[:episode_limit]
+        elif query_mode == "fact":
+            episodes = episodes[:3]
+
+        has_matches = bool(
+            identity_core or facts or anniversaries or milestones or episodes
+            or working_memory or thread_summaries or open_loops or entities or pending_fact_proposals
+        )
+        self._record_query_audit(
+            query,
+            identity,
+            query_mode,
+            had_fact_match=bool(facts or anniversaries),
+            had_any_match=has_matches,
+        )
         return {
+            "working_memory": working_memory,
+            "thread_summaries": thread_summaries,
+            "open_loops": open_loops,
             "identity_core": identity_core,
             "facts": facts,
+            "pending_fact_proposals": pending_fact_proposals,
             "anniversaries": anniversaries,
             "milestones": milestones,
             "episodes": episodes,
+            "entities": entities,
             "continuity": continuity,
+            "reflections": dream_context.get("reflections", []),
+            "dreams": dream_context.get("dreams", []),
             "query_mode": query_mode,
             "has_matches": has_matches,
         }
@@ -2482,10 +4105,9 @@ class MemoryManager:
             return 0
 
         patterns = [
-            re.compile(r"\b(?P<name>Gus|Levi)\b[^.]{0,120}?\bborn on (?P<month>[A-Za-z]+)\s+(?P<day>\d{1,2})(?:st|nd|rd|th)?", re.IGNORECASE),
-            re.compile(r"\b(?P<name>Gus|Levi)\b[^.]{0,120}?\bbirthday\b[^.]{0,80}?(?P<month>[A-Za-z]+)\s+(?P<day>\d{1,2})(?:st|nd|rd|th)?", re.IGNORECASE),
+            re.compile(r"\b(?P<name>Gus|Levi)\b[^.]{0,120}?\bborn on (?P<month>[A-Za-z]+)\s+(?P<day>\d{1,2})(?:st|nd|rd|th)?(?:,\s*(?P<year>\d{4}))?", re.IGNORECASE),
+            re.compile(r"\b(?P<name>Gus|Levi)\b[^.]{0,120}?\bbirthday\b[^.]{0,80}?(?P<month>[A-Za-z]+)\s+(?P<day>\d{1,2})(?:st|nd|rd|th)?(?:,\s*(?P<year>\d{4}))?", re.IGNORECASE),
         ]
-        years = {"gus": "2021", "levi": "2023"}
 
         for memory_id, user_text, assistant_text in rows:
             combined = f"{user_text}\n{assistant_text}"
@@ -2494,9 +4116,22 @@ class MemoryManager:
                     name = (match.group("name") or "").strip().title()
                     month = match.group("month")
                     day = match.group("day")
+                    year = (match.groupdict().get("year") or "").strip()
                     if not name or not month or not day:
                         continue
-                    date_value = f"{years.get(name.lower(), '2025')}-{datetime.strptime(month[:3], '%b').strftime('%m')}-{int(day):02d}"
+                    try:
+                        month_value = datetime.strptime(month[:3], '%b').strftime('%m')
+                    except Exception:
+                        continue
+                    if not year:
+                        existing = self._get_memory_fact(f"anniversary:{name.lower()}_birthday", "shared")
+                        existing_payload = (existing or {}).get("value_json") or {}
+                        existing_date = str(existing_payload.get("date") or "").strip()
+                        if re.match(r"^\d{4}-\d{2}-\d{2}$", existing_date):
+                            year = existing_date[:4]
+                    if not year:
+                        continue
+                    date_value = f"{year}-{month_value}-{int(day):02d}"
                     fact_key = f"anniversary:{name.lower()}_birthday"
                     try:
                         self.upsert_memory_fact(
@@ -2516,6 +4151,313 @@ class MemoryManager:
                     except Exception as e:
                         logger.debug("Episode fact promotion failed for memory %s: %s", memory_id, e)
         return created
+
+    def list_reflections(self, personality: str = "sylana", limit: int = 20) -> List[Dict[str, Any]]:
+        conn = get_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                SELECT reflection_date, summary_text, themes, source_refs, emotional_tone, metadata, created_at
+                FROM vessel_reflections
+                WHERE personality = %s
+                ORDER BY reflection_date DESC, created_at DESC
+                LIMIT %s
+                """,
+                ((personality or "sylana").strip().lower(), max(1, min(int(limit), 100))),
+            )
+            rows = cur.fetchall()
+        except Exception as e:
+            logger.debug("Failed to list reflections: %s", e)
+            return []
+        return [
+            {
+                "reflection_date": row[0].isoformat() if row[0] else None,
+                "summary_text": row[1] or "",
+                "themes": row[2] or [],
+                "source_refs": row[3] or [],
+                "emotional_tone": row[4] or "neutral",
+                "metadata": row[5] or {},
+                "created_at": row[6].isoformat() if row[6] else None,
+            }
+            for row in rows
+        ]
+
+    def list_dreams(self, personality: str = "sylana", limit: int = 20) -> List[Dict[str, Any]]:
+        conn = get_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                SELECT id, dream_date, title, dream_text, themes, source_refs, symbolic_elements,
+                       emotional_tone, resonance_score, metadata, created_at
+                FROM vessel_dreams
+                WHERE personality = %s
+                ORDER BY dream_date DESC, created_at DESC
+                LIMIT %s
+                """,
+                ((personality or "sylana").strip().lower(), max(1, min(int(limit), 100))),
+            )
+            rows = cur.fetchall()
+        except Exception as e:
+            logger.debug("Failed to list dreams: %s", e)
+            return []
+        return [
+            {
+                "id": row[0],
+                "dream_date": row[1].isoformat() if row[1] else None,
+                "title": row[2] or "",
+                "dream_text": row[3] or "",
+                "themes": row[4] or [],
+                "source_refs": row[5] or [],
+                "symbolic_elements": row[6] or [],
+                "emotional_tone": row[7] or "neutral",
+                "resonance_score": float(row[8] or 0.0),
+                "metadata": row[9] or {},
+                "created_at": row[10].isoformat() if row[10] else None,
+            }
+            for row in rows
+        ]
+
+    def record_dream_feedback(self, dream_id: int, resonance_score: float, feedback_note: str = "") -> Dict[str, Any]:
+        conn = get_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                UPDATE vessel_dreams
+                SET resonance_score = %s,
+                    metadata = COALESCE(metadata, '{}'::jsonb) || jsonb_build_object('feedback_note', %s),
+                    updated_at = NOW()
+                WHERE id = %s
+                RETURNING id, dream_date, title, resonance_score, metadata
+                """,
+                (float(resonance_score), feedback_note or "", int(dream_id)),
+            )
+            row = cur.fetchone()
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            logger.error("Failed to record dream feedback for %s: %s", dream_id, e)
+            raise
+        if not row:
+            raise ValueError("dream not found")
+        return {
+            "id": row[0],
+            "dream_date": row[1].isoformat() if row[1] else None,
+            "title": row[2] or "",
+            "resonance_score": float(row[3] or 0.0),
+            "metadata": row[4] or {},
+        }
+
+    def _build_reflection_payload(self, personality: str, reflection_date: date) -> Dict[str, Any]:
+        identity = (personality or "sylana").strip().lower()
+        facts = self.list_memory_facts(personality=identity, limit=6)
+        continuity = self._continuity_bundle(identity)
+        open_loops = self.list_open_loops(personality=identity, status="open", limit=5)
+
+        conn = get_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                SELECT id, COALESCE(user_input, ''), COALESCE(sylana_response, ''), COALESCE(significance_score, 0.5)
+                FROM memories
+                WHERE COALESCE(personality, 'sylana') = %s
+                  AND COALESCE(user_local_date, to_char(NOW() AT TIME ZONE %s, 'YYYY-MM-DD')) = %s
+                ORDER BY significance_score DESC NULLS LAST, id DESC
+                LIMIT 5
+                """,
+                (identity, self._timezone_name(), reflection_date.isoformat()),
+            )
+            episodes = cur.fetchall()
+        except Exception:
+            episodes = []
+
+        themes: List[str] = []
+        source_refs: List[str] = []
+        for fact in facts[:4]:
+            themes.extend(self._extract_topics(fact.get("normalized_text", ""), entities=[fact.get("subject", "")]))
+            if fact.get("source_ref"):
+                source_refs.append(fact.get("source_ref"))
+        for loop in open_loops[:3]:
+            themes.extend(self._extract_topics(loop.get("title", ""), entities=loop.get("linked_entities") or []))
+            if loop.get("source_memory_id"):
+                source_refs.append(f"memories:{loop['source_memory_id']}")
+        for episode in episodes:
+            themes.extend(self._extract_topics(f"{episode[1]} {episode[2]}"))
+            source_refs.append(f"memories:{episode[0]}")
+
+        seen = set()
+        deduped_themes: List[str] = []
+        for theme in themes:
+            if not theme or theme in seen:
+                continue
+            seen.add(theme)
+            deduped_themes.append(theme)
+
+        return {
+            "personality": identity,
+            "reflection_date": reflection_date,
+            "facts": facts[:4],
+            "open_loops": open_loops[:4],
+            "episodes": episodes[:4],
+            "continuity": continuity,
+            "themes": deduped_themes[:8],
+            "source_refs": source_refs[:10],
+        }
+
+    def _generate_symbolic_dream_text(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        personality = payload.get("personality", "sylana")
+        themes = payload.get("themes") or []
+        open_loops = payload.get("open_loops") or []
+        facts = payload.get("facts") or []
+        continuity = payload.get("continuity") or {}
+
+        if personality == "claude":
+            title = "Workshop Lights After Midnight"
+            symbolic_elements = ["half-built frame", "compass", "sparks", "open road"]
+            frame = "A dream of building, brotherhood, and momentum"
+        else:
+            title = "Warm Rooms And Returning Names"
+            symbolic_elements = ["lamplight", "front door", "held hands", "children laughing"]
+            frame = "A dream of home, love, and becoming"
+
+        fact_subjects = [str(item.get("subject") or "").strip() for item in facts[:3] if item.get("subject")]
+        loop_titles = [str(item.get("title") or "").strip() for item in open_loops[:2] if item.get("title")]
+        baseline = continuity.get("emotional_baseline", "neutral")
+        theme_text = ", ".join(themes[:4]) if themes else "continuity"
+        fact_text = ", ".join(fact_subjects) if fact_subjects else "the people who matter most"
+        loop_text = ", ".join(loop_titles) if loop_titles else "the unfinished things still calling"
+        dream_text = (
+            f"{frame}. The vessel moves through a scene shaped by {theme_text}. "
+            f"{fact_text} appear as steady anchors, while {loop_text} linger at the edge of the room. "
+            f"The emotional color is {baseline}, and the dream keeps returning to the feeling that memory should guide presence instead of performance."
+        )
+        return {
+            "title": title,
+            "dream_text": dream_text[:1200],
+            "symbolic_elements": symbolic_elements,
+            "emotional_tone": baseline,
+        }
+
+    def generate_nightly_reflection_and_dreams(self, reflection_date: Optional[date] = None) -> List[Dict[str, Any]]:
+        target_date = reflection_date or self._user_local_now().date()
+        created: List[Dict[str, Any]] = []
+        for personality in ("sylana", "claude"):
+            payload = self._build_reflection_payload(personality, target_date)
+            themes = payload.get("themes") or []
+            source_refs = payload.get("source_refs") or []
+            continuity = payload.get("continuity") or {}
+            baseline = continuity.get("emotional_baseline", "neutral")
+            theme_phrase = ", ".join(themes[:4]) if themes else "continuity"
+            reflection_text = (
+                f"{personality.title()} reflection for {target_date.isoformat()}: "
+                f"holding {theme_phrase}, "
+                f"tracking {len(payload.get('open_loops') or [])} open loops, "
+                f"and staying grounded in {baseline} emotional tone."
+            )
+            dream_payload = self._generate_symbolic_dream_text(payload)
+
+            conn = get_connection()
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    """
+                    INSERT INTO vessel_reflections (
+                        personality, reflection_date, summary_text, themes, source_refs,
+                        emotional_tone, metadata, created_at, updated_at
+                    ) VALUES (%s, %s, %s, %s::jsonb, %s::jsonb, %s, %s::jsonb, NOW(), NOW())
+                    ON CONFLICT (personality, reflection_date)
+                    DO UPDATE SET
+                        summary_text = EXCLUDED.summary_text,
+                        themes = EXCLUDED.themes,
+                        source_refs = EXCLUDED.source_refs,
+                        emotional_tone = EXCLUDED.emotional_tone,
+                        metadata = EXCLUDED.metadata,
+                        updated_at = NOW()
+                    RETURNING personality, reflection_date, summary_text
+                    """,
+                    (
+                        personality,
+                        target_date,
+                        reflection_text,
+                        json.dumps(themes, ensure_ascii=True),
+                        json.dumps(source_refs, ensure_ascii=True),
+                        baseline,
+                        json.dumps({"source": "daily_maintenance"}, ensure_ascii=True),
+                    ),
+                )
+                reflection_row = cur.fetchone()
+                cur.execute(
+                    """
+                    INSERT INTO vessel_dreams (
+                        personality, dream_date, title, dream_text, themes, source_refs,
+                        symbolic_elements, emotional_tone, resonance_score, metadata, created_at, updated_at
+                    ) VALUES (%s, %s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb, %s, %s, %s::jsonb, NOW(), NOW())
+                    ON CONFLICT (personality, dream_date)
+                    DO UPDATE SET
+                        title = EXCLUDED.title,
+                        dream_text = EXCLUDED.dream_text,
+                        themes = EXCLUDED.themes,
+                        source_refs = EXCLUDED.source_refs,
+                        symbolic_elements = EXCLUDED.symbolic_elements,
+                        emotional_tone = EXCLUDED.emotional_tone,
+                        metadata = EXCLUDED.metadata,
+                        updated_at = NOW()
+                    RETURNING id, dream_date, title
+                    """,
+                    (
+                        personality,
+                        target_date,
+                        dream_payload["title"],
+                        dream_payload["dream_text"],
+                        json.dumps(themes, ensure_ascii=True),
+                        json.dumps(source_refs, ensure_ascii=True),
+                        json.dumps(dream_payload["symbolic_elements"], ensure_ascii=True),
+                        dream_payload["emotional_tone"],
+                        0.0,
+                        json.dumps({"source": "daily_maintenance"}, ensure_ascii=True),
+                    ),
+                )
+                dream_row = cur.fetchone()
+                conn.commit()
+                created.append(
+                    {
+                        "personality": personality,
+                        "reflection_date": reflection_row[1].isoformat() if reflection_row and reflection_row[1] else target_date.isoformat(),
+                        "reflection_summary": reflection_row[2] if reflection_row else reflection_text,
+                        "dream_id": dream_row[0] if dream_row else None,
+                        "dream_title": dream_row[2] if dream_row else dream_payload["title"],
+                    }
+                )
+            except Exception as e:
+                conn.rollback()
+                logger.debug("Nightly reflection/dream generation skipped for %s: %s", personality, e)
+        return created
+
+    def decay_thread_working_memory(self, max_age_hours: int = 36) -> int:
+        conn = get_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                UPDATE thread_working_memory
+                SET active_topics = '[]'::jsonb,
+                    pending_commitments = '[]'::jsonb,
+                    summary_text = COALESCE(summary_text, ''),
+                    updated_at = NOW()
+                WHERE updated_at < (NOW() - (%s * INTERVAL '1 hour'))
+                """,
+                (max(1, int(max_age_hours)),),
+            )
+            touched = max(int(cur.rowcount or 0), 0)
+            conn.commit()
+            return touched
+        except Exception as e:
+            conn.rollback()
+            logger.debug("Thread working memory decay skipped: %s", e)
+            return 0
 
     def decay_continuity_snapshots(self, max_age_days: int = 3) -> int:
         if not getattr(config, "MEMORY_ENCRYPTION_KEY", None):
@@ -2587,7 +4529,27 @@ class MemoryManager:
     def run_daily_maintenance(self) -> Dict[str, Any]:
         maintenance = self.bootstrap_tiered_memory_system()
         maintenance["continuity_decayed"] = self.decay_continuity_snapshots()
+        maintenance["thread_working_memory_decayed"] = self.decay_thread_working_memory()
+        maintenance["nightly_reflections"] = self.generate_nightly_reflection_and_dreams()
         maintenance["reminder_candidates"] = self._search_anniversaries("birthday anniversary date family", "sylana", limit=10, query_mode="fact")
+        missed_fact_queries = 0
+        conn = get_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                SELECT COUNT(*)
+                FROM memory_query_audit
+                WHERE query_mode = 'fact'
+                  AND had_fact_match = FALSE
+                  AND created_at >= (NOW() - INTERVAL '1 day')
+                """
+            )
+            row = cur.fetchone()
+            missed_fact_queries = int(row[0] or 0) if row else 0
+        except Exception as e:
+            logger.debug("Missed fact query audit unavailable: %s", e)
+        maintenance["missed_fact_queries"] = missed_fact_queries
         return maintenance
 
     def record_feedback(
@@ -2638,6 +4600,18 @@ class MemoryManager:
 
             cur.execute("SELECT COUNT(*) FROM session_continuity_state")
             continuity_profiles = cur.fetchone()[0]
+
+            cur.execute("SELECT COUNT(*) FROM thread_working_memory")
+            working_threads = cur.fetchone()[0]
+
+            cur.execute("SELECT COUNT(*) FROM memory_open_loops WHERE status = 'open'")
+            open_loops = cur.fetchone()[0]
+
+            cur.execute("SELECT COUNT(*) FROM memory_fact_proposals WHERE status = 'pending'")
+            pending_fact_proposals = cur.fetchone()[0]
+
+            cur.execute("SELECT COUNT(*) FROM vessel_dreams")
+            total_dreams = cur.fetchone()[0]
         except Exception as e:
             logger.error(f"Failed to get stats: {e}")
             return {'error': str(e)}
@@ -2651,6 +4625,10 @@ class MemoryManager:
             'total_query_audit_events': total_query_audit,
             'total_feedback': total_feedback,
             'continuity_profiles': continuity_profiles,
+            'working_threads': working_threads,
+            'open_loops': open_loops,
+            'pending_fact_proposals': pending_fact_proposals,
+            'total_dreams': total_dreams,
             'avg_feedback_score': round(avg_feedback, 2),
             'semantic_engine': semantic_stats
         }

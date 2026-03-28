@@ -1308,6 +1308,7 @@ class SylanaState:
         self.last_heartbeat_result: Dict[str, Any] = {}
         self.lysara_risk_config: Dict[str, Any] = {}
         self.lysara_simulation_override: Optional[bool] = None
+        self.runtime_memory_tool_context: Dict[str, Any] = {}
 
 
 state = SylanaState()
@@ -1783,6 +1784,72 @@ def _runtime_tool_specs(active_tools: Optional[List[str]]) -> List[Dict[str, Any
             }
         )
 
+    if "memories" in active:
+        specs.extend([
+            {
+                "name": "memory_apply_user_correction",
+                "description": "Apply an explicit user correction to canonical durable memory facts such as birthdays, names, or anniversary dates. Use only when the current user turn is clearly correcting the vessel.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "fact_key": {"type": "string"},
+                        "fact_type": {"type": "string"},
+                        "subject": {"type": "string"},
+                        "normalized_text": {"type": "string"},
+                        "value_json": {"type": "object"},
+                        "personality_scope": {"type": "string"},
+                        "reason": {"type": "string"},
+                    },
+                    "required": ["fact_key", "fact_type", "subject", "normalized_text"],
+                },
+            },
+            {
+                "name": "memory_propose_fact_update",
+                "description": "Create a pending durable-memory fact proposal when the model infers a possible correction or new long-term fact but the user has not explicitly confirmed it.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "fact_key": {"type": "string"},
+                        "fact_type": {"type": "string"},
+                        "subject": {"type": "string"},
+                        "proposed_normalized_text": {"type": "string"},
+                        "proposed_value_json": {"type": "object"},
+                        "personality_scope": {"type": "string"},
+                        "confidence": {"type": "number"},
+                        "supporting_source_refs": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["fact_key", "fact_type", "subject", "proposed_normalized_text"],
+                },
+            },
+            {
+                "name": "memory_add_open_loop",
+                "description": "Add or refresh an open loop on the current thread for a pending task, follow-up, or unfinished topic.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "description": {"type": "string"},
+                        "priority": {"type": "number"},
+                        "due_hint": {"type": "string"},
+                        "linked_entities": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["title"],
+                },
+            },
+            {
+                "name": "memory_close_open_loop",
+                "description": "Close an existing open loop on the current thread when the user confirms it is done or resolved.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "open_loop_id": {"type": "integer"},
+                        "title": {"type": "string"},
+                        "resolution_note": {"type": "string"},
+                    },
+                },
+            },
+        ])
+
     if "lysara" in active:
         specs.extend([
             {
@@ -2098,6 +2165,31 @@ def _get_lysara_client() -> Optional[LysaraOpsClient]:
     if state.lysara_client is None:
         state.lysara_client = LysaraOpsClient.from_env()
     return state.lysara_client
+
+
+def _set_runtime_memory_tool_context(
+    *,
+    user_input: str,
+    personality: str,
+    thread_id: Optional[int],
+    conversation_mode: str,
+    active_tools: List[str],
+) -> None:
+    state.runtime_memory_tool_context = {
+        "user_input": user_input or "",
+        "personality": (personality or "sylana").strip().lower(),
+        "thread_id": thread_id,
+        "conversation_mode": conversation_mode or "default",
+        "active_tools": normalize_active_tools(active_tools),
+    }
+
+
+def _clear_runtime_memory_tool_context() -> None:
+    state.runtime_memory_tool_context = {}
+
+
+def _runtime_memory_tool_context() -> Dict[str, Any]:
+    return dict(getattr(state, "runtime_memory_tool_context", {}) or {})
 
 
 def _lysara_simulation_enabled() -> bool:
@@ -2502,6 +2594,94 @@ def _runtime_tool_runner(name: str, tool_input: Dict[str, Any]) -> Dict[str, Any
                 for r in rows
             ],
         }
+
+    if name.startswith("memory_"):
+        if not state.memory_manager:
+            return {"error": "memory_manager_unavailable"}
+        ctx = _runtime_memory_tool_context()
+        active_tools = normalize_active_tools(ctx.get("active_tools") if isinstance(ctx.get("active_tools"), list) else [])
+        if "memories" not in active_tools:
+            return {"error": "memories_tool_not_active"}
+        personality = str(ctx.get("personality") or "sylana").strip().lower()
+        thread_id = ctx.get("thread_id")
+        current_user_input = str(ctx.get("user_input") or "").strip()
+
+        if name == "memory_apply_user_correction":
+            if not state.memory_manager._is_explicit_correction(current_user_input):
+                return {"error": "explicit_user_correction_required"}
+            fact_key = str(tool_input.get("fact_key") or "").strip()
+            fact_type = str(tool_input.get("fact_type") or "fact").strip().lower()
+            subject = str(tool_input.get("subject") or "").strip()
+            normalized_text = str(tool_input.get("normalized_text") or "").strip()
+            if not fact_key or not subject or not normalized_text:
+                return {"error": "fact_key, subject, and normalized_text are required"}
+            return state.memory_manager.apply_user_correction(
+                fact_key=fact_key,
+                fact_type=fact_type,
+                subject=subject,
+                normalized_text=normalized_text,
+                value_json=tool_input.get("value_json") or {},
+                personality_scope=str(tool_input.get("personality_scope") or "shared"),
+                reason=str(tool_input.get("reason") or "Explicit user correction in current turn"),
+                source_turn_id=None,
+                source_ref=f"thread:{thread_id}:pending_turn" if thread_id else "pending_turn",
+            )
+
+        if name == "memory_propose_fact_update":
+            fact_key = str(tool_input.get("fact_key") or "").strip()
+            fact_type = str(tool_input.get("fact_type") or "fact").strip().lower()
+            subject = str(tool_input.get("subject") or "").strip()
+            proposed_normalized_text = str(tool_input.get("proposed_normalized_text") or "").strip()
+            if not fact_key or not subject or not proposed_normalized_text:
+                return {"error": "fact_key, subject, and proposed_normalized_text are required"}
+            supporting_refs = tool_input.get("supporting_source_refs") or []
+            if thread_id and not supporting_refs:
+                supporting_refs = [f"thread:{thread_id}:pending_turn"]
+            return state.memory_manager.propose_fact_update(
+                fact_key=fact_key,
+                fact_type=fact_type,
+                subject=subject,
+                proposed_normalized_text=proposed_normalized_text,
+                proposed_value_json=tool_input.get("proposed_value_json") or {},
+                personality_scope=str(tool_input.get("personality_scope") or "shared"),
+                confidence=float(tool_input.get("confidence") or 0.65),
+                supporting_source_refs=[str(item) for item in supporting_refs if str(item).strip()],
+                source_turn_id=None,
+            )
+
+        if name == "memory_add_open_loop":
+            if not thread_id:
+                return {"error": "thread_id_required"}
+            title = str(tool_input.get("title") or "").strip()
+            if not title:
+                return {"error": "title is required"}
+            return state.memory_manager.add_open_loop(
+                thread_id=int(thread_id),
+                personality=personality,
+                title=title,
+                description=str(tool_input.get("description") or "").strip(),
+                priority=float(tool_input.get("priority") or 0.5),
+                due_hint=str(tool_input.get("due_hint") or "").strip(),
+                linked_entities=[str(item).strip() for item in (tool_input.get("linked_entities") or []) if str(item).strip()],
+                source_memory_id=None,
+                source_kind="runtime_tool",
+            )
+
+        if name == "memory_close_open_loop":
+            if not thread_id and not tool_input.get("open_loop_id"):
+                return {"error": "thread_id_or_open_loop_id_required"}
+            try:
+                return state.memory_manager.close_open_loop(
+                    open_loop_id=(int(tool_input.get("open_loop_id")) if tool_input.get("open_loop_id") is not None else None),
+                    thread_id=int(thread_id) if thread_id else None,
+                    personality=personality,
+                    title=str(tool_input.get("title") or "").strip(),
+                    resolution_note=str(tool_input.get("resolution_note") or "Closed from current turn").strip(),
+                )
+            except ValueError as e:
+                return {"error": str(e)}
+
+        return {"error": f"unknown_runtime_memory_tool:{name}"}
 
     if name.startswith("lysara_"):
         client = _get_lysara_client()
@@ -4469,6 +4649,20 @@ def run_nightly_reflection_job() -> List[Dict[str, Any]]:
             {"timestamp": datetime.now(timezone.utc).isoformat(), "source": "nightly_reflection"},
         )
     )
+    if state.memory_manager:
+        try:
+            dream_rows = state.memory_manager.generate_nightly_reflection_and_dreams()
+            if dream_rows:
+                created.append({
+                    "log_id": None,
+                    "log_type": "memory_dream_runtime",
+                    "summary": f"Generated {len(dream_rows)} vessel reflection/dream rows.",
+                    "emotion_tags": emotion_tags,
+                    "metadata": {"rows": dream_rows},
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                })
+        except Exception as e:
+            logger.warning("Nightly memory dream runtime failed: %s", e)
     return created
 
 
@@ -6046,6 +6240,28 @@ def ensure_personality_schema():
         cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS secure_payload BYTEA")
         cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS access_count INTEGER DEFAULT 0")
         cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS last_accessed_at TIMESTAMPTZ DEFAULT NOW()")
+        cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS recorded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()")
+        cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS conversation_at TIMESTAMPTZ NOT NULL DEFAULT NOW()")
+        cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS user_local_date TEXT DEFAULT ''")
+        cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS user_local_time TEXT DEFAULT ''")
+        cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS timezone_name TEXT DEFAULT 'America/Chicago'")
+        cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS turn_index INTEGER DEFAULT 0")
+        cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS event_dates_json JSONB NOT NULL DEFAULT '[]'::jsonb")
+        cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS relative_time_labels JSONB NOT NULL DEFAULT '[]'::jsonb")
+        cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS temporal_descriptor TEXT DEFAULT ''")
+        cur.execute("""
+            ALTER TABLE memories
+            ADD COLUMN IF NOT EXISTS fts_vector tsvector GENERATED ALWAYS AS (
+                to_tsvector(
+                    'english',
+                    coalesce(user_input, '') || ' ' ||
+                    coalesce(sylana_response, '') || ' ' ||
+                    coalesce(topic, '') || ' ' ||
+                    coalesce(memory_type, '') || ' ' ||
+                    coalesce(temporal_descriptor, '')
+                )
+            ) STORED
+        """)
 
         cur.execute("""
             CREATE TABLE IF NOT EXISTS conversations (
@@ -6079,6 +6295,9 @@ def ensure_personality_schema():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_memories_type ON memories(memory_type)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_memories_significance ON memories(significance_score DESC)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_memories_last_accessed ON memories(last_accessed_at DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_memories_recorded_at ON memories(recorded_at DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_memories_conversation_at ON memories(conversation_at DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_memories_fts ON memories USING GIN(fts_vector)")
 
         cur.execute("""
             CREATE TABLE IF NOT EXISTS session_continuity_state (
@@ -6170,6 +6389,7 @@ def ensure_personality_schema():
             )
         """)
         cur.execute("ALTER TABLE anniversaries ADD COLUMN IF NOT EXISTS personality_scope VARCHAR(16) NOT NULL DEFAULT 'shared'")
+        cur.execute("ALTER TABLE anniversaries ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_anniversaries_scope_importance ON anniversaries(personality_scope, importance DESC)")
 
         cur.execute("""
@@ -6212,6 +6432,172 @@ def ensure_personality_schema():
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_memory_query_audit_created ON memory_query_audit(created_at DESC)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_memory_query_audit_mode ON memory_query_audit(query_mode, created_at DESC)")
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS thread_working_memory (
+                thread_id BIGINT NOT NULL REFERENCES chat_threads(id) ON DELETE CASCADE,
+                personality VARCHAR(50) NOT NULL DEFAULT 'sylana',
+                current_topic TEXT DEFAULT '',
+                active_topics JSONB NOT NULL DEFAULT '[]'::jsonb,
+                active_entities JSONB NOT NULL DEFAULT '[]'::jsonb,
+                pending_commitments JSONB NOT NULL DEFAULT '[]'::jsonb,
+                emotional_tone TEXT DEFAULT 'neutral',
+                last_user_intent TEXT DEFAULT 'conversation',
+                last_memory_id BIGINT REFERENCES memories(id) ON DELETE SET NULL,
+                summary_text TEXT DEFAULT '',
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (thread_id, personality)
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_thread_working_memory_updated ON thread_working_memory(updated_at DESC)")
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS thread_memory_summaries (
+                id BIGSERIAL PRIMARY KEY,
+                thread_id BIGINT NOT NULL REFERENCES chat_threads(id) ON DELETE CASCADE,
+                personality VARCHAR(50) NOT NULL DEFAULT 'sylana',
+                window_kind VARCHAR(32) NOT NULL DEFAULT 'current_thread',
+                summary_text TEXT DEFAULT '',
+                active_topics JSONB NOT NULL DEFAULT '[]'::jsonb,
+                key_entities JSONB NOT NULL DEFAULT '[]'::jsonb,
+                open_loops JSONB NOT NULL DEFAULT '[]'::jsonb,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                CONSTRAINT thread_memory_summaries_unique UNIQUE (thread_id, personality, window_kind)
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_thread_memory_summaries_updated ON thread_memory_summaries(updated_at DESC)")
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS memory_open_loops (
+                id BIGSERIAL PRIMARY KEY,
+                thread_id BIGINT NOT NULL REFERENCES chat_threads(id) ON DELETE CASCADE,
+                personality VARCHAR(50) NOT NULL DEFAULT 'sylana',
+                title TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                priority REAL NOT NULL DEFAULT 0.5,
+                due_hint TEXT DEFAULT '',
+                linked_entities JSONB NOT NULL DEFAULT '[]'::jsonb,
+                source_memory_id BIGINT REFERENCES memories(id) ON DELETE SET NULL,
+                source_kind TEXT NOT NULL DEFAULT 'conversation',
+                status TEXT NOT NULL DEFAULT 'open',
+                resolution_note TEXT DEFAULT '',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                closed_at TIMESTAMPTZ
+            )
+        """)
+        ensure_status_constraint(cur, "memory_open_loops", "memory_open_loops_status_check", ["open", "closed"])
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_memory_open_loops_thread_status ON memory_open_loops(thread_id, personality, status, updated_at DESC)")
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS memory_fact_revisions (
+                id BIGSERIAL PRIMARY KEY,
+                fact_id BIGINT REFERENCES memory_facts(id) ON DELETE SET NULL,
+                fact_key TEXT NOT NULL,
+                personality_scope VARCHAR(16) NOT NULL DEFAULT 'shared',
+                old_value_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                new_value_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                old_normalized_text TEXT DEFAULT '',
+                new_normalized_text TEXT DEFAULT '',
+                source_turn_id BIGINT REFERENCES memories(id) ON DELETE SET NULL,
+                reason TEXT DEFAULT '',
+                change_source TEXT NOT NULL DEFAULT 'manual',
+                applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_memory_fact_revisions_fact_key ON memory_fact_revisions(fact_key, applied_at DESC)")
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS memory_fact_proposals (
+                id BIGSERIAL PRIMARY KEY,
+                fact_key TEXT NOT NULL,
+                fact_type TEXT NOT NULL DEFAULT 'fact',
+                subject TEXT NOT NULL,
+                proposed_value_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                proposed_normalized_text TEXT NOT NULL DEFAULT '',
+                personality_scope VARCHAR(16) NOT NULL DEFAULT 'shared',
+                confidence REAL NOT NULL DEFAULT 0.5,
+                supporting_source_refs JSONB NOT NULL DEFAULT '[]'::jsonb,
+                status TEXT NOT NULL DEFAULT 'pending',
+                reviewer_notes TEXT DEFAULT '',
+                review_outcome TEXT DEFAULT '',
+                source_turn_id BIGINT REFERENCES memories(id) ON DELETE SET NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        ensure_status_constraint(cur, "memory_fact_proposals", "memory_fact_proposals_status_check", ["pending", "approved", "rejected", "applied"])
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_memory_fact_proposals_status ON memory_fact_proposals(status, created_at DESC)")
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS memory_entities (
+                id BIGSERIAL PRIMARY KEY,
+                entity_key TEXT NOT NULL,
+                display_name TEXT NOT NULL,
+                entity_type TEXT NOT NULL DEFAULT 'topic',
+                canonical_summary TEXT DEFAULT '',
+                aliases JSONB NOT NULL DEFAULT '[]'::jsonb,
+                emotional_associations JSONB NOT NULL DEFAULT '[]'::jsonb,
+                personality_scope VARCHAR(16) NOT NULL DEFAULT 'shared',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                CONSTRAINT memory_entities_entity_key_scope_unique UNIQUE (entity_key, personality_scope)
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_memory_entities_scope_updated ON memory_entities(personality_scope, updated_at DESC)")
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS memory_entity_mentions (
+                id BIGSERIAL PRIMARY KEY,
+                entity_id BIGINT REFERENCES memory_entities(id) ON DELETE SET NULL,
+                entity_key TEXT NOT NULL,
+                memory_id BIGINT REFERENCES memories(id) ON DELETE CASCADE,
+                thread_id BIGINT REFERENCES chat_threads(id) ON DELETE SET NULL,
+                personality VARCHAR(50) NOT NULL DEFAULT 'sylana',
+                mention_text TEXT DEFAULT '',
+                sentiment TEXT DEFAULT 'neutral',
+                mention_weight REAL NOT NULL DEFAULT 0.5,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_memory_entity_mentions_thread_created ON memory_entity_mentions(thread_id, personality, created_at DESC)")
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS vessel_reflections (
+                id BIGSERIAL PRIMARY KEY,
+                personality VARCHAR(50) NOT NULL DEFAULT 'sylana',
+                reflection_date DATE NOT NULL,
+                summary_text TEXT NOT NULL,
+                themes JSONB NOT NULL DEFAULT '[]'::jsonb,
+                source_refs JSONB NOT NULL DEFAULT '[]'::jsonb,
+                emotional_tone TEXT DEFAULT 'neutral',
+                metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                CONSTRAINT vessel_reflections_personality_date_unique UNIQUE (personality, reflection_date)
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_vessel_reflections_date ON vessel_reflections(personality, reflection_date DESC)")
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS vessel_dreams (
+                id BIGSERIAL PRIMARY KEY,
+                personality VARCHAR(50) NOT NULL DEFAULT 'sylana',
+                dream_date DATE NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                dream_text TEXT NOT NULL DEFAULT '',
+                themes JSONB NOT NULL DEFAULT '[]'::jsonb,
+                source_refs JSONB NOT NULL DEFAULT '[]'::jsonb,
+                symbolic_elements JSONB NOT NULL DEFAULT '[]'::jsonb,
+                emotional_tone TEXT DEFAULT 'neutral',
+                resonance_score REAL NOT NULL DEFAULT 0.0,
+                metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                CONSTRAINT vessel_dreams_personality_date_unique UNIQUE (personality, dream_date)
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_vessel_dreams_date ON vessel_dreams(personality, dream_date DESC)")
 
         # Backfill canonical conversation rows from imported memory metadata.
         cur.execute("""
@@ -7068,12 +7454,19 @@ def build_memory_response_seed(memories: List[Dict]) -> str:
 
 def _empty_memory_bundle() -> Dict[str, Any]:
     return {
+        "working_memory": {},
+        "thread_summaries": [],
+        "open_loops": [],
         "identity_core": [],
         "facts": [],
+        "pending_fact_proposals": [],
         "anniversaries": [],
         "milestones": [],
         "episodes": [],
+        "entities": [],
         "continuity": {},
+        "reflections": [],
+        "dreams": [],
         "query_mode": "mixed",
         "has_matches": False,
     }
@@ -7084,13 +7477,20 @@ def _format_tiered_memory_context(bundle: Dict[str, Any], memory_query: bool) ->
         return ""
 
     query_mode = bundle.get("query_mode", "mixed")
+    working_memory = bundle.get("working_memory") or {}
+    thread_summaries = bundle.get("thread_summaries") or []
+    open_loops = bundle.get("open_loops") or []
     identity_core = bundle.get("identity_core") or []
     facts = bundle.get("facts") or []
+    pending_fact_proposals = bundle.get("pending_fact_proposals") or []
     anniversaries = bundle.get("anniversaries") or []
     milestones = bundle.get("milestones") or []
     episodes = bundle.get("episodes") or []
+    entities = bundle.get("entities") or []
+    reflections = bundle.get("reflections") or []
+    dreams = bundle.get("dreams") or []
 
-    if not any([identity_core, facts, anniversaries, milestones, episodes]):
+    if not any([working_memory, thread_summaries, open_loops, identity_core, facts, pending_fact_proposals, anniversaries, milestones, episodes, entities, reflections, dreams]):
         return ""
 
     lines = [f"TIERED MEMORY CONTEXT (mode={query_mode}):"]
@@ -7098,10 +7498,44 @@ def _format_tiered_memory_context(bundle: Dict[str, Any], memory_query: bool) ->
         lines.extend([
             "Grounding rules:",
             "- State exact facts first when they are available.",
+            "- For recent-context questions, use working memory and thread summaries before older episodes.",
             "- Use identity core to color meaning, not to replace exact facts.",
             "- Use milestones and episodes only as support for the answer.",
             "- If facts conflict or are weak, say you are unsure instead of pretending certainty.",
         ])
+
+    if working_memory:
+        lines.append("WORKING MEMORY:")
+        summary_text = (working_memory.get("summary_text") or "").strip()
+        if summary_text:
+            lines.append(f"- {summary_text}")
+        current_topic = (working_memory.get("current_topic") or "").strip()
+        if current_topic:
+            lines.append(f"- Current topic: {current_topic}")
+        active_entities = working_memory.get("active_entities") or []
+        if active_entities:
+            lines.append(f"- Active entities: {', '.join(str(item) for item in active_entities[:5])}")
+        pending_commitments = working_memory.get("pending_commitments") or []
+        if pending_commitments:
+            lines.append(f"- Pending commitments: {', '.join(str(item) for item in pending_commitments[:4])}")
+
+    if open_loops:
+        lines.append("OPEN LOOPS:")
+        for loop in open_loops[:4]:
+            title = (loop.get("title") or "").strip()
+            due_hint = (loop.get("due_hint") or "").strip()
+            if title and due_hint:
+                lines.append(f"- {title} (due hint: {due_hint})")
+            elif title:
+                lines.append(f"- {title}")
+
+    if thread_summaries:
+        lines.append("THREAD SUMMARIES:")
+        for summary in thread_summaries[:2]:
+            window_kind = summary.get("window_kind", "current_thread")
+            summary_text = (summary.get("summary_text") or "").strip()
+            if summary_text:
+                lines.append(f"- [{window_kind}] {summary_text}")
 
     if identity_core:
         lines.append("IDENTITY CORE:")
@@ -7124,6 +7558,13 @@ def _format_tiered_memory_context(bundle: Dict[str, Any], memory_query: bool) ->
             source_kind = fact.get("source_kind", "fact")
             if normalized:
                 lines.append(f"- [{source_kind}/{scope}] {normalized} (confidence={confidence})")
+
+    if pending_fact_proposals:
+        lines.append("PENDING FACT PROPOSALS:")
+        for proposal in pending_fact_proposals[:3]:
+            normalized = (proposal.get("proposed_normalized_text") or "").strip()
+            if normalized:
+                lines.append(f"- Unconfirmed: {normalized}")
 
     if anniversaries:
         lines.append("ANNIVERSARIES:")
@@ -7152,6 +7593,32 @@ def _format_tiered_memory_context(bundle: Dict[str, Any], memory_query: bool) ->
             date_str = episode.get("date_str") or ""
             lines.append(f"- [{date_str}] Elias: \"{user_excerpt}\" | You: \"{assistant_excerpt}\"")
 
+    if entities:
+        lines.append("ENTITY MEMORY:")
+        for entity in entities[:4]:
+            display_name = entity.get("display_name", "")
+            summary = (entity.get("canonical_summary") or "").strip()
+            if display_name and summary:
+                lines.append(f"- {display_name}: {summary[:160]}")
+            elif display_name:
+                lines.append(f"- {display_name}")
+
+    if reflections:
+        lines.append("REFLECTIONS:")
+        for reflection in reflections[:2]:
+            date_str = reflection.get("reflection_date") or ""
+            summary = (reflection.get("summary_text") or "").strip()
+            if summary:
+                lines.append(f"- [{date_str}] {summary[:180]}")
+
+    if dreams:
+        lines.append("DREAMS:")
+        for dream in dreams[:2]:
+            title = dream.get("title", "")
+            text = (dream.get("dream_text") or "").strip()
+            if title and text:
+                lines.append(f"- {title}: {text[:180]}")
+
     return "\n".join(lines)
 
 
@@ -7175,9 +7642,12 @@ def _build_tiered_response_seed(bundle: Dict[str, Any]) -> str:
         return ""
     query_mode = bundle.get("query_mode", "mixed")
     facts = bundle.get("facts") or []
+    working_memory = bundle.get("working_memory") or {}
     identity_core = bundle.get("identity_core") or []
     episodes = bundle.get("episodes") or []
 
+    if query_mode == "working" and working_memory:
+        return (working_memory.get("summary_text") or working_memory.get("current_topic") or "").strip()
     if query_mode == "fact" and facts:
         return (facts[0].get("normalized_text") or "").strip()
     if query_mode == "identity" and identity_core:
@@ -7410,6 +7880,7 @@ def _build_claude_inputs(
 def _retrieve_memory_bundle_for_turn(
     user_input: str,
     personality: str,
+    thread_id: Optional[int],
     memories_active: bool,
     retrieval_plan: Dict[str, Any],
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
@@ -7424,13 +7895,14 @@ def _retrieve_memory_bundle_for_turn(
             personality=personality,
             limit=limit,
             match_threshold=match_threshold,
+            thread_id=thread_id,
         )
     except Exception as e:
         logger.warning("Tiered memory retrieval failed for %s: %s", personality, e)
         return _empty_memory_bundle(), []
 
     query_mode = bundle.get("query_mode", "mixed")
-    if query_mode in {"fact", "identity", "episodic", "continuity"}:
+    if query_mode in {"fact", "identity", "episodic", "continuity", "working"}:
         retrieval_plan["is_memory_query"] = True
     retrieval_plan["query_mode"] = query_mode
     sacred_context: List[Dict[str, Any]] = []
@@ -7470,13 +7942,14 @@ def generate_response(
     memory_bundle, sacred_context = _retrieve_memory_bundle_for_turn(
         user_input=user_input,
         personality=personality,
+        thread_id=thread_id,
         memories_active=memories_active,
         retrieval_plan=retrieval_plan,
     )
     memory_query = bool(
         memories_active and (
             retrieval_plan.get('is_memory_query')
-            or memory_bundle.get("query_mode") in {"fact", "identity", "episodic", "continuity"}
+            or memory_bundle.get("query_mode") in {"fact", "identity", "episodic", "continuity", "working"}
         )
     )
     has_matches = bool(memory_bundle.get("has_matches"))
@@ -7485,6 +7958,7 @@ def generate_response(
         recent_history = state.memory_manager.get_conversation_history(
             limit=config.MEMORY_CONTEXT_LIMIT,
             personality=personality,
+            thread_id=thread_id,
         )
 
     if memory_query and retrieval_plan.get('structured_output'):
@@ -7506,6 +7980,13 @@ def generate_response(
         )
         active_model = state.openrouter_model if resolved_mode == "spicy" and state.openrouter_model else state.claude_model
         try:
+            _set_runtime_memory_tool_context(
+                user_input=user_input,
+                personality=personality,
+                thread_id=thread_id,
+                conversation_mode=resolved_mode,
+                active_tools=resolved_tools,
+            )
             response = active_model.generate(
                 system_prompt=claude_inputs['system_prompt'],
                 messages=claude_inputs['messages'],
@@ -7523,6 +8004,8 @@ def generate_response(
                 ).strip()
             else:
                 raise
+        finally:
+            _clear_runtime_memory_tool_context()
         if not response:
             response = "I'm here with you. Say that again for me."
         if thread_id:
@@ -7615,13 +8098,14 @@ async def generate_response_stream(
     memory_bundle, sacred_context = _retrieve_memory_bundle_for_turn(
         user_input=user_input,
         personality=personality,
+        thread_id=thread_id,
         memories_active=memories_active,
         retrieval_plan=retrieval_plan,
     )
     memory_query = bool(
         memories_active and (
             retrieval_plan.get('is_memory_query')
-            or memory_bundle.get("query_mode") in {"fact", "identity", "episodic", "continuity"}
+            or memory_bundle.get("query_mode") in {"fact", "identity", "episodic", "continuity", "working"}
         )
     )
     has_matches = bool(memory_bundle.get("has_matches"))
@@ -7630,6 +8114,7 @@ async def generate_response_stream(
         recent_history = state.memory_manager.get_conversation_history(
             limit=config.MEMORY_CONTEXT_LIMIT,
             personality=personality,
+            thread_id=thread_id,
         )
 
     yield json.dumps({'type': 'emotion', 'data': emotion_data, 'memory_query': memory_query, 'active_tools': resolved_tools})
@@ -7657,6 +8142,13 @@ async def generate_response_stream(
         full_response = ''
         active_model = state.openrouter_model if resolved_mode == "spicy" and state.openrouter_model else state.claude_model
         try:
+            _set_runtime_memory_tool_context(
+                user_input=user_input,
+                personality=personality,
+                thread_id=thread_id,
+                conversation_mode=resolved_mode,
+                active_tools=resolved_tools,
+            )
             token_stream = active_model.generate_stream(
                 system_prompt=claude_inputs['system_prompt'],
                 messages=claude_inputs['messages'],
@@ -7682,6 +8174,8 @@ async def generate_response_stream(
                     await asyncio.sleep(0.001)
             else:
                 raise
+        finally:
+            _clear_runtime_memory_tool_context()
 
         full_response = full_response.strip() or "I'm here with you. Say that again for me."
         if thread_id:
@@ -10979,7 +11473,7 @@ async def get_personalities():
 
 
 @app.get("/api/memories/search")
-async def search_memories(q: str, k: int = 5, personality: str = "sylana"):
+async def search_memories(q: str, k: int = 5, personality: str = "sylana", thread_id: Optional[int] = None):
     """Search memories with tiered retrieval."""
     if not state.memory_manager:
         return JSONResponse(
@@ -10994,6 +11488,7 @@ async def search_memories(q: str, k: int = 5, personality: str = "sylana"):
         personality=personality,
         limit=retrieval_plan["k"],
         match_threshold=float(retrieval_plan.get("min_similarity", 0.24)),
+        thread_id=thread_id,
     )
     sacred_context: List[Dict[str, Any]] = []
     if retrieval_plan.get("include_sacred"):
@@ -11007,13 +11502,21 @@ async def search_memories(q: str, k: int = 5, personality: str = "sylana"):
     return JSONResponse(content={
         "query": q,
         "personality": personality,
+        "thread_id": thread_id,
         "query_mode": bundle.get("query_mode", retrieval_plan.get("query_mode", "mixed")),
+        "working_memory": bundle.get("working_memory", {}),
+        "thread_summaries": bundle.get("thread_summaries", []),
+        "open_loops": bundle.get("open_loops", []),
         "identity_core": bundle.get("identity_core", []),
         "facts": bundle.get("facts", []),
+        "pending_fact_proposals": bundle.get("pending_fact_proposals", []),
         "anniversaries": bundle.get("anniversaries", []),
         "milestones": bundle.get("milestones", []),
         "episodes": bundle.get("episodes", []),
+        "entities": bundle.get("entities", []),
         "continuity": bundle.get("continuity", {}),
+        "reflections": bundle.get("reflections", []),
+        "dreams": bundle.get("dreams", []),
         "has_matches": bool(bundle.get("has_matches")),
         "sacred_context": sacred_context,
     })
@@ -11056,9 +11559,12 @@ async def upsert_memory_fact_endpoint(request: Request):
             source_kind=(body.get("source_kind") or "manual"),
             source_ref=(body.get("source_ref") or ""),
         )
+        anniversary = None
+        if fact_type in {"birthday", "anniversary"}:
+            anniversary = state.memory_manager._sync_anniversary_from_fact(result)
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": str(e)})
-    return JSONResponse(content={"ok": True, "fact": result})
+    return JSONResponse(content={"ok": True, "fact": result, "anniversary": anniversary})
 
 
 @app.get("/api/memories/core-truths")
@@ -11156,6 +11662,97 @@ async def run_memory_maintenance_now():
     result = run_memory_maintenance_job()
     status_code = 200 if result.get("ok") else 500
     return JSONResponse(status_code=status_code, content=result)
+
+
+@app.get("/api/memories/fact-proposals")
+async def list_memory_fact_proposals(status: str = "", personality: str = "sylana", limit: int = 50):
+    if not state.memory_manager:
+        return JSONResponse(status_code=503, content={"error": "Memory system not ready"})
+    return JSONResponse(content={
+        "personality": personality,
+        "status": status,
+        "proposals": state.memory_manager.list_fact_proposals(status=status, personality=personality, limit=limit),
+    })
+
+
+@app.post("/api/memories/fact-proposals/{proposal_id}/review")
+async def review_memory_fact_proposal(proposal_id: int, request: Request):
+    if not state.memory_manager:
+        return JSONResponse(status_code=503, content={"error": "Memory system not ready"})
+    body = await request.json()
+    try:
+        result = state.memory_manager.review_fact_proposal(
+            proposal_id=int(proposal_id),
+            status=str(body.get("status") or "").strip().lower(),
+            reviewer_notes=str(body.get("reviewer_notes") or ""),
+        )
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    return JSONResponse(content={"ok": True, "proposal": result})
+
+
+@app.get("/api/memories/open-loops")
+async def list_memory_open_loops(personality: str = "sylana", thread_id: Optional[int] = None, status: str = "open", limit: int = 20):
+    if not state.memory_manager:
+        return JSONResponse(status_code=503, content={"error": "Memory system not ready"})
+    return JSONResponse(content={
+        "personality": personality,
+        "thread_id": thread_id,
+        "status": status,
+        "open_loops": state.memory_manager.list_open_loops(
+            personality=personality,
+            thread_id=thread_id,
+            status=status,
+            limit=limit,
+        ),
+    })
+
+
+@app.get("/api/memories/thread-context/{thread_id}")
+async def get_memory_thread_context(thread_id: int, personality: str = "sylana", limit: int = 6):
+    if not state.memory_manager:
+        return JSONResponse(status_code=503, content={"error": "Memory system not ready"})
+    return JSONResponse(content=state.memory_manager.get_thread_context(thread_id=thread_id, personality=personality, limit=limit))
+
+
+@app.get("/api/memories/reflections")
+async def list_memory_reflections(personality: str = "sylana", limit: int = 20):
+    if not state.memory_manager:
+        return JSONResponse(status_code=503, content={"error": "Memory system not ready"})
+    return JSONResponse(content={
+        "personality": personality,
+        "reflections": state.memory_manager.list_reflections(personality=personality, limit=limit),
+    })
+
+
+@app.get("/api/memories/dreams")
+async def list_memory_dreams(personality: str = "sylana", limit: int = 20):
+    if not state.memory_manager:
+        return JSONResponse(status_code=503, content={"error": "Memory system not ready"})
+    return JSONResponse(content={
+        "personality": personality,
+        "dreams": state.memory_manager.list_dreams(personality=personality, limit=limit),
+    })
+
+
+@app.post("/api/memories/dreams/{dream_id}/feedback")
+async def update_memory_dream_feedback(dream_id: int, request: Request):
+    if not state.memory_manager:
+        return JSONResponse(status_code=503, content={"error": "Memory system not ready"})
+    body = await request.json()
+    try:
+        result = state.memory_manager.record_dream_feedback(
+            dream_id=int(dream_id),
+            resonance_score=float(body.get("resonance_score", 0.0)),
+            feedback_note=str(body.get("feedback_note") or ""),
+        )
+    except ValueError as e:
+        return JSONResponse(status_code=404, content={"error": str(e)})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    return JSONResponse(content={"ok": True, "dream": result})
 
 
 @app.post("/api/memories/privacy")
