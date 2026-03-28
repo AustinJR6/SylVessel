@@ -1086,6 +1086,25 @@
                     })
                 });
 
+                if (!response.ok) {
+                    let errorPayload = {};
+                    try {
+                        errorPayload = await response.json();
+                    } catch (e) {
+                        errorPayload = {};
+                    }
+                    if (response.status === 409) {
+                        currentThreadId = null;
+                        await refreshThreads(false);
+                        renderThreadList();
+                    }
+                    throw new Error(
+                        errorPayload.details
+                        || errorPayload.error
+                        || `Request failed (${response.status})`
+                    );
+                }
+
                 const reader = response.body.getReader();
                 const decoder = new TextDecoder();
                 let buffer = '';
@@ -1106,7 +1125,11 @@
                         try {
                             const event = JSON.parse(rawData);
 
-                            if (event.type === 'emotion') {
+                            if (event.type === 'session') {
+                                if (event.data && event.data.thread_id) {
+                                    currentThreadId = event.data.thread_id;
+                                }
+                            } else if (event.type === 'emotion') {
                                 emotionData = event.data;
                             } else if (event.type === 'token') {
                                 if (!streamStarted) {
@@ -1125,6 +1148,10 @@
                                 if (event.data.thread_id) {
                                     currentThreadId = event.data.thread_id;
                                 }
+                            } else if (event.type === 'error') {
+                                fullText = event.error || 'Generation failed.';
+                                streamBubble.textContent = fullText;
+                                streamStarted = true;
                             }
                         } catch (e) {
                             // Skip malformed events
@@ -1133,7 +1160,8 @@
                 }
             } catch (e) {
                 console.error('Stream error:', e);
-                streamBubble.textContent = 'Connection interrupted. Please try again.';
+                fullText = e && e.message ? e.message : 'Connection interrupted. Please try again.';
+                streamBubble.textContent = fullText;
             }
 
             // Replace typing message with final message

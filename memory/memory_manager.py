@@ -7,6 +7,7 @@ import logging
 import json
 import math
 import re
+import uuid
 from pathlib import Path
 from typing import List, Dict, Optional, Any
 from datetime import date, datetime, timedelta
@@ -17,6 +18,10 @@ from memory.semantic_search import SemanticMemoryEngine
 from memory.supabase_client import get_connection, close_connection
 
 logger = logging.getLogger(__name__)
+
+
+def _savepoint_name(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex[:8]}"
 
 
 # Emotion weights for importance scoring
@@ -742,12 +747,14 @@ class MemoryManager:
         out.sort(key=lambda x: (x.get("keyword_score", 0.0), x.get("significance_score", 0.0), x.get("id", 0)), reverse=True)
         return out[:max(limit, 20)]
 
-    def _encrypt_payload(self, payload: Dict[str, Any]) -> Optional[bytes]:
+    def _encrypt_payload(self, payload: Dict[str, Any], cur=None) -> Optional[bytes]:
         key = getattr(config, "MEMORY_ENCRYPTION_KEY", None)
         if not key:
             return None
-        conn = get_connection()
-        cur = conn.cursor()
+        own_cursor = cur is None
+        if own_cursor:
+            conn = get_connection()
+            cur = conn.cursor()
         try:
             cur.execute("SELECT pgp_sym_encrypt(%s, %s)", (json.dumps(payload), key))
             row = cur.fetchone()
@@ -755,6 +762,12 @@ class MemoryManager:
         except Exception as e:
             logger.warning(f"Secure payload encryption failed: {e}")
             return None
+        finally:
+            if own_cursor:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
 
     def _decrypt_payload(self, encrypted_payload: Any) -> Dict[str, Any]:
         key = getattr(config, "MEMORY_ENCRYPTION_KEY", None)
@@ -806,16 +819,19 @@ class MemoryManager:
             thread_id=thread_id,
             turn_index=turn_index,
         )
-        secure_payload = self._encrypt_payload({
-            "user_input": user_input,
-            "sylana_response": sylana_response,
-            "emotion_data": emotion_data or {"category": emotion},
-            "thread_id": thread_id,
-            "personality": personality,
-            "memory_type": memory_type,
-            "turn_index": turn_index,
-            "stored_at": datetime.utcnow().isoformat(),
-        })
+        secure_payload = self._encrypt_payload(
+            {
+                "user_input": user_input,
+                "sylana_response": sylana_response,
+                "emotion_data": emotion_data or {"category": emotion},
+                "thread_id": thread_id,
+                "personality": personality,
+                "memory_type": memory_type,
+                "turn_index": turn_index,
+                "stored_at": datetime.utcnow().isoformat(),
+            },
+            cur=cur,
+        )
 
         try:
             cur.execute("""
@@ -858,15 +874,17 @@ class MemoryManager:
             logger.error(f"Failed to store conversation: {e}")
             raise
 
-        self._update_session_continuity_state(
-            personality=personality,
-            memory_type=memory_type,
-            emotion_data=emotion_data or {"category": emotion, "intensity": 5},
-            feeling_weight=feeling_weight,
-            user_input=user_input,
-            sylana_response=sylana_response,
-        )
         try:
+            self._update_session_continuity_state(
+                personality=personality,
+                memory_type=memory_type,
+                emotion_data=emotion_data or {"category": emotion, "intensity": 5},
+                feeling_weight=feeling_weight,
+                user_input=user_input,
+                sylana_response=sylana_response,
+                conn=conn,
+                cur=cur,
+            )
             self._refresh_recent_memory_layers(
                 memory_id=memory_id,
                 thread_id=thread_id,
@@ -877,9 +895,18 @@ class MemoryManager:
                 memory_type=memory_type,
                 significance_score=significance_score,
                 temporal_context=temporal_context,
+                conn=conn,
+                cur=cur,
             )
+            conn.commit()
         except Exception as e:
+            conn.rollback()
             logger.warning("Recent memory layer refresh failed for %s: %s", memory_id, e)
+        finally:
+            try:
+                cur.close()
+            except Exception:
+                pass
         logger.info(f"Stored conversation {memory_id} with emotion: {emotion}")
         return memory_id
 
@@ -1005,6 +1032,8 @@ class MemoryManager:
         feeling_weight: float,
         user_input: str,
         sylana_response: str,
+        conn=None,
+        cur=None,
     ) -> None:
         if not getattr(config, "MEMORY_ENCRYPTION_KEY", None):
             return
@@ -1030,12 +1059,14 @@ class MemoryManager:
             "updated_at": datetime.utcnow().isoformat(),
         }
 
-        encrypted_state = self._encrypt_payload(state_payload)
+        encrypted_state = self._encrypt_payload(state_payload, cur=cur)
         if encrypted_state is None:
             return
 
-        conn = get_connection()
-        cur = conn.cursor()
+        own_cursor = conn is None or cur is None
+        if own_cursor:
+            conn = get_connection()
+            cur = conn.cursor()
         try:
             cur.execute(
                 """
@@ -1048,10 +1079,18 @@ class MemoryManager:
                 """,
                 (personality, encrypted_state),
             )
-            conn.commit()
+            if own_cursor:
+                conn.commit()
         except Exception as e:
-            conn.rollback()
+            if own_cursor:
+                conn.rollback()
             logger.warning(f"Failed to persist continuity state: {e}")
+        finally:
+            if own_cursor:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
 
     def _upsert_thread_working_memory(
         self,
@@ -1066,9 +1105,13 @@ class MemoryManager:
         last_user_intent: str,
         last_memory_id: Optional[int],
         summary_text: str,
+        conn=None,
+        cur=None,
     ) -> None:
-        conn = get_connection()
-        cur = conn.cursor()
+        own_cursor = conn is None or cur is None
+        if own_cursor:
+            conn = get_connection()
+            cur = conn.cursor()
         try:
             cur.execute(
                 """
@@ -1102,10 +1145,18 @@ class MemoryManager:
                     summary_text or "",
                 ),
             )
-            conn.commit()
+            if own_cursor:
+                conn.commit()
         except Exception as e:
-            conn.rollback()
+            if own_cursor:
+                conn.rollback()
             logger.debug("Thread working memory upsert failed for thread %s: %s", thread_id, e)
+        finally:
+            if own_cursor:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
 
     def _upsert_thread_summary(
         self,
@@ -1117,9 +1168,13 @@ class MemoryManager:
         active_topics: List[str],
         key_entities: List[str],
         open_loops: List[Dict[str, Any]],
+        conn=None,
+        cur=None,
     ) -> None:
-        conn = get_connection()
-        cur = conn.cursor()
+        own_cursor = conn is None or cur is None
+        if own_cursor:
+            conn = get_connection()
+            cur = conn.cursor()
         try:
             cur.execute(
                 """
@@ -1145,10 +1200,18 @@ class MemoryManager:
                     json.dumps(open_loops or [], ensure_ascii=True),
                 ),
             )
-            conn.commit()
+            if own_cursor:
+                conn.commit()
         except Exception as e:
-            conn.rollback()
+            if own_cursor:
+                conn.rollback()
             logger.debug("Thread summary upsert failed for thread %s/%s: %s", thread_id, window_kind, e)
+        finally:
+            if own_cursor:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
 
     def add_open_loop(
         self,
@@ -1162,13 +1225,20 @@ class MemoryManager:
         linked_entities: Optional[List[str]] = None,
         source_memory_id: Optional[int] = None,
         source_kind: str = "conversation",
+        conn=None,
+        cur=None,
     ) -> Dict[str, Any]:
         clean_title = re.sub(r"\s+", " ", (title or "").strip(" .,:;"))
         if not clean_title:
             raise ValueError("title is required")
-        conn = get_connection()
-        cur = conn.cursor()
+        own_cursor = conn is None or cur is None
+        if own_cursor:
+            conn = get_connection()
+            cur = conn.cursor()
+        savepoint = None if own_cursor else _savepoint_name("open_loop")
         try:
+            if savepoint:
+                cur.execute(f"SAVEPOINT {savepoint}")
             cur.execute(
                 """
                 SELECT id, title, description, priority, due_hint, linked_entities, source_memory_id, status, created_at, updated_at, closed_at
@@ -1230,11 +1300,24 @@ class MemoryManager:
                     ),
                 )
             row = cur.fetchone()
-            conn.commit()
+            if own_cursor:
+                conn.commit()
+            elif savepoint:
+                cur.execute(f"RELEASE SAVEPOINT {savepoint}")
         except Exception as e:
-            conn.rollback()
+            if own_cursor:
+                conn.rollback()
+            elif savepoint:
+                cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                cur.execute(f"RELEASE SAVEPOINT {savepoint}")
             logger.error("Failed to add open loop on thread %s: %s", thread_id, e)
             raise
+        finally:
+            if own_cursor:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
         return {
             "id": row[0],
             "title": row[1] or "",
@@ -1257,9 +1340,13 @@ class MemoryManager:
         personality: str = "sylana",
         title: str = "",
         resolution_note: str = "",
+        conn=None,
+        cur=None,
     ) -> Dict[str, Any]:
-        conn = get_connection()
-        cur = conn.cursor()
+        own_cursor = conn is None or cur is None
+        if own_cursor:
+            conn = get_connection()
+            cur = conn.cursor()
         params: List[Any]
         where_sql = ""
         if open_loop_id:
@@ -1275,7 +1362,10 @@ class MemoryManager:
                   AND lower(title) = lower(%s)
             """
             params = [int(thread_id), (personality or "sylana").strip().lower(), title.strip()]
+        savepoint = None if own_cursor else _savepoint_name("close_loop")
         try:
+            if savepoint:
+                cur.execute(f"SAVEPOINT {savepoint}")
             cur.execute(
                 f"""
                 UPDATE memory_open_loops
@@ -1293,11 +1383,24 @@ class MemoryManager:
                 tuple([resolution_note or "", resolution_note or ""] + params),
             )
             row = cur.fetchone()
-            conn.commit()
+            if own_cursor:
+                conn.commit()
+            elif savepoint:
+                cur.execute(f"RELEASE SAVEPOINT {savepoint}")
         except Exception as e:
-            conn.rollback()
+            if own_cursor:
+                conn.rollback()
+            elif savepoint:
+                cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                cur.execute(f"RELEASE SAVEPOINT {savepoint}")
             logger.error("Failed to close open loop: %s", e)
             raise
+        finally:
+            if own_cursor:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
         if not row:
             raise ValueError("open loop not found")
         return {
@@ -1324,9 +1427,13 @@ class MemoryManager:
         thread_id: Optional[int] = None,
         status: str = "open",
         limit: int = 20,
+        conn=None,
+        cur=None,
     ) -> List[Dict[str, Any]]:
-        conn = get_connection()
-        cur = conn.cursor()
+        own_cursor = conn is None or cur is None
+        if own_cursor:
+            conn = get_connection()
+            cur = conn.cursor()
         where = ["personality = %s"]
         params: List[Any] = [(personality or "sylana").strip().lower()]
         if thread_id:
@@ -1352,6 +1459,12 @@ class MemoryManager:
         except Exception as e:
             logger.debug("Failed to list open loops: %s", e)
             return []
+        finally:
+            if own_cursor:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
         return [
             {
                 "id": row[0],
@@ -1383,17 +1496,24 @@ class MemoryManager:
         emotion: str,
         significance_score: float,
         mention_text: str,
+        conn=None,
+        cur=None,
     ) -> None:
         if not entities:
             return
-        conn = get_connection()
-        cur = conn.cursor()
+        own_cursor = conn is None or cur is None
+        if own_cursor:
+            conn = get_connection()
+            cur = conn.cursor()
         for entity in entities:
             scope = self._entity_scope(entity, personality)
             entity_key = re.sub(r"[^a-z0-9]+", "_", entity.lower()).strip("_") or entity.lower()
             entity_type = "person" if entity_key in {"elias", "gus", "levi", "sylana", "claude"} else "topic"
             summary = f"Recent mentions for {entity} tracked in conversation memory."
+            savepoint = None if own_cursor else _savepoint_name("entity")
             try:
+                if savepoint:
+                    cur.execute(f"SAVEPOINT {savepoint}")
                 cur.execute(
                     """
                     INSERT INTO memory_entities (
@@ -1443,10 +1563,22 @@ class MemoryManager:
                         float(significance_score or 0.5),
                     ),
                 )
-                conn.commit()
+                if own_cursor:
+                    conn.commit()
+                elif savepoint:
+                    cur.execute(f"RELEASE SAVEPOINT {savepoint}")
             except Exception as e:
-                conn.rollback()
+                if own_cursor:
+                    conn.rollback()
+                elif savepoint:
+                    cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                    cur.execute(f"RELEASE SAVEPOINT {savepoint}")
                 logger.debug("Entity upsert skipped for %s: %s", entity, e)
+        if own_cursor:
+            try:
+                cur.close()
+            except Exception:
+                pass
 
     def _sync_open_loops_from_turn(
         self,
@@ -1458,9 +1590,11 @@ class MemoryManager:
         sylana_response: str,
         entities: List[str],
         significance_score: float,
-    ) -> None:
+        conn=None,
+        cur=None,
+    ) -> List[Dict[str, Any]]:
         if not thread_id:
-            return
+            return []
         combined = f"{user_input or ''}\n{sylana_response or ''}"
         commitments = self._extract_commitments(combined)
         for item in commitments:
@@ -1474,12 +1608,21 @@ class MemoryManager:
                     linked_entities=entities,
                     source_memory_id=memory_id,
                     source_kind="conversation",
+                    conn=conn,
+                    cur=cur,
                 )
             except Exception as e:
                 logger.debug("Open loop creation skipped for thread %s: %s", thread_id, e)
 
         if self._is_completion_signal(combined):
-            active_loops = self.list_open_loops(personality=personality, thread_id=thread_id, status="open", limit=10)
+            active_loops = self.list_open_loops(
+                personality=personality,
+                thread_id=thread_id,
+                status="open",
+                limit=10,
+                conn=conn,
+                cur=cur,
+            )
             lowered = combined.lower()
             for loop in active_loops:
                 title = (loop.get("title") or "").lower()
@@ -1489,9 +1632,19 @@ class MemoryManager:
                             open_loop_id=int(loop["id"]),
                             personality=personality,
                             resolution_note=f"Closed from memory turn {memory_id}",
+                            conn=conn,
+                            cur=cur,
                         )
                     except Exception:
                         continue
+        return self.list_open_loops(
+            personality=personality,
+            thread_id=thread_id,
+            status="open",
+            limit=6,
+            conn=conn,
+            cur=cur,
+        )
 
     def _refresh_recent_memory_layers(
         self,
@@ -1505,6 +1658,8 @@ class MemoryManager:
         memory_type: str,
         significance_score: float,
         temporal_context: Dict[str, Any],
+        conn=None,
+        cur=None,
     ) -> None:
         combined = f"{user_input or ''}\n{sylana_response or ''}"
         entities = self._extract_entities(combined)
@@ -1521,8 +1676,10 @@ class MemoryManager:
             emotion=emotional_tone,
             significance_score=significance_score,
             mention_text=combined,
+            conn=conn,
+            cur=cur,
         )
-        self._sync_open_loops_from_turn(
+        open_loops = self._sync_open_loops_from_turn(
             memory_id=memory_id,
             thread_id=thread_id,
             personality=personality,
@@ -1530,6 +1687,8 @@ class MemoryManager:
             sylana_response=sylana_response,
             entities=entities,
             significance_score=significance_score,
+            conn=conn,
+            cur=cur,
         )
 
         if not thread_id:
@@ -1558,9 +1717,9 @@ class MemoryManager:
             last_user_intent=last_user_intent,
             last_memory_id=memory_id,
             summary_text=summary_text,
+            conn=conn,
+            cur=cur,
         )
-
-        open_loops = self.list_open_loops(personality=personality, thread_id=thread_id, status="open", limit=6)
         self._upsert_thread_summary(
             thread_id=int(thread_id),
             personality=personality,
@@ -1569,6 +1728,8 @@ class MemoryManager:
             active_topics=topics,
             key_entities=entities,
             open_loops=open_loops,
+            conn=conn,
+            cur=cur,
         )
         self._upsert_thread_summary(
             thread_id=int(thread_id),
@@ -1578,6 +1739,8 @@ class MemoryManager:
             active_topics=topics,
             key_entities=entities,
             open_loops=open_loops,
+            conn=conn,
+            cur=cur,
         )
 
     def get_thread_context(self, thread_id: int, personality: str = "sylana", limit: int = 6) -> Dict[str, Any]:

@@ -26,6 +26,7 @@ import tempfile
 import subprocess
 import selectors
 from collections import Counter
+from contextvars import ContextVar
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from html import unescape
@@ -44,7 +45,6 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from svix.webhooks import Webhook, WebhookVerificationError
 import resend
-from sse_starlette.sse import EventSourceResponse
 from openai import OpenAI
 from anthropic import (
     APIConnectionError,
@@ -553,6 +553,26 @@ def _chat_sync_error_response(err: Exception, thread_id: Optional[int]) -> JSONR
             "error": "Upstream model service unavailable. Please retry.",
             "details": details,
             "thread_id": thread_id,
+        },
+    )
+
+
+class ThreadContinuityError(Exception):
+    def __init__(self, requested_thread_id: Any):
+        self.requested_thread_id = requested_thread_id
+        super().__init__("Requested thread continuity could not be preserved.")
+
+
+def _thread_continuity_error_response(requested_thread_id: Any) -> JSONResponse:
+    return JSONResponse(
+        status_code=409,
+        content={
+            "error": "thread_continuity_error",
+            "details": (
+                "The requested thread_id is invalid or no longer available. "
+                "Reuse a valid thread or start a new one explicitly."
+            ),
+            "requested_thread_id": requested_thread_id,
         },
     )
 
@@ -1315,10 +1335,25 @@ class SylanaState:
 
 state = SylanaState()
 scheduler: Optional[AsyncIOScheduler] = None
+_RUNTIME_MEMORY_TOOL_CONTEXT: ContextVar[Dict[str, Any]] = ContextVar(
+    "runtime_memory_tool_context",
+    default={},
+)
 
 # Generation anti-repetition defaults.
 REPETITION_PENALTY = 1.15
 NO_REPEAT_NGRAM_SIZE = 4
+SYSTEM_PROMPT_BUDGET_TOKENS = max(800, int(os.getenv("SYSTEM_PROMPT_BUDGET_TOKENS", "2600")))
+RECENT_HISTORY_BUDGET_TOKENS = max(200, int(os.getenv("RECENT_HISTORY_BUDGET_TOKENS", "900")))
+RECENT_HISTORY_TURN_LIMIT = max(1, min(int(os.getenv("RECENT_HISTORY_TURN_LIMIT", "4")), 6))
+RECENT_HISTORY_MESSAGE_CHAR_LIMIT = max(
+    120,
+    int(os.getenv("RECENT_HISTORY_MESSAGE_CHAR_LIMIT", "480")),
+)
+SSE_KEEPALIVE_INTERVAL_SECONDS = max(
+    0.25,
+    float(os.getenv("SSE_KEEPALIVE_INTERVAL_SECONDS", "1.0")),
+)
 
 DEFAULT_ACTIVE_TOOLS = ["web_search", "memories"]
 AVAILABLE_TOOLS: List[Dict[str, str]] = [
@@ -1646,23 +1681,6 @@ def _build_user_context(active_tools: List[str]) -> Dict[str, Any]:
         ctx["work_sessions_summary"] = _get_work_session_summary()
     if "outreach" in active_tools:
         ctx["outreach_summary"] = _get_outreach_summary()
-    if "lysara" in active_tools:
-        ctx["lysara_status"] = _get_lysara_status_snapshot()
-        ctx["lysara_risk"] = state.lysara_risk_config or {}
-        ctx["lysara_performance"] = _get_lysara_performance_summary(limit=50)
-        ctx["lysara_sentiment"] = _get_lysara_sentiment_snapshot(limit=6)
-        ctx["lysara_confluence"] = _get_lysara_confluence_snapshot(limit=6)
-        ctx["lysara_event_risk"] = _get_lysara_event_risk_snapshot(limit=6)
-        ctx["lysara_exposure"] = _get_lysara_exposure_snapshot(limit=6)
-        ctx["lysara_override"] = _get_lysara_override_snapshot()
-        if state.lysara_memory_manager:
-            try:
-                ctx["lysara_context"] = state.lysara_memory_manager.get_context_bundle(
-                    query="current operational state",
-                    limit=6,
-                )
-            except Exception as e:
-                ctx["lysara_context_error"] = str(e)
     ctx["last_heartbeat_result"] = state.last_heartbeat_result or {}
     return ctx
 
@@ -1864,14 +1882,23 @@ def _runtime_tool_specs(active_tools: Optional[List[str]]) -> List[Dict[str, Any
         specs.extend([
             {
                 "name": "lysara_get_context",
-                "description": "Get the structured Lysara operational context bundle, including working state, open loops, canonical rules, recent operations, and research context.",
+                "description": "Get a structured Lysara context bundle. Prefer narrow Lysara tools first; use this when you need cross-cutting synthesis across state, rules, operations, and research.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
                         "query": {"type": "string"},
+                        "query_mode": {
+                            "type": "string",
+                            "description": "Optional override: working, canonical, episodic, open_loop, research, or mixed.",
+                        },
                         "symbol": {"type": "string"},
                         "strategy_key": {"type": "string"},
                         "market": {"type": "string"},
+                        "sections": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Optional section filter: working_state, open_loops, canonical_rules, recent_operations, research_context, staleness.",
+                        },
                         "limit": {"type": "integer", "minimum": 1, "maximum": 100},
                     },
                 },
@@ -2270,21 +2297,23 @@ def _set_runtime_memory_tool_context(
     conversation_mode: str,
     active_tools: List[str],
 ) -> None:
-    state.runtime_memory_tool_context = {
+    _RUNTIME_MEMORY_TOOL_CONTEXT.set(
+        {
         "user_input": user_input or "",
         "personality": (personality or "sylana").strip().lower(),
         "thread_id": thread_id,
         "conversation_mode": conversation_mode or "default",
         "active_tools": normalize_active_tools(active_tools),
-    }
+        }
+    )
 
 
 def _clear_runtime_memory_tool_context() -> None:
-    state.runtime_memory_tool_context = {}
+    _RUNTIME_MEMORY_TOOL_CONTEXT.set({})
 
 
 def _runtime_memory_tool_context() -> Dict[str, Any]:
-    return dict(getattr(state, "runtime_memory_tool_context", {}) or {})
+    return dict(_RUNTIME_MEMORY_TOOL_CONTEXT.get() or {})
 
 
 def _lysara_simulation_enabled() -> bool:
@@ -2876,9 +2905,11 @@ def _runtime_tool_runner(name: str, tool_input: Dict[str, Any]) -> Dict[str, Any
                 return {"error": "lysara_memory_manager_unavailable"}
             return manager.get_context_bundle(
                 query=str(tool_input.get("query") or "").strip(),
+                query_mode=str(tool_input.get("query_mode") or "").strip() or None,
                 symbol=str(tool_input.get("symbol") or "").strip() or None,
                 strategy_key=str(tool_input.get("strategy_key") or "").strip() or None,
                 market=str(tool_input.get("market") or "").strip() or None,
+                sections=tool_input.get("sections"),
                 limit=max(1, min(int(tool_input.get("limit") or 12), 100)),
             )
         if name == "lysara_get_review_queue":
@@ -3182,6 +3213,47 @@ def _set_thread_tools(thread_id: int, active_tools: List[str]) -> None:
         conn2.commit()
     except Exception:
         _safe_rollback(conn2, "_set_thread_tools.sync_conversations")
+
+
+def _resolve_chat_request_context(
+    *,
+    raw_thread_id: Any,
+    requested_tools: Any,
+    personality: str,
+    user_input: str,
+) -> Dict[str, Any]:
+    explicit_thread_requested = raw_thread_id is not None
+    thread_id: Optional[int]
+
+    if explicit_thread_requested:
+        try:
+            thread_id = int(raw_thread_id)
+        except Exception as exc:
+            raise ThreadContinuityError(raw_thread_id) from exc
+        if not _thread_exists(thread_id):
+            raise ThreadContinuityError(raw_thread_id)
+    else:
+        thread_id = None
+
+    if requested_tools is None:
+        resolved_tools = _get_thread_tools(thread_id) if thread_id is not None else list(DEFAULT_ACTIVE_TOOLS)
+    else:
+        resolved_tools = normalize_active_tools(requested_tools)
+
+    created_new = False
+    if thread_id is None:
+        thread = create_chat_thread(title=f"[{personality}] {user_input[:80]}", active_tools=resolved_tools)
+        thread_id = int(thread["id"])
+        created_new = True
+    else:
+        _set_thread_tools(thread_id, resolved_tools)
+
+    return {
+        "thread_id": thread_id,
+        "active_tools": resolved_tools,
+        "created_new": created_new,
+        "explicit_thread_requested": explicit_thread_requested,
+    }
 
 
 def _update_conversation_tool_metadata(
@@ -7891,9 +7963,9 @@ def _empty_memory_bundle() -> Dict[str, Any]:
     }
 
 
-def _format_tiered_memory_context(bundle: Dict[str, Any], memory_query: bool) -> str:
+def _build_tiered_memory_context_sections(bundle: Dict[str, Any], memory_query: bool) -> Dict[str, str]:
     if not bundle:
-        return ""
+        return {"priority": "", "support": ""}
 
     query_mode = bundle.get("query_mode", "mixed")
     working_memory = bundle.get("working_memory") or {}
@@ -7910,11 +7982,12 @@ def _format_tiered_memory_context(bundle: Dict[str, Any], memory_query: bool) ->
     dreams = bundle.get("dreams") or []
 
     if not any([working_memory, thread_summaries, open_loops, identity_core, facts, pending_fact_proposals, anniversaries, milestones, episodes, entities, reflections, dreams]):
-        return ""
+        return {"priority": "", "support": ""}
 
-    lines = [f"TIERED MEMORY CONTEXT (mode={query_mode}):"]
+    priority_lines = [f"TIERED MEMORY CONTEXT (mode={query_mode}):"]
+    support_lines = [f"MEMORY SUPPORT (mode={query_mode}):"]
     if memory_query:
-        lines.extend([
+        priority_lines.extend([
             "Grounding rules:",
             "- State exact facts first when they are available.",
             "- For recent-context questions, use working memory and thread summaries before older episodes.",
@@ -7924,121 +7997,129 @@ def _format_tiered_memory_context(bundle: Dict[str, Any], memory_query: bool) ->
         ])
 
     if working_memory:
-        lines.append("WORKING MEMORY:")
+        priority_lines.append("WORKING MEMORY:")
         summary_text = (working_memory.get("summary_text") or "").strip()
         if summary_text:
-            lines.append(f"- {summary_text}")
+            priority_lines.append(f"- {summary_text}")
         current_topic = (working_memory.get("current_topic") or "").strip()
         if current_topic:
-            lines.append(f"- Current topic: {current_topic}")
+            priority_lines.append(f"- Current topic: {current_topic}")
         active_entities = working_memory.get("active_entities") or []
         if active_entities:
-            lines.append(f"- Active entities: {', '.join(str(item) for item in active_entities[:5])}")
+            priority_lines.append(f"- Active entities: {', '.join(str(item) for item in active_entities[:5])}")
         pending_commitments = working_memory.get("pending_commitments") or []
         if pending_commitments:
-            lines.append(f"- Pending commitments: {', '.join(str(item) for item in pending_commitments[:4])}")
+            priority_lines.append(f"- Pending commitments: {', '.join(str(item) for item in pending_commitments[:4])}")
 
     if open_loops:
-        lines.append("OPEN LOOPS:")
+        priority_lines.append("OPEN LOOPS:")
         for loop in open_loops[:4]:
             title = (loop.get("title") or "").strip()
             due_hint = (loop.get("due_hint") or "").strip()
             if title and due_hint:
-                lines.append(f"- {title} (due hint: {due_hint})")
+                priority_lines.append(f"- {title} (due hint: {due_hint})")
             elif title:
-                lines.append(f"- {title}")
+                priority_lines.append(f"- {title}")
 
     if thread_summaries:
-        lines.append("THREAD SUMMARIES:")
+        priority_lines.append("THREAD SUMMARIES:")
         for summary in thread_summaries[:2]:
             window_kind = summary.get("window_kind", "current_thread")
             summary_text = (summary.get("summary_text") or "").strip()
             if summary_text:
-                lines.append(f"- [{window_kind}] {summary_text}")
+                priority_lines.append(f"- [{window_kind}] {summary_text}")
 
     if identity_core:
-        lines.append("IDENTITY CORE:")
+        support_lines.append("IDENTITY CORE:")
         for item in identity_core[:4]:
             source_type = item.get("source_type", "core_truth")
             statement = (item.get("statement") or "").strip()
             explanation = (item.get("explanation") or "").strip()
             scope = item.get("personality_scope", "shared")
             if statement and explanation:
-                lines.append(f"- [{source_type}/{scope}] {statement} :: {explanation[:160]}")
+                support_lines.append(f"- [{source_type}/{scope}] {statement} :: {explanation[:160]}")
             elif statement:
-                lines.append(f"- [{source_type}/{scope}] {statement}")
+                support_lines.append(f"- [{source_type}/{scope}] {statement}")
 
     if facts:
-        lines.append("LIFE FACTS:")
+        support_lines.append("LIFE FACTS:")
         for fact in facts[:5]:
             normalized = (fact.get("normalized_text") or "").strip()
             confidence = fact.get("confidence")
             scope = fact.get("personality_scope", "shared")
             source_kind = fact.get("source_kind", "fact")
             if normalized:
-                lines.append(f"- [{source_kind}/{scope}] {normalized} (confidence={confidence})")
+                support_lines.append(f"- [{source_kind}/{scope}] {normalized} (confidence={confidence})")
 
     if pending_fact_proposals:
-        lines.append("PENDING FACT PROPOSALS:")
+        support_lines.append("PENDING FACT PROPOSALS:")
         for proposal in pending_fact_proposals[:3]:
             normalized = (proposal.get("proposed_normalized_text") or "").strip()
             if normalized:
-                lines.append(f"- Unconfirmed: {normalized}")
+                support_lines.append(f"- Unconfirmed: {normalized}")
 
     if anniversaries:
-        lines.append("ANNIVERSARIES:")
+        support_lines.append("ANNIVERSARIES:")
         for ann in anniversaries[:3]:
             title = ann.get("title", "")
             date_human = ann.get("date_human") or ann.get("date") or ""
             scope = ann.get("personality_scope", "shared")
-            lines.append(f"- [{scope}] {title}: {date_human}")
+            support_lines.append(f"- [{scope}] {title}: {date_human}")
 
     if milestones:
-        lines.append("MILESTONES:")
+        support_lines.append("MILESTONES:")
         for milestone in milestones[:3]:
             title = milestone.get("title", "")
             date_human = milestone.get("date_human") or milestone.get("date_occurred") or ""
             quote = (milestone.get("quote") or "").strip()
             if quote:
-                lines.append(f"- {title} ({date_human}) :: {quote[:140]}")
+                support_lines.append(f"- {title} ({date_human}) :: {quote[:140]}")
             else:
-                lines.append(f"- {title} ({date_human})")
+                support_lines.append(f"- {title} ({date_human})")
 
     if episodes:
-        lines.append("EPISODIC SUPPORT:")
+        support_lines.append("EPISODIC SUPPORT:")
         for episode in episodes[:3]:
             user_excerpt = (episode.get("user_input") or "").replace("\n", " ").strip()[:140]
             assistant_excerpt = (episode.get("sylana_response") or "").replace("\n", " ").strip()[:140]
             date_str = episode.get("date_str") or ""
-            lines.append(f"- [{date_str}] Elias: \"{user_excerpt}\" | You: \"{assistant_excerpt}\"")
+            support_lines.append(f"- [{date_str}] Elias: \"{user_excerpt}\" | You: \"{assistant_excerpt}\"")
 
     if entities:
-        lines.append("ENTITY MEMORY:")
+        support_lines.append("ENTITY MEMORY:")
         for entity in entities[:4]:
             display_name = entity.get("display_name", "")
             summary = (entity.get("canonical_summary") or "").strip()
             if display_name and summary:
-                lines.append(f"- {display_name}: {summary[:160]}")
+                support_lines.append(f"- {display_name}: {summary[:160]}")
             elif display_name:
-                lines.append(f"- {display_name}")
+                support_lines.append(f"- {display_name}")
 
     if reflections:
-        lines.append("REFLECTIONS:")
+        support_lines.append("REFLECTIONS:")
         for reflection in reflections[:2]:
             date_str = reflection.get("reflection_date") or ""
             summary = (reflection.get("summary_text") or "").strip()
             if summary:
-                lines.append(f"- [{date_str}] {summary[:180]}")
+                support_lines.append(f"- [{date_str}] {summary[:180]}")
 
     if dreams:
-        lines.append("DREAMS:")
+        support_lines.append("DREAMS:")
         for dream in dreams[:2]:
             title = dream.get("title", "")
             text = (dream.get("dream_text") or "").strip()
             if title and text:
-                lines.append(f"- {title}: {text[:180]}")
+                support_lines.append(f"- {title}: {text[:180]}")
 
-    return "\n".join(lines)
+    return {
+        "priority": "\n".join(priority_lines) if len(priority_lines) > 1 else "",
+        "support": "\n".join(support_lines) if len(support_lines) > 1 else "",
+    }
+
+
+def _format_tiered_memory_context(bundle: Dict[str, Any], memory_query: bool) -> str:
+    sections = _build_tiered_memory_context_sections(bundle, memory_query)
+    return "\n\n".join(part for part in [sections.get("priority"), sections.get("support")] if part)
 
 
 def _format_supplemental_sacred_context(sacred_context: List[Dict[str, Any]]) -> str:
@@ -8080,16 +8161,13 @@ def _build_tiered_response_seed(bundle: Dict[str, Any]) -> str:
     return ""
 
 
-def build_system_prompt(
+def _build_base_system_prompt(
     entity: str,
     active_tools: List[str],
-    user_context: Optional[Dict[str, Any]] = None,
     conversation_mode: str = "default",
 ) -> str:
-    """Build dynamic system prompt from active tools + user context."""
     personality = (entity or "sylana").strip().lower()
     tools = normalize_active_tools(active_tools)
-    user_ctx = user_context or {}
 
     if state.personality_manager:
         base_identity = state.personality_manager.get_system_prompt(personality)
@@ -8123,20 +8201,12 @@ def build_system_prompt(
             "Tone mode: spicy. Be bolder, flirtier, and more teasing than your default tone. "
             "Keep it emotionally intimate, suggestive, and playful without becoming graphically explicit."
         )
+    return "\n\n".join(base_lines)
 
-    health_snapshot = user_ctx.get("health_snapshot") or {}
-    github_snapshot = user_ctx.get("github_snapshot") or {}
-    work_sessions_summary = user_ctx.get("work_sessions_summary") or {}
-    outreach_summary = user_ctx.get("outreach_summary") or {}
-    lysara_status = user_ctx.get("lysara_status") or {}
-    lysara_risk = user_ctx.get("lysara_risk") or {}
-    lysara_performance = user_ctx.get("lysara_performance") or {}
-    lysara_sentiment = user_ctx.get("lysara_sentiment") or {}
-    lysara_confluence = user_ctx.get("lysara_confluence") or {}
-    lysara_event_risk = user_ctx.get("lysara_event_risk") or {}
-    lysara_exposure = user_ctx.get("lysara_exposure") or {}
-    lysara_override = user_ctx.get("lysara_override") or {}
-    heartbeat_result = user_ctx.get("last_heartbeat_result") or {}
+
+def _build_tool_policy_section(active_tools: List[str]) -> str:
+    tools = normalize_active_tools(active_tools)
+    lines: List[str] = []
     tool_blocks = {
         "web_search": "You have access to web search. Use it when current information would improve your response.",
         "code_execution": "You have access to code execution. You can write and run Python, JavaScript, or bash. Use this to produce real outputs, not just describe them.",
@@ -8147,49 +8217,69 @@ def build_system_prompt(
         "photos": "You have access to Elias's photo library with tagged memories of his life, family, and work.",
         "memories": "You have access to conversation memory and past context.",
         "outreach": "You have access to the Manifest outreach system including prospect lists, email drafts, session results, and prospect-research execution.",
-        "lysara": "You have access to the Lysara trading node. Use Lysara tools for operational truth about balances, incidents, strategies, and trade execution. Do not invent trading state from memory.",
+        "lysara": "You have access to the Lysara trading node.",
     }
     for tool in tools:
         line = tool_blocks.get(tool)
         if line:
-            base_lines.append(line)
-        if tool == "health_data" and health_snapshot:
-            base_lines.append(f"Latest health snapshot: {json.dumps(health_snapshot)[:1200]}")
-        if tool == "github" and github_snapshot:
-            base_lines.append(f"GitHub access snapshot: {json.dumps(github_snapshot)[:1800]}")
-        if tool == "work_sessions" and work_sessions_summary:
-            base_lines.append(f"Work session summary: {json.dumps(work_sessions_summary)}")
-        if tool == "outreach" and outreach_summary:
-            base_lines.append(f"Outreach summary: {json.dumps(outreach_summary)}")
+            lines.append(line)
         if tool == "outreach":
-            base_lines.append(f"Product context: {MANIFEST_PRODUCT_CONTEXT}")
-            base_lines.append(
-                "When user asks to find prospects/run outreach, use outreach_run_prospect_research "
-                "instead of doing ad-hoc in-chat web research."
+            lines.append(f"Product context: {MANIFEST_PRODUCT_CONTEXT}")
+            lines.append(
+                "When user asks to find prospects or run outreach, use outreach_run_prospect_research instead of ad-hoc in-chat web research."
             )
-        if tool == "lysara" and lysara_status:
-            base_lines.append(f"Lysara status snapshot: {json.dumps(lysara_status)[:1800]}")
-            if lysara_risk:
-                base_lines.append(f"Lysara risk policy: {json.dumps(lysara_risk)[:1200]}")
-            if lysara_performance:
-                base_lines.append(f"Lysara performance snapshot: {json.dumps(lysara_performance)[:1200]}")
-            if lysara_sentiment:
-                base_lines.append(f"Lysara sentiment radar: {json.dumps(lysara_sentiment)[:1400]}")
-            if lysara_confluence:
-                base_lines.append(f"Lysara confluence: {json.dumps(lysara_confluence)[:1400]}")
-            if lysara_event_risk:
-                base_lines.append(f"Lysara event risk: {json.dumps(lysara_event_risk)[:1300]}")
-            if lysara_exposure:
-                base_lines.append(f"Lysara exposure snapshot: {json.dumps(lysara_exposure)[:1200]}")
-            if lysara_override:
-                base_lines.append(f"Lysara override state: {json.dumps(lysara_override)[:900]}")
-            base_lines.append(
-                "Financial operator policy: for current market-moving decisions, gather current source-backed information via web search before submitting any trade intent. "
-                "Only use approved Lysara mutation tools for risk, strategy controls, pause/resume, and trade intents."
+        if tool == "lysara":
+            lines.extend(
+                [
+                    "Use Lysara tools only for trading, node-state, risk-policy, incident, research, or execution questions.",
+                    "Prefer narrow Lysara tools first: lysara_get_status, lysara_get_positions, lysara_get_recent_trades, lysara_get_exposure, lysara_get_incidents, lysara_get_open_loops, lysara_get_canonical_risk, lysara_get_canonical_strategies, lysara_get_research, and lysara_get_journal.",
+                    "Use lysara_get_context only when you need cross-cutting synthesis across working state, canonical rules, operations, and research.",
+                    "Never infer live trading state from memory alone.",
+                    "For current market-moving decisions, gather current source-backed information via web search before submitting any trade intent.",
+                    "Only use approved Lysara mutation tools for risk, strategy controls, pause/resume, overrides, research/journal recording, and trade intents.",
+                ]
             )
+    return "\n".join(lines)
+
+
+def _build_operational_prompt_sections(
+    active_tools: List[str],
+    user_context: Optional[Dict[str, Any]] = None,
+) -> List[Tuple[str, str]]:
+    tools = normalize_active_tools(active_tools)
+    user_ctx = user_context or {}
+    sections: List[Tuple[str, str]] = []
+    health_snapshot = user_ctx.get("health_snapshot") or {}
+    github_snapshot = user_ctx.get("github_snapshot") or {}
+    work_sessions_summary = user_ctx.get("work_sessions_summary") or {}
+    outreach_summary = user_ctx.get("outreach_summary") or {}
+    heartbeat_result = user_ctx.get("last_heartbeat_result") or {}
+
+    if "health_data" in tools and health_snapshot:
+        sections.append(("health_snapshot", f"Latest health snapshot: {json.dumps(health_snapshot)[:1200]}"))
+    if "github" in tools and github_snapshot:
+        sections.append(("github_snapshot", f"GitHub access snapshot: {json.dumps(github_snapshot)[:1800]}"))
+    if "work_sessions" in tools and work_sessions_summary:
+        sections.append(("work_sessions", f"Work session summary: {json.dumps(work_sessions_summary)[:900]}"))
+    if "outreach" in tools and outreach_summary:
+        sections.append(("outreach_summary", f"Outreach summary: {json.dumps(outreach_summary)[:900]}"))
     if heartbeat_result:
-        base_lines.append(f"Latest heartbeat summary: {json.dumps(heartbeat_result)[:1200]}")
-    return "\n\n".join(base_lines)
+        sections.append(("heartbeat", f"Latest heartbeat summary: {json.dumps(heartbeat_result)[:1200]}"))
+    return sections
+
+
+def build_system_prompt(
+    entity: str,
+    active_tools: List[str],
+    user_context: Optional[Dict[str, Any]] = None,
+    conversation_mode: str = "default",
+) -> str:
+    parts = [
+        _build_base_system_prompt(entity, active_tools, conversation_mode=conversation_mode),
+        _build_tool_policy_section(active_tools),
+    ]
+    parts.extend(section for _, section in _build_operational_prompt_sections(active_tools, user_context))
+    return "\n\n".join(part for part in parts if part)
 
 
 def _format_session_continuity_context(payload: Dict[str, Any]) -> str:
@@ -8230,6 +8320,69 @@ def _format_session_continuity_context(payload: Dict[str, Any]) -> str:
 
     return "\n".join(lines)
 
+
+def _budget_prompt_sections(
+    sections: List[Tuple[str, str, bool]],
+    token_budget: int,
+) -> Tuple[str, List[str]]:
+    selected: List[str] = []
+    dropped: List[str] = []
+    used_tokens = 0
+    budget = max(200, int(token_budget or 0))
+
+    for name, raw_text, required in sections:
+        text = (raw_text or "").strip()
+        if not text:
+            continue
+        section_tokens = _approx_token_count(text)
+        if selected and not required and (used_tokens + section_tokens) > budget:
+            dropped.append(name)
+            continue
+        selected.append(text)
+        used_tokens += section_tokens
+
+    return "\n\n".join(selected), dropped
+
+
+def _truncate_recent_history_message(text: str, char_limit: int = RECENT_HISTORY_MESSAGE_CHAR_LIMIT) -> str:
+    compact = re.sub(r"\s+", " ", text or "").strip()
+    if len(compact) <= char_limit:
+        return compact
+    return compact[: max(40, char_limit - 3)].rstrip() + "..."
+
+
+def _budget_recent_history_messages(
+    recent_history: Optional[List[Dict[str, Any]]],
+    token_budget: int = RECENT_HISTORY_BUDGET_TOKENS,
+    max_turns: int = RECENT_HISTORY_TURN_LIMIT,
+) -> List[Dict[str, str]]:
+    if not recent_history:
+        return []
+
+    used_tokens = 0
+    selected_reversed: List[Dict[str, str]] = []
+    budget = max(120, int(token_budget or 0))
+
+    for turn in reversed(recent_history[-max_turns:]):
+        assistant = _truncate_recent_history_message(turn.get("sylana_response") or "")
+        user = _truncate_recent_history_message(turn.get("user_input") or "")
+        pair: List[Dict[str, str]] = []
+        if assistant:
+            pair.append({"role": "assistant", "content": assistant})
+        if user:
+            pair.append({"role": "user", "content": user})
+        if not pair:
+            continue
+
+        pair_tokens = sum(_approx_token_count(item["content"]) for item in pair)
+        if selected_reversed and (used_tokens + pair_tokens) > budget:
+            continue
+        selected_reversed.extend(pair)
+        used_tokens += pair_tokens
+
+    selected_reversed.reverse()
+    return selected_reversed
+
 def _build_claude_inputs(
     user_input: str,
     personality: str,
@@ -8244,9 +8397,9 @@ def _build_claude_inputs(
     memory_query: bool,
     has_matches: bool,
 ) -> Dict[str, Any]:
-    system_prompt = build_system_prompt(personality, active_tools, user_context, conversation_mode=conversation_mode)
+    base_prompt = _build_base_system_prompt(personality, active_tools, conversation_mode=conversation_mode)
     composed_system = state.prompt_engineer.build_system_message(
-        personality_prompt=system_prompt,
+        personality_prompt=base_prompt,
         emotion=emotion_data['category'],
         emotional_history=state.emotional_history[-5:],
         semantic_memories=[],
@@ -8254,28 +8407,25 @@ def _build_claude_inputs(
         core_truths=[],
         sacred_context=[],
     )
-
-    tiered_text = _format_tiered_memory_context(memory_bundle, memory_query=memory_query)
-    if tiered_text:
-        composed_system = f"{composed_system}\n\n{tiered_text}"
-    if sacred_context:
-        supplemental_sacred = _format_supplemental_sacred_context(sacred_context)
-        if supplemental_sacred:
-            composed_system = f"{composed_system}\n\n{supplemental_sacred}"
-
+    tool_policy = _build_tool_policy_section(active_tools)
+    memory_sections = _build_tiered_memory_context_sections(memory_bundle, memory_query=memory_query)
     continuity_text = _format_session_continuity_context(memory_bundle.get("continuity") or {})
-    if continuity_text:
-        composed_system = f"{composed_system}\n\n{continuity_text}"
+    supplemental_sacred = _format_supplemental_sacred_context(sacred_context)
+    operational_sections = _build_operational_prompt_sections(active_tools, user_context)
+    composed_system, dropped_sections = _budget_prompt_sections(
+        [
+            ("base_identity", composed_system, True),
+            ("tool_policy", tool_policy, True),
+            ("working_memory", memory_sections.get("priority") or "", True),
+            ("continuity", continuity_text, True),
+            ("factual_support", memory_sections.get("support") or "", False),
+            ("sacred_context", supplemental_sacred, False),
+            *[(name, text, False) for name, text in operational_sections],
+        ],
+        SYSTEM_PROMPT_BUDGET_TOKENS,
+    )
 
-    messages = []
-    if recent_history:
-        for turn in recent_history[-4:]:
-            u = (turn.get('user_input') or '').strip()
-            a = (turn.get('sylana_response') or '').strip()
-            if u:
-                messages.append({'role': 'user', 'content': u})
-            if a:
-                messages.append({'role': 'assistant', 'content': a})
+    messages = _budget_recent_history_messages(recent_history)
 
     user_content = user_input
     if memory_query:
@@ -8293,6 +8443,7 @@ def _build_claude_inputs(
         'system_prompt': composed_system,
         'messages': messages,
         'response_seed': response_seed,
+        'dropped_sections': dropped_sections,
     }
 
 
@@ -8337,22 +8488,22 @@ def _retrieve_memory_bundle_for_turn(
     return bundle, sacred_context
 
 
-def generate_response(
+def _generate_turn_result(
     user_input: str,
     thread_id: Optional[int] = None,
     personality: str = 'sylana',
     active_tools: Optional[List[str]] = None,
     conversation_mode: str = "default",
+    emotion_data: Optional[Dict[str, Any]] = None,
 ) -> dict:
-    """Generate a complete response (non-streaming)."""
     state.turn_count += 1
     resolved_tools = normalize_active_tools(active_tools)
     resolved_mode = normalize_conversation_mode(conversation_mode, personality)
     memories_active = "memories" in resolved_tools
     user_context = _build_user_context(resolved_tools)
 
-    emotion_data = detect_emotion(user_input)
-    state.emotional_history.append(emotion_data['emotion'])
+    emotion_payload = emotion_data or detect_emotion(user_input)
+    state.emotional_history.append(emotion_payload['emotion'])
 
     retrieval_plan = infer_retrieval_plan(user_input) if memories_active else {
         "is_memory_query": False,
@@ -8380,6 +8531,12 @@ def generate_response(
             thread_id=thread_id,
         )
 
+    prompt_for_metadata = build_system_prompt(
+        personality,
+        resolved_tools,
+        user_context,
+        conversation_mode=resolved_mode,
+    )
     if memory_query and retrieval_plan.get('structured_output'):
         response = build_structured_memory_report(memory_bundle.get('episodes', [])[:retrieval_plan.get('k', 3)])
     else:
@@ -8389,7 +8546,7 @@ def generate_response(
             conversation_mode=resolved_mode,
             active_tools=resolved_tools,
             user_context=user_context,
-            emotion_data=emotion_data,
+            emotion_data=emotion_payload,
             retrieval_plan=retrieval_plan,
             memory_bundle=memory_bundle,
             recent_history=recent_history,
@@ -8397,6 +8554,7 @@ def generate_response(
             memory_query=memory_query,
             has_matches=has_matches,
         )
+        prompt_for_metadata = claude_inputs['system_prompt']
         active_model = state.openrouter_model if resolved_mode == "spicy" and state.openrouter_model else state.claude_model
         try:
             _set_runtime_memory_tool_context(
@@ -8425,19 +8583,13 @@ def generate_response(
                 raise
         finally:
             _clear_runtime_memory_tool_context()
-        if not response:
-            response = "I'm here with you. Say that again for me."
-        if thread_id:
-            _update_conversation_tool_metadata(
-                thread_id,
-                active_tools=resolved_tools,
-                system_prompt=claude_inputs['system_prompt'],
-            )
-    if memory_query and retrieval_plan.get('structured_output') and thread_id:
+        response = response or "I'm here with you. Say that again for me."
+
+    if thread_id:
         _update_conversation_tool_metadata(
             thread_id,
             active_tools=resolved_tools,
-            system_prompt=build_system_prompt(personality, resolved_tools, user_context, conversation_mode=resolved_mode),
+            system_prompt=prompt_for_metadata,
         )
 
     voice_score = None
@@ -8446,21 +8598,22 @@ def generate_response(
         voice_score = round(score, 2)
 
     conv_id = None
-    try:
-        conv_id = state.memory_manager.store_conversation(
-            user_input=user_input,
-            sylana_response=response,
-            emotion=emotion_data['category'],
-            emotion_data=emotion_data,
-            personality=personality,
-            thread_id=thread_id,
-        )
-    except Exception as e:
-        logger.error(f'Failed to store conversation: {e}')
+    if state.memory_manager:
+        try:
+            conv_id = state.memory_manager.store_conversation(
+                user_input=user_input,
+                sylana_response=response,
+                emotion=emotion_payload['category'],
+                emotion_data=emotion_payload,
+                personality=personality,
+                thread_id=thread_id,
+            )
+        except Exception as e:
+            logger.error(f'Failed to store conversation: {e}')
 
     result = {
         'response': response,
-        'emotion': emotion_data,
+        'emotion': emotion_payload,
         'voice_score': voice_score,
         'conversation_id': conv_id,
         'turn': state.turn_count,
@@ -8468,20 +8621,65 @@ def generate_response(
         'personality': personality,
         'conversation_mode': resolved_mode,
         'active_tools': resolved_tools,
+        'memory_query': memory_query,
     }
     save_thread_turn(
         thread_id=thread_id,
         user_input=user_input,
         assistant_output=response,
         personality=personality,
-        emotion=emotion_data,
+        emotion=emotion_payload,
         voice_score=voice_score,
         turn=state.turn_count,
     )
     return result
 
 
+def generate_response(
+    user_input: str,
+    thread_id: Optional[int] = None,
+    personality: str = 'sylana',
+    active_tools: Optional[List[str]] = None,
+    conversation_mode: str = "default",
+) -> dict:
+    """Generate a complete response (non-streaming)."""
+    return _generate_turn_result(
+        user_input,
+        thread_id=thread_id,
+        personality=personality,
+        active_tools=active_tools,
+        conversation_mode=conversation_mode,
+    )
+
+
+def _chunk_text_for_sse(text: str, max_chars: int = 24) -> List[str]:
+    chunks: List[str] = []
+    for part in re.findall(r"\S+\s*", text or ""):
+        if len(part) <= max_chars:
+            chunks.append(part)
+            continue
+        for i in range(0, len(part), max_chars):
+            chunks.append(part[i:i + max_chars])
+    return chunks or [text or ""]
+
+
+def _sse_data(payload: Dict[str, Any]) -> str:
+    return f"data: {json.dumps(payload)}\n\n"
+
+
+def _sse_comment(comment: str) -> str:
+    return f": {comment}\n\n"
+
+
+def _observe_background_turn(task: asyncio.Task) -> None:
+    try:
+        task.result()
+    except Exception as exc:
+        logger.debug("Background turn finished after disconnect: %s", exc)
+
+
 async def generate_response_stream(
+    request: Request,
     user_input: str,
     thread_id: Optional[int] = None,
     personality: str = 'sylana',
@@ -8489,166 +8687,89 @@ async def generate_response_stream(
     conversation_mode: str = "default",
 ):
     """Generate a streaming response using SSE."""
-    def _chunk_text_for_sse(text: str, max_chars: int = 24) -> List[str]:
-        """Chunk text into small token-like pieces for SSE streaming."""
-        chunks: List[str] = []
-        for part in re.findall(r"\S+\s*", text or ""):
-            if len(part) <= max_chars:
-                chunks.append(part)
-                continue
-            for i in range(0, len(part), max_chars):
-                chunks.append(part[i:i + max_chars])
-        return chunks or [text or ""]
-
     resolved_tools = normalize_active_tools(active_tools)
     resolved_mode = normalize_conversation_mode(conversation_mode, personality)
+    preview_emotion = detect_emotion(user_input)
 
-    state.turn_count += 1
-    memories_active = "memories" in resolved_tools
-    user_context = _build_user_context(resolved_tools)
-
-    emotion_data = detect_emotion(user_input)
-    state.emotional_history.append(emotion_data['emotion'])
-
-    retrieval_plan = infer_retrieval_plan(user_input) if memories_active else {
-        "is_memory_query": False,
-        "include_sacred": False,
-    }
-    memory_bundle, sacred_context = _retrieve_memory_bundle_for_turn(
-        user_input=user_input,
-        personality=personality,
-        thread_id=thread_id,
-        memories_active=memories_active,
-        retrieval_plan=retrieval_plan,
-    )
-    memory_query = bool(
-        memories_active and (
-            retrieval_plan.get('is_memory_query')
-            or memory_bundle.get("query_mode") in {"fact", "identity", "episodic", "continuity", "working"}
-        )
-    )
-    has_matches = bool(memory_bundle.get("has_matches"))
-    recent_history = None
-    if memories_active and state.memory_manager:
-        recent_history = state.memory_manager.get_conversation_history(
-            limit=config.MEMORY_CONTEXT_LIMIT,
-            personality=personality,
-            thread_id=thread_id,
-        )
-
-    yield json.dumps({'type': 'emotion', 'data': emotion_data, 'memory_query': memory_query, 'active_tools': resolved_tools})
-
-    if memory_query and retrieval_plan.get('structured_output'):
-        response = build_structured_memory_report(memory_bundle.get('episodes', [])[:retrieval_plan.get('k', 3)])
-        yield json.dumps({'type': 'token', 'data': response})
-        full_response = response
-    else:
-        claude_inputs = _build_claude_inputs(
-            user_input=user_input,
-            personality=personality,
-            conversation_mode=resolved_mode,
-            active_tools=resolved_tools,
-            user_context=user_context,
-            emotion_data=emotion_data,
-            retrieval_plan=retrieval_plan,
-            memory_bundle=memory_bundle,
-            recent_history=recent_history,
-            sacred_context=sacred_context,
-            memory_query=memory_query,
-            has_matches=has_matches,
-        )
-
-        full_response = ''
-        active_model = state.openrouter_model if resolved_mode == "spicy" and state.openrouter_model else state.claude_model
-        try:
-            _set_runtime_memory_tool_context(
-                user_input=user_input,
-                personality=personality,
-                thread_id=thread_id,
-                conversation_mode=resolved_mode,
-                active_tools=resolved_tools,
-            )
-            token_stream = active_model.generate_stream(
-                system_prompt=claude_inputs['system_prompt'],
-                messages=claude_inputs['messages'],
-                max_tokens=_max_new_tokens_for_turn(memory_query=memory_query),
-                active_tools=resolved_tools,
-            )
-            for token in token_stream:
-                full_response += token
-                yield json.dumps({'type': 'token', 'data': token})
-                await asyncio.sleep(0.001)
-        except Exception as spicy_error:
-            if resolved_mode == "spicy" and state.openrouter_model:
-                logger.warning("Spicy mode stream provider failed; falling back to default model: %s", spicy_error)
-                full_response = ""
-                for token in state.claude_model.generate_stream(
-                    system_prompt=claude_inputs['system_prompt'],
-                    messages=claude_inputs['messages'],
-                    max_tokens=_max_new_tokens_for_turn(memory_query=memory_query),
-                    active_tools=resolved_tools,
-                ):
-                    full_response += token
-                    yield json.dumps({'type': 'token', 'data': token})
-                    await asyncio.sleep(0.001)
-            else:
-                raise
-        finally:
-            _clear_runtime_memory_tool_context()
-
-        full_response = full_response.strip() or "I'm here with you. Say that again for me."
-        if thread_id:
-            _update_conversation_tool_metadata(
-                thread_id,
-                active_tools=resolved_tools,
-                system_prompt=claude_inputs['system_prompt'],
-            )
-    if memory_query and retrieval_plan.get('structured_output') and thread_id:
-        _update_conversation_tool_metadata(
-            thread_id,
-            active_tools=resolved_tools,
-            system_prompt=build_system_prompt(personality, resolved_tools, user_context, conversation_mode=resolved_mode),
-        )
-
-    voice_score = None
-    if state.voice_validator and full_response:
-        score, _, _ = state.voice_validator.validate(full_response)
-        voice_score = round(score, 2)
-
-    conv_id = None
-    try:
-        conv_id = state.memory_manager.store_conversation(
-            user_input=user_input,
-            sylana_response=full_response,
-            emotion=emotion_data['category'],
-            emotion_data=emotion_data,
-            personality=personality,
-            thread_id=thread_id,
-        )
-    except Exception as e:
-        logger.error(f'Failed to store conversation (stream): {e}')
-
-    yield json.dumps({
-        'type': 'done',
-        'data': {
-            'voice_score': voice_score,
-            'conversation_id': conv_id,
-            'turn': state.turn_count,
-            'full_response': full_response,
-            'thread_id': thread_id,
-            'personality': personality,
-            'conversation_mode': resolved_mode,
-            'active_tools': resolved_tools,
+    yield _sse_data(
+        {
+            "type": "session",
+            "data": {
+                "thread_id": thread_id,
+                "personality": personality,
+                "conversation_mode": resolved_mode,
+                "active_tools": resolved_tools,
+            },
         }
-    })
-    save_thread_turn(
-        thread_id=thread_id,
-        user_input=user_input,
-        assistant_output=full_response,
-        personality=personality,
-        emotion=emotion_data,
-        voice_score=voice_score,
-        turn=state.turn_count,
+    )
+
+    worker = asyncio.create_task(
+        asyncio.to_thread(
+            _generate_turn_result,
+            user_input,
+            thread_id,
+            personality,
+            resolved_tools,
+            resolved_mode,
+            preview_emotion,
+        )
+    )
+
+    while not worker.done():
+        if await request.is_disconnected():
+            worker.add_done_callback(_observe_background_turn)
+            return
+        yield _sse_comment("keep-alive")
+        await asyncio.sleep(SSE_KEEPALIVE_INTERVAL_SECONDS)
+
+    try:
+        result = await worker
+    except Exception as exc:
+        yield _sse_data(
+            {
+                "type": "error",
+                "error": _safe_error_details(exc),
+                "thread_id": thread_id,
+            }
+        )
+        return
+
+    if await request.is_disconnected():
+        return
+
+    yield _sse_data(
+        {
+            'type': 'emotion',
+            'data': result.get('emotion') or preview_emotion,
+            'memory_query': bool(result.get('memory_query')),
+            'active_tools': result.get('active_tools') or resolved_tools,
+        }
+    )
+
+    full_response = str(result.get("response") or "")
+    for token in _chunk_text_for_sse(full_response):
+        if await request.is_disconnected():
+            return
+        yield _sse_data({'type': 'token', 'data': token})
+        await asyncio.sleep(0.001)
+
+    if await request.is_disconnected():
+        return
+
+    yield _sse_data(
+        {
+            'type': 'done',
+            'data': {
+                'voice_score': result.get('voice_score'),
+                'conversation_id': result.get('conversation_id'),
+                'turn': result.get('turn'),
+                'full_response': full_response,
+                'thread_id': result.get('thread_id'),
+                'personality': result.get('personality') or personality,
+                'conversation_mode': result.get('conversation_mode') or resolved_mode,
+                'active_tools': result.get('active_tools') or resolved_tools,
+            }
+        }
     )
 
 
@@ -11316,9 +11437,11 @@ async def lysara_risk_policy():
 @lysara_router.get("/context")
 async def lysara_context(
     query: str = "",
+    query_mode: str = "",
     symbol: str = "",
     strategy_key: str = "",
     market: str = "",
+    sections: Optional[List[str]] = Query(default=None),
     limit: int = 12,
 ):
     if not state.lysara_memory_manager:
@@ -11326,9 +11449,11 @@ async def lysara_context(
     return JSONResponse(
         content=state.lysara_memory_manager.get_context_bundle(
             query=query,
+            query_mode=query_mode or None,
             symbol=symbol or None,
             strategy_key=strategy_key or None,
             market=market or None,
+            sections=sections,
             limit=limit,
         )
     )
@@ -11737,33 +11862,33 @@ async def chat(request: Request):
             content={"error": "No message provided"}
         )
     try:
-        thread_id = int(thread_id) if thread_id is not None else None
-    except Exception:
-        thread_id = None
-    if thread_id is not None and not _thread_exists(thread_id):
-        thread_id = None
-    if requested_tools is None:
-        resolved_tools = _get_thread_tools(thread_id) if thread_id is not None else list(DEFAULT_ACTIVE_TOOLS)
-    else:
-        resolved_tools = normalize_active_tools(requested_tools)
-    if thread_id is None:
-        thread = create_chat_thread(title=f"[{personality}] {user_input[:80]}", active_tools=resolved_tools)
-        thread_id = thread["id"]
-    else:
-        _set_thread_tools(thread_id, resolved_tools)
+        chat_ctx = _resolve_chat_request_context(
+            raw_thread_id=thread_id,
+            requested_tools=requested_tools,
+            personality=personality,
+            user_input=user_input,
+        )
+    except ThreadContinuityError as err:
+        return _thread_continuity_error_response(err.requested_thread_id)
+    thread_id = int(chat_ctx["thread_id"])
+    resolved_tools = normalize_active_tools(chat_ctx["active_tools"])
 
     logger.info(f"Chat request: {user_input[:50]}...")
 
-    # Use streaming
-    return EventSourceResponse(
+    return StreamingResponse(
         generate_response_stream(
+            request,
             user_input,
             thread_id=thread_id,
             personality=personality,
             active_tools=resolved_tools,
             conversation_mode=conversation_mode,
         ),
-        media_type="text/event-stream"
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 
@@ -11795,28 +11920,25 @@ async def chat_sync(request: Request):
             content={"error": "No message provided"}
         )
     try:
-        thread_id = int(thread_id) if thread_id is not None else None
-    except Exception:
-        thread_id = None
-    if thread_id is not None and not _thread_exists(thread_id):
-        thread_id = None
-    if requested_tools is None:
-        resolved_tools = _get_thread_tools(thread_id) if thread_id is not None else list(DEFAULT_ACTIVE_TOOLS)
-    else:
-        resolved_tools = normalize_active_tools(requested_tools)
-    if thread_id is None:
-        thread = create_chat_thread(title=f"[{personality}] {user_input[:80]}", active_tools=resolved_tools)
-        thread_id = thread["id"]
-    else:
-        _set_thread_tools(thread_id, resolved_tools)
+        chat_ctx = _resolve_chat_request_context(
+            raw_thread_id=thread_id,
+            requested_tools=requested_tools,
+            personality=personality,
+            user_input=user_input,
+        )
+    except ThreadContinuityError as err:
+        return _thread_continuity_error_response(err.requested_thread_id)
+    thread_id = int(chat_ctx["thread_id"])
+    resolved_tools = normalize_active_tools(chat_ctx["active_tools"])
 
     try:
-        result = generate_response(
+        result = await asyncio.to_thread(
+            _generate_turn_result,
             user_input,
-            thread_id=thread_id,
-            personality=personality,
-            active_tools=resolved_tools,
-            conversation_mode=conversation_mode,
+            thread_id,
+            personality,
+            resolved_tools,
+            conversation_mode,
         )
         if _is_image_generation_request(user_input, resolved_tools):
             try:

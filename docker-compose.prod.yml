@@ -1,10 +1,11 @@
 # =============================================================================
-# Sylana Vessel — Production Docker Compose
+# Sylana Vessel - Production Docker Compose
 # DigitalOcean Droplet @ 167.99.127.14
 #
 # Services:
-#   vessel   — FastAPI Python backend (port 8080, internal only)
-#   caddy    — Reverse proxy + auto HTTPS via sslip.io
+#   lysara   - local Lysara ops sidecar (port 18791, internal only)
+#   vessel   - FastAPI Python backend (port 8080, internal only)
+#   caddy    - Reverse proxy + auto HTTPS via sslip.io
 #
 # Start:  docker compose -f docker-compose.prod.yml up -d --build
 # Stop:   docker compose -f docker-compose.prod.yml down
@@ -12,8 +13,26 @@
 # =============================================================================
 
 services:
+  lysara:
+    build:
+      context: .
+      dockerfile: docker/lysara/Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - MOCK_LYSARA_HOST=0.0.0.0
+      - MOCK_LYSARA_PORT=18791
+    expose:
+      - "18791"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:18791/api/v1/ops/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
+    networks:
+      - internal
 
-  # ── FastAPI backend ──────────────────────────────────────
   vessel:
     build:
       context: .
@@ -25,10 +44,12 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
-      # Persist FAISS index and voice profile between deploys
       - vessel_data:/app/data
     expose:
       - "8080"
+    depends_on:
+      lysara:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/api/health')"]
       interval: 30s
@@ -38,14 +59,13 @@ services:
     networks:
       - internal
 
-  # ── Caddy reverse proxy + auto SSL ──────────────────────
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped
     ports:
       - "80:80"
       - "443:443"
-      - "443:443/udp"   # HTTP/3
+      - "443:443/udp"
     volumes:
       - ./docker/Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
@@ -53,7 +73,8 @@ services:
     networks:
       - internal
     depends_on:
-      - vessel
+      vessel:
+        condition: service_healthy
 
 networks:
   internal:

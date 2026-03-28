@@ -34,6 +34,17 @@ QUERY_MODE_HINTS = {
     },
 }
 
+CONTEXT_BUNDLE_SECTIONS = {
+    "working_state",
+    "open_loops",
+    "canonical_rules",
+    "recent_operations",
+    "research_context",
+    "staleness",
+}
+
+ALLOWED_QUERY_MODES = {"working", "canonical", "episodic", "open_loop", "research", "mixed"}
+
 STALENESS_DEFAULTS = {
     "status": 180,
     "positions": 180,
@@ -127,6 +138,67 @@ class LysaraMemoryManager:
                 if hint in text:
                     return mode
         return "mixed"
+
+    @staticmethod
+    def normalize_query_mode(query_mode: Optional[str], fallback_query: str = "") -> str:
+        clean = (query_mode or "").strip().lower()
+        if clean in ALLOWED_QUERY_MODES:
+            return clean
+        return LysaraMemoryManager.route_query_mode(fallback_query)
+
+    @staticmethod
+    def normalize_context_sections(sections: Optional[Sequence[Any]]) -> List[str]:
+        if not sections:
+            return []
+        raw_items: Sequence[Any]
+        if isinstance(sections, str):
+            raw_items = [item.strip() for item in sections.split(",")]
+        else:
+            raw_items = sections
+        normalized: List[str] = []
+        for raw in raw_items:
+            clean = str(raw or "").strip().lower()
+            if clean in CONTEXT_BUNDLE_SECTIONS and clean not in normalized:
+                normalized.append(clean)
+        return normalized
+
+    @staticmethod
+    def _empty_context_bundle(query_mode: str) -> Dict[str, Any]:
+        return {
+            "working_state": {},
+            "open_loops": {"loops": [], "review_queue": []},
+            "canonical_rules": {
+                "risk_policies": [],
+                "portfolio_constraints": [],
+                "strategies": [],
+                "symbol_profiles": [],
+                "operator_policies": [],
+            },
+            "recent_operations": {
+                "trade_decisions": [],
+                "trade_performance": [],
+                "operator_overrides": [],
+                "regime_history": [],
+            },
+            "research_context": {
+                "theses": [],
+                "notes": [],
+            },
+            "query_mode": query_mode,
+            "staleness": {},
+        }
+
+    @staticmethod
+    def _default_sections_for_mode(query_mode: str) -> set[str]:
+        if query_mode in {"working", "open_loop"}:
+            return {"working_state", "open_loops", "canonical_rules", "staleness"}
+        if query_mode == "canonical":
+            return {"canonical_rules", "staleness"}
+        if query_mode == "episodic":
+            return {"recent_operations", "staleness"}
+        if query_mode == "research":
+            return {"research_context", "staleness"}
+        return {"working_state", "open_loops", "canonical_rules", "recent_operations", "staleness"}
 
     @staticmethod
     def _extract_symbol_tokens(text: str) -> List[str]:
@@ -2091,238 +2163,292 @@ class LysaraMemoryManager:
         self,
         *,
         query: str = "",
+        query_mode: Optional[str] = None,
         symbol: Optional[str] = None,
         strategy_key: Optional[str] = None,
         market: Optional[str] = None,
+        sections: Optional[Sequence[Any]] = None,
         limit: int = 12,
     ) -> Dict[str, Any]:
-        query_mode = self.route_query_mode(query)
+        query_mode = self.normalize_query_mode(query_mode, query)
         extracted_symbols = self._extract_symbol_tokens(query)
         chosen_symbol = (symbol or (extracted_symbols[0] if extracted_symbols else "")).strip().upper() or None
         chosen_market = (market or "").strip().lower() or None
         chosen_strategy = (strategy_key or "").strip() or None
+        limit = max(1, min(int(limit or 12), 100))
+        normalized_sections = self.normalize_context_sections(sections)
+        explicit_sections = bool(normalized_sections)
+        wanted_sections = set(normalized_sections or self._default_sections_for_mode(query_mode))
+        bundle = self._empty_context_bundle(query_mode)
 
-        working_state = self.get_working_state(
-            symbol=chosen_symbol,
-            market=chosen_market,
-            strategy_key=chosen_strategy,
-            limit=limit,
-        )
-        open_loops = {
-            "loops": self.list_open_loops(
-                status="open",
+        if "working_state" in wanted_sections:
+            working_limit = limit if explicit_sections or query_mode == "working" else min(limit, 6)
+            bundle["working_state"] = self.get_working_state(
                 symbol=chosen_symbol,
-                strategy_key=chosen_strategy,
                 market=chosen_market,
-                limit=limit,
-            )["items"],
-            "review_queue": self.list_review_queue(status="pending", limit=limit)["items"],
-        }
+                strategy_key=chosen_strategy,
+                limit=working_limit,
+            )
+
+        if "open_loops" in wanted_sections:
+            loop_limit = limit if explicit_sections or query_mode in {"working", "open_loop"} else min(limit, 6)
+            bundle["open_loops"] = {
+                "loops": self.list_open_loops(
+                    status="open",
+                    symbol=chosen_symbol,
+                    strategy_key=chosen_strategy,
+                    market=chosen_market,
+                    limit=loop_limit,
+                )["items"],
+                "review_queue": self.list_review_queue(status="pending", limit=loop_limit)["items"],
+            }
+
+        if "staleness" in wanted_sections:
+            bundle["staleness"] = self._staleness_snapshot()
+
+        need_canonical = "canonical_rules" in wanted_sections
+        need_recent = "recent_operations" in wanted_sections
+        need_research = "research_context" in wanted_sections
+        if not any([need_canonical, need_recent, need_research]):
+            return bundle
 
         with pooled_cursor(commit=False) as cur:
-            cur.execute(
-                """
-                SELECT policy_key, name, scope, limits_json, approval_thresholds_json,
-                       autonomy_rules_json, status, effective_at, source_ref, updated_at
-                FROM lysara.risk_policies
-                WHERE status = 'active'
-                ORDER BY updated_at DESC
-                LIMIT 5
-                """
-            )
-            risk_rows = _rows_to_dicts(cur)
+            if need_canonical:
+                risk_rows: List[Dict[str, Any]] = []
+                constraint_rows: List[Dict[str, Any]] = []
+                strategy_rows: List[Dict[str, Any]] = []
+                symbol_rows: List[Dict[str, Any]] = []
+                operator_rows: List[Dict[str, Any]] = []
 
-            strategy_where: List[str] = []
-            strategy_params: List[Any] = []
-            if chosen_strategy:
-                strategy_where.append("strategy_key = %s")
-                strategy_params.append(chosen_strategy)
-            elif chosen_symbol:
-                strategy_where.append("(allowed_symbols_json @> %s::jsonb OR payload_json::text ILIKE %s)")
-                strategy_params.extend([_json_dumps([chosen_symbol]), f"%{chosen_symbol}%"])
-            strategy_sql = f"WHERE {' AND '.join(strategy_where)}" if strategy_where else ""
-            cur.execute(
-                f"""
-                SELECT strategy_key, name, description, market_scope, allowed_symbols_json,
-                       default_params_json, status, owner, source_ref, updated_at
-                FROM lysara.strategy_profiles
-                {strategy_sql}
-                ORDER BY updated_at DESC
-                LIMIT %s
-                """,
-                tuple(strategy_params + [limit]),
-            )
-            strategy_rows = _rows_to_dicts(cur)
+                canonical_full = explicit_sections or query_mode == "canonical"
+                canonical_mixed = (not explicit_sections) and query_mode == "mixed"
+                canonical_relevant = (not explicit_sections) and query_mode in {"working", "open_loop"}
 
-            symbol_where = ""
-            symbol_params: List[Any] = []
-            if chosen_symbol:
-                symbol_where = "WHERE symbol = %s"
-                symbol_params.append(chosen_symbol)
-            cur.execute(
-                f"""
-                SELECT symbol, asset_class, market, liquidity_profile, volatility_profile,
-                       restriction_status, preferred_strategies_json, notes, updated_at
-                FROM lysara.symbol_profiles
-                {symbol_where}
-                ORDER BY updated_at DESC
-                LIMIT %s
-                """,
-                tuple(symbol_params + [limit]),
-            )
-            symbol_rows = _rows_to_dicts(cur)
+                if canonical_full or canonical_mixed:
+                    cur.execute(
+                        """
+                        SELECT policy_key, name, scope, limits_json, approval_thresholds_json,
+                               autonomy_rules_json, status, effective_at, source_ref, updated_at
+                        FROM lysara.risk_policies
+                        WHERE status = 'active'
+                        ORDER BY updated_at DESC
+                        LIMIT %s
+                        """,
+                        (5 if canonical_full else min(limit, 2),),
+                    )
+                    risk_rows = _rows_to_dicts(cur)
 
-            cur.execute(
-                """
-                SELECT portfolio_key, constraint_type, constraint_value_json, status, effective_at, updated_at
-                FROM lysara.portfolio_constraints
-                WHERE status = 'active'
-                ORDER BY updated_at DESC
-                LIMIT %s
-                """,
-                (limit,),
-            )
-            constraint_rows = _rows_to_dicts(cur)
+                    cur.execute(
+                        """
+                        SELECT portfolio_key, constraint_type, constraint_value_json, status, effective_at, updated_at
+                        FROM lysara.portfolio_constraints
+                        WHERE status = 'active'
+                        ORDER BY updated_at DESC
+                        LIMIT %s
+                        """,
+                        (limit if canonical_full else min(limit, 2),),
+                    )
+                    constraint_rows = _rows_to_dicts(cur)
 
-            cur.execute(
-                """
-                SELECT policy_key, description, tool_permissions_json, approval_rules_json,
-                       mutation_rules_json, status, updated_at
-                FROM lysara.operator_policies
-                WHERE status = 'active'
-                ORDER BY updated_at DESC
-                LIMIT %s
-                """,
-                (limit,),
-            )
-            operator_rows = _rows_to_dicts(cur)
+                    cur.execute(
+                        """
+                        SELECT policy_key, description, tool_permissions_json, approval_rules_json,
+                               mutation_rules_json, status, updated_at
+                        FROM lysara.operator_policies
+                        WHERE status = 'active'
+                        ORDER BY updated_at DESC
+                        LIMIT %s
+                        """,
+                        (limit if canonical_full else min(limit, 2),),
+                    )
+                    operator_rows = _rows_to_dicts(cur)
 
-            decision_where: List[str] = []
-            decision_params: List[Any] = []
-            if chosen_symbol:
-                decision_where.append("(symbol = %s OR symbol IS NULL)")
-                decision_params.append(chosen_symbol)
-            if chosen_market:
-                decision_where.append("(market = %s OR market IS NULL)")
-                decision_params.append(chosen_market)
-            if chosen_strategy:
-                decision_where.append("(strategy_key = %s OR strategy_key IS NULL)")
-                decision_params.append(chosen_strategy)
-            decision_sql = f"WHERE {' AND '.join(decision_where)}" if decision_where else ""
+                if canonical_full or canonical_mixed or (canonical_relevant and (chosen_strategy or chosen_symbol)):
+                    strategy_where: List[str] = []
+                    strategy_params: List[Any] = []
+                    if chosen_strategy:
+                        strategy_where.append("strategy_key = %s")
+                        strategy_params.append(chosen_strategy)
+                    elif chosen_symbol:
+                        strategy_where.append("(allowed_symbols_json @> %s::jsonb OR payload_json::text ILIKE %s)")
+                        strategy_params.extend([_json_dumps([chosen_symbol]), f"%{chosen_symbol}%"])
+                    strategy_sql = f"WHERE {' AND '.join(strategy_where)}" if strategy_where else ""
+                    cur.execute(
+                        f"""
+                        SELECT strategy_key, name, description, market_scope, allowed_symbols_json,
+                               default_params_json, status, owner, source_ref, updated_at
+                        FROM lysara.strategy_profiles
+                        {strategy_sql}
+                        ORDER BY updated_at DESC
+                        LIMIT %s
+                        """,
+                        tuple(strategy_params + [limit if canonical_full else min(limit, 3)]),
+                    )
+                    strategy_rows = _rows_to_dicts(cur)
 
-            cur.execute(
-                f"""
-                SELECT id, trade_ref, decision_type, symbol, strategy_key, market, regime_label,
-                       rationale, risk_snapshot_json, approval_state, review_item_id, decided_by,
-                       decided_at, final_status, execution_payload_json, source_ref, metadata_json
-                FROM lysara.trade_decision_log
-                {decision_sql}
-                ORDER BY decided_at DESC
-                LIMIT %s
-                """,
-                tuple(decision_params + [limit]),
-            )
-            decision_rows = _rows_to_dicts(cur)
+                    symbol_where = ""
+                    symbol_params: List[Any] = []
+                    if chosen_symbol:
+                        symbol_where = "WHERE symbol = %s"
+                        symbol_params.append(chosen_symbol)
+                    elif not canonical_full and not canonical_mixed:
+                        symbol_where = "WHERE FALSE"
+                    cur.execute(
+                        f"""
+                        SELECT symbol, asset_class, market, liquidity_profile, volatility_profile,
+                               restriction_status, preferred_strategies_json, notes, updated_at
+                        FROM lysara.symbol_profiles
+                        {symbol_where}
+                        ORDER BY updated_at DESC
+                        LIMIT %s
+                        """,
+                        tuple(symbol_params + [limit if canonical_full else min(limit, 3)]),
+                    )
+                    symbol_rows = _rows_to_dicts(cur)
 
-            cur.execute(
-                f"""
-                SELECT metric_id, trade_id, source_trade_ref, market, symbol, strategy_key, strategy_name,
-                       sector, regime_label, pnl, pnl_pct, win, closed_at, metadata_json
-                FROM lysara.trade_performance
-                {decision_sql}
-                ORDER BY closed_at DESC
-                LIMIT %s
-                """,
-                tuple(decision_params + [limit]),
-            )
-            performance_rows = _rows_to_dicts(cur)
+                bundle["canonical_rules"] = {
+                    "risk_policies": risk_rows,
+                    "portfolio_constraints": constraint_rows,
+                    "strategies": strategy_rows,
+                    "symbol_profiles": symbol_rows,
+                    "operator_policies": operator_rows,
+                }
 
-            cur.execute(
-                f"""
-                SELECT id, override_type, symbol, strategy_key, market, reason, set_by, set_at,
-                       cleared_at, source_ref, payload_json
-                FROM lysara.operator_overrides
-                {decision_sql}
-                ORDER BY set_at DESC
-                LIMIT %s
-                """,
-                tuple(decision_params + [limit]),
-            )
-            override_rows = _rows_to_dicts(cur)
+            if need_recent:
+                recent_full = explicit_sections or query_mode == "episodic"
+                recent_limit = limit if recent_full else min(limit, 4)
+                decision_where: List[str] = []
+                decision_params: List[Any] = []
+                if chosen_symbol:
+                    decision_where.append("(symbol = %s OR symbol IS NULL)")
+                    decision_params.append(chosen_symbol)
+                if chosen_market:
+                    decision_where.append("(market = %s OR market IS NULL)")
+                    decision_params.append(chosen_market)
+                if chosen_strategy:
+                    decision_where.append("(strategy_key = %s OR strategy_key IS NULL)")
+                    decision_params.append(chosen_strategy)
+                decision_sql = f"WHERE {' AND '.join(decision_where)}" if decision_where else ""
 
-            regime_where: List[str] = []
-            regime_params: List[Any] = []
-            if chosen_market:
-                regime_where.append("market = %s")
-                regime_params.append(chosen_market)
-            regime_sql = f"WHERE {' AND '.join(regime_where)}" if regime_where else ""
-            cur.execute(
-                f"""
-                SELECT market, symbol, regime_label, volatility_score, trend_score, confidence,
-                       recommended_params_json, applied, source, source_ref, observed_at
-                FROM lysara.regime_history
-                {regime_sql}
-                ORDER BY observed_at DESC
-                LIMIT %s
-                """,
-                tuple(regime_params + [limit]),
-            )
-            regime_rows = _rows_to_dicts(cur)
+                cur.execute(
+                    f"""
+                    SELECT id, trade_ref, decision_type, symbol, strategy_key, market, regime_label,
+                           rationale, risk_snapshot_json, approval_state, review_item_id, decided_by,
+                           decided_at, final_status, execution_payload_json, source_ref, metadata_json
+                    FROM lysara.trade_decision_log
+                    {decision_sql}
+                    ORDER BY decided_at DESC
+                    LIMIT %s
+                    """,
+                    tuple(decision_params + [recent_limit]),
+                )
+                decision_rows = _rows_to_dicts(cur)
 
-            cur.execute(
-                f"""
-                SELECT note_type, symbol, strategy_key, market, title, content, tags_json,
-                       recorded_at, source_ref
-                FROM lysara.research_notes
-                {decision_sql}
-                ORDER BY recorded_at DESC
-                LIMIT %s
-                """,
-                tuple(decision_params + [limit]),
-            )
-            research_rows = _rows_to_dicts(cur)
+                cur.execute(
+                    f"""
+                    SELECT metric_id, trade_id, source_trade_ref, market, symbol, strategy_key, strategy_name,
+                           sector, regime_label, pnl, pnl_pct, win, closed_at, metadata_json
+                    FROM lysara.trade_performance
+                    {decision_sql}
+                    ORDER BY closed_at DESC
+                    LIMIT %s
+                    """,
+                    tuple(decision_params + [recent_limit]),
+                )
+                performance_rows = _rows_to_dicts(cur)
 
-            thesis_where: List[str] = ["status = 'active'"]
-            thesis_params: List[Any] = []
-            if chosen_symbol:
-                thesis_where.append("(symbol = %s OR symbol IS NULL)")
-                thesis_params.append(chosen_symbol)
-            if chosen_strategy:
-                thesis_where.append("(strategy_key = %s OR strategy_key IS NULL)")
-                thesis_params.append(chosen_strategy)
-            cur.execute(
-                f"""
-                SELECT thesis_key, scope_type, symbol, sector, strategy_key, thesis_text,
-                       confidence, status, supporting_refs_json, source_note_id, created_at, updated_at
-                FROM lysara.market_theses
-                WHERE {' AND '.join(thesis_where)}
-                ORDER BY updated_at DESC
-                LIMIT %s
-                """,
-                tuple(thesis_params + [limit]),
-            )
-            thesis_rows = _rows_to_dicts(cur)
+                cur.execute(
+                    f"""
+                    SELECT id, override_type, symbol, strategy_key, market, reason, set_by, set_at,
+                           cleared_at, source_ref, payload_json
+                    FROM lysara.operator_overrides
+                    {decision_sql}
+                    ORDER BY set_at DESC
+                    LIMIT %s
+                    """,
+                    tuple(decision_params + [recent_limit]),
+                )
+                override_rows = _rows_to_dicts(cur)
 
-        return {
-            "working_state": working_state,
-            "open_loops": open_loops,
-            "canonical_rules": {
-                "risk_policies": risk_rows,
-                "portfolio_constraints": constraint_rows,
-                "strategies": strategy_rows,
-                "symbol_profiles": symbol_rows,
-                "operator_policies": operator_rows,
-            },
-            "recent_operations": {
-                "trade_decisions": decision_rows,
-                "trade_performance": performance_rows,
-                "operator_overrides": override_rows,
-                "regime_history": regime_rows,
-            },
-            "research_context": {
-                "theses": thesis_rows if query_mode == "research" else thesis_rows[: min(3, len(thesis_rows))],
-                "notes": research_rows,
-            },
-            "query_mode": query_mode,
-            "staleness": self._staleness_snapshot(),
-        }
+                regime_where: List[str] = []
+                regime_params: List[Any] = []
+                if chosen_market:
+                    regime_where.append("market = %s")
+                    regime_params.append(chosen_market)
+                regime_sql = f"WHERE {' AND '.join(regime_where)}" if regime_where else ""
+                cur.execute(
+                    f"""
+                    SELECT market, symbol, regime_label, volatility_score, trend_score, confidence,
+                           recommended_params_json, applied, source, source_ref, observed_at
+                    FROM lysara.regime_history
+                    {regime_sql}
+                    ORDER BY observed_at DESC
+                    LIMIT %s
+                    """,
+                    tuple(regime_params + [recent_limit]),
+                )
+                regime_rows = _rows_to_dicts(cur)
+
+                bundle["recent_operations"] = {
+                    "trade_decisions": decision_rows,
+                    "trade_performance": performance_rows,
+                    "operator_overrides": override_rows,
+                    "regime_history": regime_rows,
+                }
+
+            if need_research:
+                research_full = explicit_sections or query_mode == "research"
+                research_limit = limit if research_full else min(limit, 4)
+                decision_where: List[str] = []
+                decision_params: List[Any] = []
+                if chosen_symbol:
+                    decision_where.append("(symbol = %s OR symbol IS NULL)")
+                    decision_params.append(chosen_symbol)
+                if chosen_market:
+                    decision_where.append("(market = %s OR market IS NULL)")
+                    decision_params.append(chosen_market)
+                if chosen_strategy:
+                    decision_where.append("(strategy_key = %s OR strategy_key IS NULL)")
+                    decision_params.append(chosen_strategy)
+                decision_sql = f"WHERE {' AND '.join(decision_where)}" if decision_where else ""
+
+                cur.execute(
+                    f"""
+                    SELECT note_type, symbol, strategy_key, market, title, content, tags_json,
+                           recorded_at, source_ref
+                    FROM lysara.research_notes
+                    {decision_sql}
+                    ORDER BY recorded_at DESC
+                    LIMIT %s
+                    """,
+                    tuple(decision_params + [research_limit]),
+                )
+                research_rows = _rows_to_dicts(cur)
+
+                thesis_where: List[str] = ["status = 'active'"]
+                thesis_params: List[Any] = []
+                if chosen_symbol:
+                    thesis_where.append("(symbol = %s OR symbol IS NULL)")
+                    thesis_params.append(chosen_symbol)
+                if chosen_strategy:
+                    thesis_where.append("(strategy_key = %s OR strategy_key IS NULL)")
+                    thesis_params.append(chosen_strategy)
+                cur.execute(
+                    f"""
+                    SELECT thesis_key, scope_type, symbol, sector, strategy_key, thesis_text,
+                           confidence, status, supporting_refs_json, source_note_id, created_at, updated_at
+                    FROM lysara.market_theses
+                    WHERE {' AND '.join(thesis_where)}
+                    ORDER BY updated_at DESC
+                    LIMIT %s
+                    """,
+                    tuple(thesis_params + [research_limit]),
+                )
+                thesis_rows = _rows_to_dicts(cur)
+
+                bundle["research_context"] = {
+                    "theses": thesis_rows,
+                    "notes": research_rows,
+                }
+
+        return bundle
