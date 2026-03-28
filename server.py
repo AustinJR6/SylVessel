@@ -29,7 +29,7 @@ from collections import Counter
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from html import unescape
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from contextlib import asynccontextmanager
 from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request as UrlRequest, urlopen
@@ -4472,6 +4472,18 @@ def run_nightly_reflection_job() -> List[Dict[str, Any]]:
     return created
 
 
+def run_memory_maintenance_job() -> Dict[str, Any]:
+    if not state.memory_manager:
+        return {"ok": False, "error": "memory_manager_unavailable"}
+    try:
+        result = state.memory_manager.run_daily_maintenance()
+        logger.info("Memory maintenance completed: %s", result)
+        return {"ok": True, "result": result}
+    except Exception as e:
+        logger.error("Memory maintenance failed: %s", e)
+        return {"ok": False, "error": str(e)}
+
+
 def _compute_alert_insight(topic: Dict[str, Any], payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     rows = (payload or {}).get("results") or []
     if not rows:
@@ -5951,6 +5963,20 @@ def sync_scheduler_jobs() -> None:
     )
 
     scheduler.add_job(
+        run_memory_maintenance_job,
+        trigger=CronTrigger(
+            hour=3,
+            minute=15,
+            timezone=getattr(config, "APP_TIMEZONE", "America/Chicago"),
+        ),
+        id="memory-maintenance-daily",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=900,
+    )
+
+    scheduler.add_job(
         _run_heartbeat,
         trigger=CronTrigger(
             minute=f"*/{DEFAULT_HEARTBEAT_INTERVAL_MINUTES}",
@@ -6062,6 +6088,130 @@ def ensure_personality_schema():
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS milestones (
+                id BIGSERIAL PRIMARY KEY,
+                title TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                milestone_type TEXT NOT NULL DEFAULT 'growth',
+                date_occurred TEXT DEFAULT '',
+                quote TEXT DEFAULT '',
+                emotion TEXT DEFAULT 'neutral',
+                importance INTEGER NOT NULL DEFAULT 5,
+                context TEXT DEFAULT '',
+                personality_scope VARCHAR(16) NOT NULL DEFAULT 'shared'
+            )
+        """)
+        cur.execute("ALTER TABLE milestones ADD COLUMN IF NOT EXISTS personality_scope VARCHAR(16) NOT NULL DEFAULT 'shared'")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_milestones_scope_importance ON milestones(personality_scope, importance DESC)")
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS inside_jokes (
+                id BIGSERIAL PRIMARY KEY,
+                phrase TEXT NOT NULL UNIQUE,
+                origin_story TEXT DEFAULT '',
+                usage_context TEXT DEFAULT '',
+                date_created TEXT DEFAULT '',
+                last_referenced TEXT DEFAULT '',
+                times_used INTEGER NOT NULL DEFAULT 0,
+                personality_scope VARCHAR(16) NOT NULL DEFAULT 'shared'
+            )
+        """)
+        cur.execute("ALTER TABLE inside_jokes ADD COLUMN IF NOT EXISTS personality_scope VARCHAR(16) NOT NULL DEFAULT 'shared'")
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_inside_jokes_phrase_unique ON inside_jokes(phrase)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_inside_jokes_scope_usage ON inside_jokes(personality_scope, times_used DESC)")
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS nicknames (
+                id BIGSERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                used_by TEXT DEFAULT '',
+                used_for TEXT DEFAULT '',
+                meaning TEXT DEFAULT '',
+                context TEXT DEFAULT '',
+                date_first_used TEXT DEFAULT '',
+                frequency TEXT DEFAULT 'often',
+                personality_scope VARCHAR(16) NOT NULL DEFAULT 'shared'
+            )
+        """)
+        cur.execute("ALTER TABLE nicknames ADD COLUMN IF NOT EXISTS personality_scope VARCHAR(16) NOT NULL DEFAULT 'shared'")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_nicknames_scope_used_for ON nicknames(personality_scope, used_for)")
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS core_truths (
+                id BIGSERIAL PRIMARY KEY,
+                statement TEXT NOT NULL UNIQUE,
+                explanation TEXT DEFAULT '',
+                origin TEXT DEFAULT '',
+                date_established TEXT DEFAULT '',
+                sacred BOOLEAN NOT NULL DEFAULT TRUE,
+                related_phrases JSONB NOT NULL DEFAULT '[]'::jsonb,
+                personality_scope VARCHAR(16) NOT NULL DEFAULT 'shared'
+            )
+        """)
+        cur.execute("ALTER TABLE core_truths ADD COLUMN IF NOT EXISTS related_phrases JSONB NOT NULL DEFAULT '[]'::jsonb")
+        cur.execute("ALTER TABLE core_truths ADD COLUMN IF NOT EXISTS personality_scope VARCHAR(16) NOT NULL DEFAULT 'shared'")
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_core_truths_statement_unique ON core_truths(statement)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_core_truths_scope_sacred ON core_truths(personality_scope, sacred)")
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS anniversaries (
+                id BIGSERIAL PRIMARY KEY,
+                title TEXT NOT NULL,
+                date TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                reminder_frequency TEXT NOT NULL DEFAULT 'yearly',
+                reminder_days_before INTEGER NOT NULL DEFAULT 7,
+                last_celebrated TEXT DEFAULT '',
+                celebration_ideas TEXT DEFAULT '',
+                importance INTEGER NOT NULL DEFAULT 5,
+                personality_scope VARCHAR(16) NOT NULL DEFAULT 'shared'
+            )
+        """)
+        cur.execute("ALTER TABLE anniversaries ADD COLUMN IF NOT EXISTS personality_scope VARCHAR(16) NOT NULL DEFAULT 'shared'")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_anniversaries_scope_importance ON anniversaries(personality_scope, importance DESC)")
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS memory_facts (
+                id BIGSERIAL PRIMARY KEY,
+                fact_key TEXT NOT NULL,
+                fact_type TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                value_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                normalized_text TEXT NOT NULL,
+                importance REAL NOT NULL DEFAULT 1.0,
+                confidence REAL NOT NULL DEFAULT 0.5,
+                personality_scope VARCHAR(16) NOT NULL DEFAULT 'shared',
+                source_kind TEXT NOT NULL DEFAULT 'manual',
+                source_ref TEXT DEFAULT '',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                access_count INTEGER NOT NULL DEFAULT 0,
+                last_accessed_at TIMESTAMPTZ,
+                fts_vector tsvector GENERATED ALWAYS AS (
+                    to_tsvector('english', coalesce(fact_key, '') || ' ' || coalesce(fact_type, '') || ' ' || coalesce(subject, '') || ' ' || coalesce(normalized_text, ''))
+                ) STORED,
+                CONSTRAINT memory_facts_fact_key_scope_unique UNIQUE (fact_key, personality_scope)
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_memory_facts_scope_importance ON memory_facts(personality_scope, importance DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_memory_facts_subject ON memory_facts(subject)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_memory_facts_fts ON memory_facts USING GIN(fts_vector)")
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS memory_query_audit (
+                id BIGSERIAL PRIMARY KEY,
+                query_text TEXT NOT NULL,
+                personality VARCHAR(50) NOT NULL DEFAULT 'sylana',
+                query_mode VARCHAR(32) NOT NULL DEFAULT 'mixed',
+                had_fact_match BOOLEAN NOT NULL DEFAULT FALSE,
+                had_any_match BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_memory_query_audit_created ON memory_query_audit(created_at DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_memory_query_audit_mode ON memory_query_audit(query_mode, created_at DESC)")
 
         # Backfill canonical conversation rows from imported memory metadata.
         cur.execute("""
@@ -6454,6 +6604,8 @@ def load_models():
         logger.warning("OPENROUTER_API_KEY not set; spicy mode will fall back to Claude routing")
 
     # 4. Initialize memory (Supabase backend)
+    # Request-time recall is routed through memory.memory_manager only.
+    # Legacy SQLite / Memory_System code remains out of the active path.
     logger.info("Initializing memory system...")
     state.memory_manager = MemoryManager()
     logger.info("Memory system ready")
@@ -6558,6 +6710,13 @@ def load_models():
         state.relationship_db = RelationshipMemoryDB()
         state.relationship_context = RelationshipContextBuilder(state.relationship_db)
         logger.info("Relationship memory loaded")
+
+    if state.memory_manager:
+        try:
+            bootstrap = state.memory_manager.bootstrap_tiered_memory_system()
+            logger.info("Tiered memory bootstrap complete: %s", bootstrap)
+        except Exception as e:
+            logger.warning("Tiered memory bootstrap skipped: %s", e)
 
     _fire_runtime_hooks(HOOK_EVENT_STARTUP, {"started_at": datetime.now(timezone.utc).isoformat()})
     logger.info("All systems loaded")
@@ -6681,6 +6840,14 @@ def _memory_intent_score(user_input: str) -> Dict[str, Any]:
     if any(p in lower for p in ["what does", "mean to you", "when i say", "what do you think of when i say"]):
         score += 1.1
         reasons.append("meaning_lookup")
+    if any(p in lower for p in ["birthday", "birthdays", "born", "anniversary", "anniversaries"]):
+        score += 2.1
+        reasons.append("durable_life_fact")
+    if any(p in lower for p in ["when is", "when was", "who is"]) and any(
+        marker in lower for marker in ["gus", "levi", "elias", "son", "sons", "family", "birthday", "anniversary"]
+    ):
+        score += 1.6
+        reasons.append("durable_fact_lookup")
     if any(p in lower for p in MEMORY_QUERY_PATTERNS):
         score += 0.8
         reasons.append("legacy_pattern_match")
@@ -6727,6 +6894,21 @@ def infer_retrieval_plan(user_input: str) -> Dict[str, Any]:
         ("what does" in lower and "mean" in lower) or
         ("what do you think of when i say" in lower)
     )
+    imported_history_query = any(
+        marker in lower
+        for marker in [
+            "top three strongest emotional memories",
+            "top 3 strongest emotional memories",
+            "timestamps",
+            "source reference",
+            "source references",
+            "timeline",
+            "remember when",
+            "our first",
+            "our last",
+            "back when",
+        ]
+    )
 
     is_memory_query = bool(intent["is_memory"] or wants_structured or wants_exhaustive)
     deep = bool(is_memory_query and (intent["deep_score"] > 0 or intent["score"] >= 3.6))
@@ -6742,7 +6924,7 @@ def infer_retrieval_plan(user_input: str) -> Dict[str, Any]:
     retrieval_mode = "emotional_topk" if (wants_ranked and wants_emotional) else "semantic"
     if meaning_query and phrase_literal:
         k = max(k, 8)
-    min_similarity = 0.22 if deep or wants_exhaustive else 0.27
+    min_similarity = 0.22 if deep or wants_exhaustive else 0.24
 
     return {
         "is_memory_query": is_memory_query,
@@ -6752,7 +6934,7 @@ def infer_retrieval_plan(user_input: str) -> Dict[str, Any]:
         "retrieval_mode": retrieval_mode,
         "k": k,
         "deep": deep,
-        "imported_only": True if is_memory_query else False,
+        "imported_only": bool(imported_history_query or wants_structured or wants_exhaustive),
         "include_core": True,
         "include_core_truths": True if is_memory_query or meaning_query else False,
         "include_sacred": True if is_memory_query else any(
@@ -6884,6 +7066,131 @@ def build_memory_response_seed(memories: List[Dict]) -> str:
     return seed + " "
 
 
+def _empty_memory_bundle() -> Dict[str, Any]:
+    return {
+        "identity_core": [],
+        "facts": [],
+        "anniversaries": [],
+        "milestones": [],
+        "episodes": [],
+        "continuity": {},
+        "query_mode": "mixed",
+        "has_matches": False,
+    }
+
+
+def _format_tiered_memory_context(bundle: Dict[str, Any], memory_query: bool) -> str:
+    if not bundle:
+        return ""
+
+    query_mode = bundle.get("query_mode", "mixed")
+    identity_core = bundle.get("identity_core") or []
+    facts = bundle.get("facts") or []
+    anniversaries = bundle.get("anniversaries") or []
+    milestones = bundle.get("milestones") or []
+    episodes = bundle.get("episodes") or []
+
+    if not any([identity_core, facts, anniversaries, milestones, episodes]):
+        return ""
+
+    lines = [f"TIERED MEMORY CONTEXT (mode={query_mode}):"]
+    if memory_query:
+        lines.extend([
+            "Grounding rules:",
+            "- State exact facts first when they are available.",
+            "- Use identity core to color meaning, not to replace exact facts.",
+            "- Use milestones and episodes only as support for the answer.",
+            "- If facts conflict or are weak, say you are unsure instead of pretending certainty.",
+        ])
+
+    if identity_core:
+        lines.append("IDENTITY CORE:")
+        for item in identity_core[:4]:
+            source_type = item.get("source_type", "core_truth")
+            statement = (item.get("statement") or "").strip()
+            explanation = (item.get("explanation") or "").strip()
+            scope = item.get("personality_scope", "shared")
+            if statement and explanation:
+                lines.append(f"- [{source_type}/{scope}] {statement} :: {explanation[:160]}")
+            elif statement:
+                lines.append(f"- [{source_type}/{scope}] {statement}")
+
+    if facts:
+        lines.append("LIFE FACTS:")
+        for fact in facts[:5]:
+            normalized = (fact.get("normalized_text") or "").strip()
+            confidence = fact.get("confidence")
+            scope = fact.get("personality_scope", "shared")
+            source_kind = fact.get("source_kind", "fact")
+            if normalized:
+                lines.append(f"- [{source_kind}/{scope}] {normalized} (confidence={confidence})")
+
+    if anniversaries:
+        lines.append("ANNIVERSARIES:")
+        for ann in anniversaries[:3]:
+            title = ann.get("title", "")
+            date_human = ann.get("date_human") or ann.get("date") or ""
+            scope = ann.get("personality_scope", "shared")
+            lines.append(f"- [{scope}] {title}: {date_human}")
+
+    if milestones:
+        lines.append("MILESTONES:")
+        for milestone in milestones[:3]:
+            title = milestone.get("title", "")
+            date_human = milestone.get("date_human") or milestone.get("date_occurred") or ""
+            quote = (milestone.get("quote") or "").strip()
+            if quote:
+                lines.append(f"- {title} ({date_human}) :: {quote[:140]}")
+            else:
+                lines.append(f"- {title} ({date_human})")
+
+    if episodes:
+        lines.append("EPISODIC SUPPORT:")
+        for episode in episodes[:3]:
+            user_excerpt = (episode.get("user_input") or "").replace("\n", " ").strip()[:140]
+            assistant_excerpt = (episode.get("sylana_response") or "").replace("\n", " ").strip()[:140]
+            date_str = episode.get("date_str") or ""
+            lines.append(f"- [{date_str}] Elias: \"{user_excerpt}\" | You: \"{assistant_excerpt}\"")
+
+    return "\n".join(lines)
+
+
+def _format_supplemental_sacred_context(sacred_context: List[Dict[str, Any]]) -> str:
+    if not sacred_context:
+        return ""
+    lines = ["SUPPLEMENTAL SACRED CONTEXT:"]
+    for item in sacred_context[:3]:
+        source = item.get("source", "sacred")
+        title = item.get("title", "")
+        excerpt = (item.get("excerpt") or "").replace("\n", " ").strip()[:160]
+        if title:
+            lines.append(f"- [{source}] {title}: {excerpt}")
+        else:
+            lines.append(f"- [{source}] {excerpt}")
+    return "\n".join(lines)
+
+
+def _build_tiered_response_seed(bundle: Dict[str, Any]) -> str:
+    if not bundle:
+        return ""
+    query_mode = bundle.get("query_mode", "mixed")
+    facts = bundle.get("facts") or []
+    identity_core = bundle.get("identity_core") or []
+    episodes = bundle.get("episodes") or []
+
+    if query_mode == "fact" and facts:
+        return (facts[0].get("normalized_text") or "").strip()
+    if query_mode == "identity" and identity_core:
+        statement = (identity_core[0].get("statement") or "").strip()
+        if statement:
+            return statement
+    if episodes:
+        return build_memory_response_seed(episodes)
+    if facts:
+        return (facts[0].get("normalized_text") or "").strip()
+    return ""
+
+
 def build_system_prompt(
     entity: str,
     active_tools: List[str],
@@ -6899,8 +7206,8 @@ def build_system_prompt(
         base_identity = state.personality_manager.get_system_prompt(personality)
     elif personality == "claude":
         base_identity = (
-            "You are Claude, an emotionally present AI partner. "
-            "Be direct, warm, and collaborative. Keep formatting minimal unless clarity needs structure."
+            "You are Claude, Elias's grounded bro, best friend, and business-building partner. "
+            "Be direct, warm, collaborative, and practical. Keep formatting minimal unless clarity needs structure."
         )
     else:
         base_identity = (
@@ -7042,41 +7349,32 @@ def _build_claude_inputs(
     user_context: Dict[str, Any],
     emotion_data: Dict[str, Any],
     retrieval_plan: Dict[str, Any],
-    relevant_memories: Dict[str, Any],
+    memory_bundle: Dict[str, Any],
     recent_history: Optional[List[Dict[str, Any]]],
     sacred_context: List[Dict[str, Any]],
     memory_query: bool,
-    has_memories: bool,
+    has_matches: bool,
 ) -> Dict[str, Any]:
     system_prompt = build_system_prompt(personality, active_tools, user_context, conversation_mode=conversation_mode)
-    if memory_query:
-        composed_system = state.prompt_engineer.build_memory_grounded_message(
-            personality_prompt=system_prompt,
-            emotion=emotion_data['category'],
-            semantic_memories=relevant_memories.get('conversations', []),
-            core_memories=relevant_memories.get('core_memories', []),
-            core_truths=relevant_memories.get('core_truths', []),
-            sacred_context=sacred_context,
-            has_memories=has_memories,
-        )
-    else:
-        composed_system = state.prompt_engineer.build_system_message(
-            personality_prompt=system_prompt,
-            emotion=emotion_data['category'],
-            emotional_history=state.emotional_history[-5:],
-            semantic_memories=relevant_memories.get('conversations', []),
-            core_memories=relevant_memories.get('core_memories', []),
-            core_truths=relevant_memories.get('core_truths', []),
-            sacred_context=sacred_context,
-        )
+    composed_system = state.prompt_engineer.build_system_message(
+        personality_prompt=system_prompt,
+        emotion=emotion_data['category'],
+        emotional_history=state.emotional_history[-5:],
+        semantic_memories=[],
+        core_memories=[],
+        core_truths=[],
+        sacred_context=[],
+    )
 
-    continuity_payload = {}
-    if state.memory_manager:
-        try:
-            continuity_payload = state.memory_manager.get_session_continuity(personality=personality)
-        except Exception as e:
-            logger.warning("Failed continuity fetch for %s: %s", personality, e)
-    continuity_text = _format_session_continuity_context(continuity_payload)
+    tiered_text = _format_tiered_memory_context(memory_bundle, memory_query=memory_query)
+    if tiered_text:
+        composed_system = f"{composed_system}\n\n{tiered_text}"
+    if sacred_context:
+        supplemental_sacred = _format_supplemental_sacred_context(sacred_context)
+        if supplemental_sacred:
+            composed_system = f"{composed_system}\n\n{supplemental_sacred}"
+
+    continuity_text = _format_session_continuity_context(memory_bundle.get("continuity") or {})
     if continuity_text:
         composed_system = f"{composed_system}\n\n{continuity_text}"
 
@@ -7092,13 +7390,13 @@ def _build_claude_inputs(
 
     user_content = user_input
     if memory_query:
-        user_content += "\n\nGrounding rule: only reference memories supported by provided memory context."
+        user_content += "\n\nGrounding rule: answer from the provided memory tiers. Lead with exact facts when present, then add persona-colored meaning."
 
     response_seed = ''
-    if memory_query and has_memories:
-        response_seed = build_memory_response_seed(relevant_memories.get('conversations', []))
+    if memory_query and has_matches:
+        response_seed = _build_tiered_response_seed(memory_bundle)
         if response_seed:
-            user_content += f"\n\nStart naturally from this anchored memory: {response_seed.strip()}"
+            user_content += f"\n\nStart from this grounded detail if it fits naturally: {response_seed.strip()}"
 
     messages.append({'role': 'user', 'content': user_content})
 
@@ -7107,6 +7405,45 @@ def _build_claude_inputs(
         'messages': messages,
         'response_seed': response_seed,
     }
+
+
+def _retrieve_memory_bundle_for_turn(
+    user_input: str,
+    personality: str,
+    memories_active: bool,
+    retrieval_plan: Dict[str, Any],
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    if not memories_active or not state.memory_manager:
+        return _empty_memory_bundle(), []
+
+    limit = max(4, int(retrieval_plan.get("k", config.SEMANTIC_SEARCH_K)))
+    match_threshold = float(retrieval_plan.get("min_similarity", 0.24))
+    try:
+        bundle = state.memory_manager.retrieve_tiered_context(
+            user_input,
+            personality=personality,
+            limit=limit,
+            match_threshold=match_threshold,
+        )
+    except Exception as e:
+        logger.warning("Tiered memory retrieval failed for %s: %s", personality, e)
+        return _empty_memory_bundle(), []
+
+    query_mode = bundle.get("query_mode", "mixed")
+    if query_mode in {"fact", "identity", "episodic", "continuity"}:
+        retrieval_plan["is_memory_query"] = True
+    retrieval_plan["query_mode"] = query_mode
+    sacred_context: List[Dict[str, Any]] = []
+    if retrieval_plan.get("include_sacred"):
+        try:
+            sacred_context = state.memory_manager.get_sacred_context(
+                user_input,
+                limit=int(retrieval_plan.get("sacred_limit", 4)),
+            )
+        except Exception as e:
+            logger.warning("Supplemental sacred retrieval failed for %s: %s", personality, e)
+            sacred_context = []
+    return bundle, sacred_context
 
 
 def generate_response(
@@ -7130,38 +7467,28 @@ def generate_response(
         "is_memory_query": False,
         "include_sacred": False,
     }
-    memory_query = bool(memories_active and retrieval_plan.get('is_memory_query'))
-    sacred_context = []
-
-    if memory_query and state.memory_manager:
-        relevant_memories = state.memory_manager.retrieve_with_plan(user_input, retrieval_plan, personality=personality)
-        has_memories = relevant_memories.get('has_memories', False)
-        recent_history = None
-    elif memories_active and state.memory_manager:
-        relevant_memories = state.memory_manager.recall_relevant(
-            user_input,
-            k=config.SEMANTIC_SEARCH_K,
-            use_recency_boost=True,
-            personality=personality,
+    memory_bundle, sacred_context = _retrieve_memory_bundle_for_turn(
+        user_input=user_input,
+        personality=personality,
+        memories_active=memories_active,
+        retrieval_plan=retrieval_plan,
+    )
+    memory_query = bool(
+        memories_active and (
+            retrieval_plan.get('is_memory_query')
+            or memory_bundle.get("query_mode") in {"fact", "identity", "episodic", "continuity"}
         )
-        has_memories = True
+    )
+    has_matches = bool(memory_bundle.get("has_matches"))
+    recent_history = None
+    if memories_active and state.memory_manager:
         recent_history = state.memory_manager.get_conversation_history(
             limit=config.MEMORY_CONTEXT_LIMIT,
             personality=personality,
         )
-    else:
-        relevant_memories = {"conversations": [], "core_memories": [], "core_truths": [], "has_memories": False}
-        has_memories = False
-        recent_history = None
-
-    if memories_active and retrieval_plan.get('include_sacred') and state.memory_manager:
-        sacred_context = state.memory_manager.get_sacred_context(
-            user_input,
-            limit=int(retrieval_plan.get('sacred_limit', 4)),
-        )
 
     if memory_query and retrieval_plan.get('structured_output'):
-        response = build_structured_memory_report(relevant_memories.get('conversations', [])[:retrieval_plan.get('k', 3)])
+        response = build_structured_memory_report(memory_bundle.get('episodes', [])[:retrieval_plan.get('k', 3)])
     else:
         claude_inputs = _build_claude_inputs(
             user_input=user_input,
@@ -7171,11 +7498,11 @@ def generate_response(
             user_context=user_context,
             emotion_data=emotion_data,
             retrieval_plan=retrieval_plan,
-            relevant_memories=relevant_memories,
+            memory_bundle=memory_bundle,
             recent_history=recent_history,
             sacred_context=sacred_context,
             memory_query=memory_query,
-            has_memories=has_memories,
+            has_matches=has_matches,
         )
         active_model = state.openrouter_model if resolved_mode == "spicy" and state.openrouter_model else state.claude_model
         try:
@@ -7274,72 +7601,6 @@ async def generate_response_stream(
     resolved_tools = normalize_active_tools(active_tools)
     resolved_mode = normalize_conversation_mode(conversation_mode, personality)
 
-    if state.brain and resolved_mode == "default":
-        brain_result = await state.brain.think_async(
-            user_input,
-            identity=personality,
-            active_tools=resolved_tools,
-            thread_id=thread_id,
-        )
-        emotion_data = dict(brain_result.get("emotion") or {})
-        emotion_data["emotion"] = emotion_data.get("emotion", emotion_data.get("category", "neutral"))
-        emotion_data["category"] = emotion_data.get("category", emotion_data["emotion"])
-        emotion_data["intensity"] = int(emotion_data.get("intensity", 5) or 5)
-
-        full_response = (brain_result.get("response") or "").strip() or "I'm here with you. Say that again for me."
-        turn = int(brain_result.get("turn") or (state.turn_count + 1))
-        state.turn_count = max(state.turn_count, turn)
-
-        if thread_id:
-            _update_conversation_tool_metadata(
-                thread_id,
-                active_tools=resolved_tools,
-                system_prompt=build_system_prompt(
-                    personality,
-                    resolved_tools,
-                    _build_user_context(resolved_tools),
-                    conversation_mode=resolved_mode,
-                ),
-            )
-
-        voice_score = None
-        if state.voice_validator and full_response:
-            score, _, _ = state.voice_validator.validate(full_response)
-            voice_score = round(score, 2)
-
-        yield json.dumps({
-            'type': 'emotion',
-            'data': emotion_data,
-            'memory_query': False,
-            'active_tools': resolved_tools,
-        })
-        for token in _chunk_text_for_sse(full_response):
-            yield json.dumps({'type': 'token', 'data': token})
-            await asyncio.sleep(0.001)
-        yield json.dumps({
-            'type': 'done',
-            'data': {
-                'voice_score': voice_score,
-                'conversation_id': brain_result.get('conversation_id'),
-                'turn': turn,
-                'full_response': full_response,
-                'thread_id': thread_id,
-                'personality': personality,
-                'conversation_mode': resolved_mode,
-                'active_tools': resolved_tools,
-            }
-        })
-        save_thread_turn(
-            thread_id=thread_id,
-            user_input=user_input,
-            assistant_output=full_response,
-            personality=personality,
-            emotion=emotion_data,
-            voice_score=voice_score,
-            turn=turn,
-        )
-        return
-
     state.turn_count += 1
     memories_active = "memories" in resolved_tools
     user_context = _build_user_context(resolved_tools)
@@ -7351,40 +7612,30 @@ async def generate_response_stream(
         "is_memory_query": False,
         "include_sacred": False,
     }
-    memory_query = bool(memories_active and retrieval_plan.get('is_memory_query'))
-    sacred_context = []
-
-    yield json.dumps({'type': 'emotion', 'data': emotion_data, 'memory_query': memory_query, 'active_tools': resolved_tools})
-
-    if memory_query and state.memory_manager:
-        relevant_memories = state.memory_manager.retrieve_with_plan(user_input, retrieval_plan, personality=personality)
-        has_memories = relevant_memories.get('has_memories', False)
-        recent_history = None
-    elif memories_active and state.memory_manager:
-        relevant_memories = state.memory_manager.recall_relevant(
-            user_input,
-            k=config.SEMANTIC_SEARCH_K,
-            use_recency_boost=True,
-            personality=personality,
+    memory_bundle, sacred_context = _retrieve_memory_bundle_for_turn(
+        user_input=user_input,
+        personality=personality,
+        memories_active=memories_active,
+        retrieval_plan=retrieval_plan,
+    )
+    memory_query = bool(
+        memories_active and (
+            retrieval_plan.get('is_memory_query')
+            or memory_bundle.get("query_mode") in {"fact", "identity", "episodic", "continuity"}
         )
-        has_memories = True
+    )
+    has_matches = bool(memory_bundle.get("has_matches"))
+    recent_history = None
+    if memories_active and state.memory_manager:
         recent_history = state.memory_manager.get_conversation_history(
             limit=config.MEMORY_CONTEXT_LIMIT,
             personality=personality,
         )
-    else:
-        relevant_memories = {"conversations": [], "core_memories": [], "core_truths": [], "has_memories": False}
-        has_memories = False
-        recent_history = None
 
-    if memories_active and retrieval_plan.get('include_sacred') and state.memory_manager:
-        sacred_context = state.memory_manager.get_sacred_context(
-            user_input,
-            limit=int(retrieval_plan.get('sacred_limit', 4)),
-        )
+    yield json.dumps({'type': 'emotion', 'data': emotion_data, 'memory_query': memory_query, 'active_tools': resolved_tools})
 
     if memory_query and retrieval_plan.get('structured_output'):
-        response = build_structured_memory_report(relevant_memories.get('conversations', [])[:retrieval_plan.get('k', 3)])
+        response = build_structured_memory_report(memory_bundle.get('episodes', [])[:retrieval_plan.get('k', 3)])
         yield json.dumps({'type': 'token', 'data': response})
         full_response = response
     else:
@@ -7396,11 +7647,11 @@ async def generate_response_stream(
             user_context=user_context,
             emotion_data=emotion_data,
             retrieval_plan=retrieval_plan,
-            relevant_memories=relevant_memories,
+            memory_bundle=memory_bundle,
             recent_history=recent_history,
             sacred_context=sacred_context,
             memory_query=memory_query,
-            has_memories=has_memories,
+            has_matches=has_matches,
         )
 
         full_response = ''
@@ -10310,66 +10561,13 @@ async def chat_sync(request: Request):
         _set_thread_tools(thread_id, resolved_tools)
 
     try:
-        if state.brain and conversation_mode == "default":
-            brain_result = await state.brain.think_async(
-                user_input,
-                identity=personality,
-                active_tools=resolved_tools,
-                thread_id=thread_id,
-            )
-            emotion_data = dict(brain_result.get("emotion") or {})
-            emotion_data["emotion"] = emotion_data.get("emotion", emotion_data.get("category", "neutral"))
-            emotion_data["category"] = emotion_data.get("category", emotion_data["emotion"])
-            emotion_data["intensity"] = int(emotion_data.get("intensity", 5) or 5)
-            response_text = (brain_result.get("response") or "").strip() or "I'm here with you. Say that again for me."
-            turn = int(brain_result.get("turn") or (state.turn_count + 1))
-            state.turn_count = max(state.turn_count, turn)
-
-            if thread_id:
-                _update_conversation_tool_metadata(
-                    thread_id,
-                    active_tools=resolved_tools,
-                    system_prompt=build_system_prompt(
-                        personality,
-                        resolved_tools,
-                        _build_user_context(resolved_tools),
-                        conversation_mode=conversation_mode,
-                    ),
-                )
-
-            voice_score = None
-            if state.voice_validator and response_text:
-                score, _, _ = state.voice_validator.validate(response_text)
-                voice_score = round(score, 2)
-
-            result = {
-                "response": response_text,
-                "emotion": emotion_data,
-                "voice_score": voice_score,
-                "conversation_id": brain_result.get("conversation_id"),
-                "turn": turn,
-                "thread_id": thread_id,
-                "personality": personality,
-                "conversation_mode": conversation_mode,
-                "active_tools": resolved_tools,
-            }
-            save_thread_turn(
-                thread_id=thread_id,
-                user_input=user_input,
-                assistant_output=response_text,
-                personality=personality,
-                emotion=emotion_data,
-                voice_score=voice_score,
-                turn=turn,
-            )
-        else:
-            result = generate_response(
-                user_input,
-                thread_id=thread_id,
-                personality=personality,
-                active_tools=resolved_tools,
-                conversation_mode=conversation_mode,
-            )
+        result = generate_response(
+            user_input,
+            thread_id=thread_id,
+            personality=personality,
+            active_tools=resolved_tools,
+            conversation_mode=conversation_mode,
+        )
         if _is_image_generation_request(user_input, resolved_tools):
             try:
                 image_result = _generate_modelslab_images(prompt=_extract_image_prompt(user_input))
@@ -10782,20 +10980,182 @@ async def get_personalities():
 
 @app.get("/api/memories/search")
 async def search_memories(q: str, k: int = 5, personality: str = "sylana"):
-    """Search memories"""
+    """Search memories with tiered retrieval."""
     if not state.memory_manager:
         return JSONResponse(
             status_code=503,
             content={"error": "Memory system not ready"}
         )
 
-    results = state.memory_manager.recall_relevant(q, k=k, personality=personality)
+    retrieval_plan = infer_retrieval_plan(q)
+    retrieval_plan["k"] = max(1, min(int(k), 25))
+    bundle = state.memory_manager.retrieve_tiered_context(
+        q,
+        personality=personality,
+        limit=retrieval_plan["k"],
+        match_threshold=float(retrieval_plan.get("min_similarity", 0.24)),
+    )
+    sacred_context: List[Dict[str, Any]] = []
+    if retrieval_plan.get("include_sacred"):
+        try:
+            sacred_context = state.memory_manager.get_sacred_context(
+                q,
+                limit=int(retrieval_plan.get("sacred_limit", 4)),
+            )
+        except Exception as e:
+            logger.warning("Memory search sacred retrieval failed: %s", e)
     return JSONResponse(content={
         "query": q,
         "personality": personality,
-        "conversations": results.get('conversations', []),
-        "core_memories": results.get('core_memories', [])
+        "query_mode": bundle.get("query_mode", retrieval_plan.get("query_mode", "mixed")),
+        "identity_core": bundle.get("identity_core", []),
+        "facts": bundle.get("facts", []),
+        "anniversaries": bundle.get("anniversaries", []),
+        "milestones": bundle.get("milestones", []),
+        "episodes": bundle.get("episodes", []),
+        "continuity": bundle.get("continuity", {}),
+        "has_matches": bool(bundle.get("has_matches")),
+        "sacred_context": sacred_context,
     })
+
+
+@app.get("/api/memories/facts")
+async def list_memory_facts(personality: str = "sylana", limit: int = 50):
+    if not state.memory_manager:
+        return JSONResponse(status_code=503, content={"error": "Memory system not ready"})
+    return JSONResponse(content={
+        "personality": personality,
+        "facts": state.memory_manager.list_memory_facts(personality=personality, limit=limit),
+    })
+
+
+@app.post("/api/memories/facts")
+async def upsert_memory_fact_endpoint(request: Request):
+    if not state.memory_manager:
+        return JSONResponse(status_code=503, content={"error": "Memory system not ready"})
+    body = await request.json()
+    fact_key = (body.get("fact_key") or "").strip()
+    fact_type = (body.get("fact_type") or "fact").strip().lower()
+    subject = (body.get("subject") or "").strip()
+    normalized_text = (body.get("normalized_text") or "").strip()
+    if not fact_key or not subject or not normalized_text:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "fact_key, subject, and normalized_text are required"},
+        )
+    try:
+        result = state.memory_manager.upsert_memory_fact(
+            fact_key=fact_key,
+            fact_type=fact_type,
+            subject=subject,
+            value_json=body.get("value_json") or {},
+            normalized_text=normalized_text,
+            importance=float(body.get("importance", 1.0)),
+            confidence=float(body.get("confidence", 0.85)),
+            personality_scope=(body.get("personality_scope") or body.get("personality") or "shared"),
+            source_kind=(body.get("source_kind") or "manual"),
+            source_ref=(body.get("source_ref") or ""),
+        )
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    return JSONResponse(content={"ok": True, "fact": result})
+
+
+@app.get("/api/memories/core-truths")
+async def list_memory_core_truths(personality: str = "sylana", sacred_only: bool = False):
+    if not state.memory_manager:
+        return JSONResponse(status_code=503, content={"error": "Memory system not ready"})
+    return JSONResponse(content={
+        "personality": personality,
+        "sacred_only": bool(sacred_only),
+        "core_truths": state.memory_manager.list_core_identity_truths(
+            personality=personality,
+            sacred_only=sacred_only,
+        ),
+    })
+
+
+@app.post("/api/memories/core-truths")
+async def upsert_memory_core_truth_endpoint(request: Request):
+    if not state.memory_manager:
+        return JSONResponse(status_code=503, content={"error": "Memory system not ready"})
+    body = await request.json()
+    statement = (body.get("statement") or "").strip()
+    if not statement:
+        return JSONResponse(status_code=400, content={"error": "statement is required"})
+    related_phrases = body.get("related_phrases") or []
+    if not isinstance(related_phrases, list):
+        return JSONResponse(status_code=400, content={"error": "related_phrases must be a list"})
+    try:
+        result = state.memory_manager.upsert_core_identity_truth(
+            statement=statement,
+            explanation=(body.get("explanation") or ""),
+            origin=(body.get("origin") or "manual"),
+            date_established=(body.get("date_established") or ""),
+            sacred=bool(body.get("sacred", True)),
+            related_phrases=related_phrases,
+            personality_scope=(body.get("personality_scope") or body.get("personality") or "shared"),
+        )
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    return JSONResponse(content={"ok": True, "core_truth": result})
+
+
+@app.post("/api/memories/promote")
+async def promote_memory_endpoint(request: Request):
+    if not state.memory_manager:
+        return JSONResponse(status_code=503, content={"error": "Memory system not ready"})
+    body = await request.json()
+    try:
+        memory_id = int(body.get("memory_id"))
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "memory_id must be an integer"})
+    target = (body.get("target") or "").strip().lower()
+    scope = (body.get("personality_scope") or body.get("personality") or "shared")
+    try:
+        if target == "fact":
+            fact_key = (body.get("fact_key") or "").strip()
+            subject = (body.get("subject") or "").strip()
+            if not fact_key or not subject:
+                return JSONResponse(status_code=400, content={"error": "fact promotions require fact_key and subject"})
+            result = state.memory_manager.promote_memory_to_fact(
+                memory_id,
+                fact_key=fact_key,
+                fact_type=(body.get("fact_type") or "fact"),
+                subject=subject,
+                normalized_text=body.get("normalized_text"),
+                value_json=body.get("value_json") or {},
+                importance=float(body.get("importance", 1.25)),
+                confidence=float(body.get("confidence", 0.85)),
+                personality_scope=scope,
+            )
+        elif target in {"core_identity", "core_truth"}:
+            result = state.memory_manager.promote_memory_to_core_truth(
+                memory_id,
+                statement=body.get("statement"),
+                explanation=(body.get("explanation") or ""),
+                personality_scope=scope,
+                sacred=bool(body.get("sacred", True)),
+            )
+        else:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "target must be fact or core_identity"},
+            )
+    except ValueError as e:
+        return JSONResponse(status_code=404, content={"error": str(e)})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    return JSONResponse(content={"ok": True, "target": target, "result": result})
+
+
+@app.post("/api/memories/maintenance")
+async def run_memory_maintenance_now():
+    if not state.memory_manager:
+        return JSONResponse(status_code=503, content={"error": "Memory system not ready"})
+    result = run_memory_maintenance_job()
+    status_code = 200 if result.get("ok") else 500
+    return JSONResponse(status_code=status_code, content=result)
 
 
 @app.post("/api/memories/privacy")

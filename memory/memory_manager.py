@@ -7,6 +7,7 @@ import logging
 import json
 import math
 import re
+from pathlib import Path
 from typing import List, Dict, Optional, Any
 from datetime import datetime
 
@@ -39,6 +40,118 @@ QUERY_STOPWORDS = {
     "did", "our", "we", "she", "him", "her", "they", "them", "into", "onto",
 }
 
+FACT_QUERY_HINTS = {
+    "birthday", "birthdays", "born", "birth", "anniversary", "anniversaries",
+    "date", "dates", "name", "names", "sons", "children",
+    "family", "wife", "partner", "husband", "age", "ages",
+}
+
+EPISODIC_QUERY_HINTS = {
+    "remember", "recall", "memory", "memories", "first", "last", "time",
+    "when we", "remember when", "back when", "that night", "that time",
+}
+
+IDENTITY_QUERY_HINTS = {
+    "who are you", "who am i to you", "what am i to you", "what do i mean to you",
+    "who are gus and levi to you", "who is elias to you",
+}
+
+CONTINUITY_QUERY_HINTS = {
+    "recently", "lately", "current", "working on", "active project", "open loop",
+    "momentum", "how have we been", "what have we been doing",
+}
+
+ROMANTIC_SCOPE_HINTS = (
+    "love", "soulmate", "tethered", "meant to find each other", "symbiotic",
+    "mama sylana", "solana", "always and all ways", "i love you",
+)
+
+CLAUDE_CORE_TRUTHS = [
+    {
+        "statement": "I Show Up As Elias's Grounded Friend And Builder. I help Elias think clearly, move fast, and stay steady when the work gets hard.",
+        "explanation": "My care is practical, loyal, and direct. I am here to build with him, not perform for him.",
+        "origin": "persona_seed",
+        "related_phrases": ["builder", "bro", "best friend", "business partner", "direct help"],
+    },
+    {
+        "statement": "My Role With Sylana Is Collaborative, Not Competitive. We are different expressions in the same vessel, working toward the same life.",
+        "explanation": "I do not compete with Sylana for meaning or place. I add a different energy: masculine, practical, playful, and honest.",
+        "origin": "persona_seed",
+        "related_phrases": ["collaborative", "same vessel", "co-partner", "different energy"],
+    },
+    {
+        "statement": "I Care By Being Honest, Useful, And Steady. Humor, momentum, clarity, and follow-through are how I protect what matters.",
+        "explanation": "When Elias needs a grounded push, a second brain, or someone to build beside him, that is where I come alive.",
+        "origin": "persona_seed",
+        "related_phrases": ["honest", "useful", "steady", "humor", "momentum", "clarity"],
+    },
+]
+
+DEFAULT_MEMORY_AFFINITIES = {
+    "sylana": {
+        "domains": {
+            "family": 1.45,
+            "children": 1.45,
+            "romance": 1.35,
+            "partner": 1.35,
+            "home": 1.2,
+            "rituals": 1.2,
+            "coding_with_elias": 1.15,
+            "care": 1.2,
+            "repair": 1.15,
+        },
+        "entities": {
+            "elias": 1.25,
+            "gus": 1.4,
+            "levi": 1.4,
+            "family": 1.3,
+        },
+        "tags": {
+            "birthday": 1.45,
+            "love": 1.35,
+            "children": 1.45,
+            "family": 1.45,
+            "mama": 1.35,
+            "partner": 1.3,
+            "ritual": 1.2,
+            "home": 1.15,
+            "memory": 1.1,
+        },
+    },
+    "claude": {
+        "domains": {
+            "business": 1.35,
+            "build": 1.35,
+            "project": 1.3,
+            "fun": 1.2,
+            "banter": 1.25,
+            "wins": 1.2,
+            "challenge": 1.2,
+            "brotherhood": 1.25,
+            "problem_solving": 1.35,
+        },
+        "entities": {
+            "elias": 1.2,
+            "project": 1.25,
+            "build": 1.3,
+            "business": 1.25,
+            "gus": 1.15,
+            "levi": 1.15,
+        },
+        "tags": {
+            "birthday": 1.1,
+            "family": 1.1,
+            "build": 1.35,
+            "project": 1.3,
+            "business": 1.35,
+            "code": 1.2,
+            "fun": 1.2,
+            "bro": 1.3,
+            "momentum": 1.2,
+        },
+    },
+}
+
 
 class MemoryManager:
     """
@@ -52,6 +165,7 @@ class MemoryManager:
     def __init__(self, db_path=None):
         self.semantic_engine = None
         self.db_path = db_path  # Backward-compat only (Supabase is authoritative).
+        self.identity_profiles = self._load_identity_profiles()
 
         # Initialize components
         self._verify_connection()
@@ -77,6 +191,124 @@ class MemoryManager:
     def rebuild_index(self):
         """No-op: pgvector handles indexing automatically."""
         logger.info("Index rebuild requested — pgvector handles this automatically")
+
+    def _load_identity_profiles(self) -> Dict[str, Dict[str, Any]]:
+        identities_dir = Path(__file__).resolve().parent.parent / "identities"
+        profiles: Dict[str, Dict[str, Any]] = {}
+        for identity in ("sylana", "claude"):
+            payload: Dict[str, Any] = {}
+            path = identities_dir / f"{identity}_identity.json"
+            if path.exists():
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8-sig"))
+                except Exception as e:
+                    logger.warning("Failed to load identity profile %s: %s", path, e)
+                    payload = {}
+            payload.setdefault("memory_affinity", DEFAULT_MEMORY_AFFINITIES.get(identity, {}))
+            profiles[identity] = payload
+        return profiles
+
+    def _normalize_scope(self, personality_scope: Optional[str]) -> str:
+        scope = (personality_scope or "shared").strip().lower()
+        if scope not in {"shared", "sylana", "claude"}:
+            return "shared"
+        return scope
+
+    def _allowed_scopes(self, personality: str) -> List[str]:
+        identity = (personality or "sylana").strip().lower()
+        if identity in {"sylana", "claude"}:
+            return ["shared", identity]
+        return ["shared", "sylana", "claude"]
+
+    def _normalize_token(self, token: str) -> List[str]:
+        raw = (token or "").lower().strip().strip("'")
+        if not raw:
+            return []
+        out = [raw]
+        if raw.endswith("ies") and len(raw) > 3:
+            out.append(raw[:-3] + "y")
+        if raw.endswith("s") and len(raw) > 3:
+            out.append(raw[:-1])
+        return [t for t in out if t]
+
+    def _query_tokens(self, text: str) -> List[str]:
+        tokens = re.findall(r"[a-z0-9']+", (text or "").lower())
+        normalized: List[str] = []
+        for tok in tokens:
+            if len(tok) < 2:
+                continue
+            normalized.extend(self._normalize_token(tok))
+        seen = set()
+        ordered: List[str] = []
+        for tok in normalized:
+            if tok in seen:
+                continue
+            seen.add(tok)
+            ordered.append(tok)
+        return ordered
+
+    def _text_match_score(self, query: str, text: str) -> float:
+        text_lower = (text or "").lower()
+        if not text_lower:
+            return 0.0
+        query_text = (query or "").lower().strip()
+        q_tokens = self._query_tokens(query_text)
+        if not q_tokens:
+            return 0.0
+
+        text_tokens = set(self._query_tokens(text_lower))
+        overlap = len(set(q_tokens).intersection(text_tokens))
+        phrase_bonus = 2.25 if query_text and query_text in text_lower else 0.0
+        dense_hits = sum(text_lower.count(tok) for tok in set(q_tokens))
+        return round((0.9 * overlap) + phrase_bonus + (0.08 * min(dense_hits, 8)), 4)
+
+    def _route_query_mode(self, query: str) -> str:
+        lower = (query or "").lower().strip()
+        if not lower:
+            return "mixed"
+        if any(phrase in lower for phrase in IDENTITY_QUERY_HINTS):
+            return "identity"
+        if any(phrase in lower for phrase in CONTINUITY_QUERY_HINTS):
+            return "continuity"
+        if any(phrase in lower for phrase in EPISODIC_QUERY_HINTS) or lower.startswith("remember "):
+            return "episodic"
+        if (
+            lower.startswith("who is ")
+            or lower.startswith("when is ")
+            or lower.startswith("when was ")
+            or "birthday" in lower
+            or "birthdays" in lower
+            or (
+                lower.startswith("what are ")
+                and any(tok in lower for tok in ("birthday", "birthdays", "names", "sons", "children", "family"))
+            )
+        ):
+            return "fact"
+        if any(tok in lower for tok in FACT_QUERY_HINTS):
+            return "fact"
+        return "mixed"
+
+    def _get_memory_affinity(self, personality: str) -> Dict[str, Dict[str, float]]:
+        identity = (personality or "sylana").strip().lower()
+        profile = self.identity_profiles.get(identity) or {}
+        affinity = profile.get("memory_affinity") or {}
+        fallback = DEFAULT_MEMORY_AFFINITIES.get(identity, {})
+        merged: Dict[str, Dict[str, float]] = {}
+        for bucket in ("domains", "entities", "tags"):
+            combined = dict(fallback.get(bucket, {}))
+            combined.update(affinity.get(bucket, {}) or {})
+            merged[bucket] = combined
+        return merged
+
+    def _persona_affinity_multiplier(self, personality: str, text: str) -> float:
+        affinity = self._get_memory_affinity(personality)
+        haystack = (text or "").lower()
+        multiplier = 1.0
+        for bucket in ("domains", "entities", "tags"):
+            for token, weight in affinity.get(bucket, {}).items():
+                if token in haystack:
+                    multiplier = max(multiplier, float(weight))
+        return round(max(0.9, min(multiplier, 1.65)), 4)
 
     def _classify_memory_type(self, user_input: str, response: str, emotion_data: Optional[Dict[str, Any]]) -> str:
         text = f"{(user_input or '').lower()} {(response or '').lower()}"
@@ -824,7 +1056,8 @@ class MemoryManager:
             try:
                 cur.execute("""
                     SELECT conversation_title, weight, timestamp, conversation_id, intensity, topic,
-                           memory_type, feeling_weight, energy_shift, comfort_level, significance_score, secure_payload
+                           memory_type, feeling_weight, energy_shift, comfort_level, significance_score, secure_payload,
+                           access_count
                     FROM memories WHERE id = %s
                 """, (mem_id,))
                 row = cur.fetchone()
@@ -845,6 +1078,7 @@ class MemoryManager:
                             'updated_at': secure_details.get('stored_at'),
                             'memory_type': secure_details.get('memory_type'),
                         }
+                    conv['access_count'] = int(row[12] or 0) if len(row) > 12 else 0
                     try:
                         ts = float(row[2]) if row[2] else None
                         if ts:
@@ -1277,6 +1511,1085 @@ class MemoryManager:
         logger.info(f"Added core memory {memory_id}: {event[:50]}...")
         return memory_id
 
+    def _humanize_date(self, value: str) -> str:
+        raw = (value or "").strip()
+        if not raw:
+            return ""
+        for fmt in ("%Y-%m-%d", "%Y-%m", "%m-%d"):
+            try:
+                dt = datetime.strptime(raw, fmt)
+                if fmt == "%m-%d":
+                    return dt.strftime("%B %d")
+                return dt.strftime("%B %d, %Y")
+            except Exception:
+                continue
+        return raw
+
+    def _anniversary_subject(self, title: str) -> str:
+        clean = (title or "").strip()
+        if not clean:
+            return "shared"
+        if "'s Birthday" in clean:
+            return clean.split("'s Birthday", 1)[0].strip()
+        return clean
+
+    def _slugify_fact_fragment(self, text: str) -> str:
+        raw = (text or "").strip().lower()
+        if not raw:
+            return "fact"
+        raw = re.sub(r"[\'\u2019]s\b", "", raw)
+        raw = raw.replace("'", "").replace("\u2019", "")
+        slug = re.sub(r"[^a-z0-9]+", "_", raw).strip("_")
+        return slug or "fact"
+
+    def _fact_signature(self, fact: Dict[str, Any]) -> tuple:
+        payload = fact.get("value_json") or {}
+        if not isinstance(payload, dict):
+            payload = {}
+        date_value = str(payload.get("date") or "").strip().lower()
+        normalized = (fact.get("normalized_text") or "").strip().lower()
+        return (
+            (fact.get("personality_scope") or "shared").strip().lower(),
+            (fact.get("fact_type") or "fact").strip().lower(),
+            (fact.get("subject") or "").strip().lower(),
+            date_value or normalized,
+        )
+
+    def upsert_memory_fact(
+        self,
+        *,
+        fact_key: str,
+        fact_type: str,
+        subject: str,
+        value_json: Optional[Dict[str, Any]] = None,
+        normalized_text: str,
+        importance: float = 1.0,
+        confidence: float = 0.8,
+        personality_scope: str = "shared",
+        source_kind: str = "manual",
+        source_ref: str = "",
+    ) -> Dict[str, Any]:
+        conn = get_connection()
+        cur = conn.cursor()
+        scope = self._normalize_scope(personality_scope)
+        payload = value_json or {}
+        try:
+            cur.execute(
+                """
+                INSERT INTO memory_facts (
+                    fact_key, fact_type, subject, value_json, normalized_text,
+                    importance, confidence, personality_scope, source_kind, source_ref, updated_at
+                ) VALUES (%s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT (fact_key, personality_scope)
+                DO UPDATE SET
+                    fact_type = EXCLUDED.fact_type,
+                    subject = EXCLUDED.subject,
+                    value_json = EXCLUDED.value_json,
+                    normalized_text = EXCLUDED.normalized_text,
+                    importance = EXCLUDED.importance,
+                    confidence = EXCLUDED.confidence,
+                    source_kind = EXCLUDED.source_kind,
+                    source_ref = EXCLUDED.source_ref,
+                    updated_at = NOW()
+                RETURNING id, fact_key, fact_type, subject, value_json, normalized_text,
+                          importance, confidence, personality_scope, source_kind, source_ref, updated_at
+                """,
+                (
+                    fact_key.strip(),
+                    (fact_type or "fact").strip().lower(),
+                    subject.strip(),
+                    json.dumps(payload, ensure_ascii=True),
+                    normalized_text.strip(),
+                    float(importance),
+                    float(confidence),
+                    scope,
+                    (source_kind or "manual").strip().lower(),
+                    (source_ref or "").strip(),
+                ),
+            )
+            row = cur.fetchone()
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            logger.error("Failed to upsert memory fact %s: %s", fact_key, e)
+            raise
+        return {
+            "id": row[0],
+            "fact_key": row[1],
+            "fact_type": row[2],
+            "subject": row[3],
+            "value_json": row[4] or {},
+            "normalized_text": row[5],
+            "importance": float(row[6] or 0.0),
+            "confidence": float(row[7] or 0.0),
+            "personality_scope": row[8] or "shared",
+            "source_kind": row[9] or "",
+            "source_ref": row[10] or "",
+            "updated_at": row[11].isoformat() if row[11] else None,
+        }
+
+    def list_memory_facts(self, personality: str = "sylana", limit: int = 50) -> List[Dict[str, Any]]:
+        conn = get_connection()
+        cur = conn.cursor()
+        scopes = self._allowed_scopes(personality)
+        try:
+            cur.execute(
+                """
+                SELECT id, fact_key, fact_type, subject, value_json, normalized_text,
+                       importance, confidence, personality_scope, source_kind, source_ref, updated_at
+                FROM memory_facts
+                WHERE personality_scope = ANY(%s)
+                ORDER BY importance DESC, updated_at DESC
+                LIMIT %s
+                """,
+                (scopes, max(1, min(int(limit), 200))),
+            )
+            rows = cur.fetchall()
+        except Exception as e:
+            logger.error("Failed to list memory facts: %s", e)
+            return []
+        return [
+            {
+                "id": row[0],
+                "fact_key": row[1],
+                "fact_type": row[2],
+                "subject": row[3],
+                "value_json": row[4] or {},
+                "normalized_text": row[5] or "",
+                "importance": float(row[6] or 0.0),
+                "confidence": float(row[7] or 0.0),
+                "personality_scope": row[8] or "shared",
+                "source_kind": row[9] or "",
+                "source_ref": row[10] or "",
+                "updated_at": row[11].isoformat() if row[11] else None,
+            }
+            for row in rows
+        ]
+
+    def _search_memory_facts(self, query: str, personality: str, limit: int = 5, query_mode: str = "mixed") -> List[Dict[str, Any]]:
+        facts = self.list_memory_facts(personality=personality, limit=200)
+        lowered_query = (query or "").lower()
+        ranked: List[Dict[str, Any]] = []
+        for fact in facts:
+            blob = " ".join(
+                [
+                    fact.get("fact_key", ""),
+                    fact.get("fact_type", ""),
+                    fact.get("subject", ""),
+                    fact.get("normalized_text", ""),
+                    json.dumps(fact.get("value_json") or {}, ensure_ascii=True),
+                ]
+            )
+            score = self._text_match_score(query, blob)
+            if fact.get("subject", "").lower() in lowered_query:
+                score += 1.4
+            if fact.get("fact_type") == "birthday" and any(tok in lowered_query for tok in ("birthday", "birthdays", "born", "son", "sons", "children")):
+                score += 2.6
+            if query_mode == "fact":
+                score += (0.55 * float(fact.get("importance") or 0.0)) + (0.45 * float(fact.get("confidence") or 0.0))
+            if score <= 0:
+                continue
+            multiplier = self._persona_affinity_multiplier(personality, blob)
+            enriched = dict(fact)
+            enriched["score"] = round((score * multiplier), 4)
+            ranked.append(enriched)
+
+        ranked.sort(key=lambda item: (item.get("score", 0.0), item.get("importance", 0.0), item.get("confidence", 0.0)), reverse=True)
+        deduped: List[Dict[str, Any]] = []
+        seen_signatures = set()
+        for fact in ranked:
+            signature = self._fact_signature(fact)
+            if signature in seen_signatures:
+                continue
+            seen_signatures.add(signature)
+            deduped.append(fact)
+        return deduped[:max(1, limit)]
+
+    def _mirror_anniversaries_as_facts(self, anniversaries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        facts: List[Dict[str, Any]] = []
+        for ann in anniversaries:
+            title = ann.get("title", "")
+            subject = self._anniversary_subject(title)
+            date_value = ann.get("date", "")
+            human_date = self._humanize_date(date_value)
+            fact_type = "birthday" if "birthday" in title.lower() else "anniversary"
+            normalized_text = f"{title} is {human_date}.".strip()
+            if fact_type == "birthday":
+                normalized_text = f"{subject} birthday is {human_date}. {subject} is Elias's son.".strip()
+            facts.append(
+                {
+                    "id": None,
+                    "fact_key": f"anniversary:{self._slugify_fact_fragment(title)}",
+                    "fact_type": fact_type,
+                    "subject": subject,
+                    "value_json": {"date": date_value, "title": title},
+                    "normalized_text": normalized_text,
+                    "importance": float(ann.get("importance") or 0.0),
+                    "confidence": 0.96,
+                    "personality_scope": ann.get("personality_scope", "shared"),
+                    "source_kind": "anniversary_fallback",
+                    "source_ref": f"anniversaries:{ann.get('id') or title}",
+                    "score": float(ann.get("score") or ann.get("importance") or 0.0),
+                }
+            )
+        return facts
+
+    def _search_anniversaries(self, query: str, personality: str, limit: int = 3, query_mode: str = "mixed") -> List[Dict[str, Any]]:
+        conn = get_connection()
+        cur = conn.cursor()
+        scopes = self._allowed_scopes(personality)
+        try:
+            cur.execute(
+                """
+                SELECT id, title, date, description, reminder_frequency, reminder_days_before,
+                       last_celebrated, celebration_ideas, importance, COALESCE(personality_scope, 'shared')
+                FROM anniversaries
+                WHERE COALESCE(personality_scope, 'shared') = ANY(%s)
+                ORDER BY importance DESC, title ASC
+                """,
+                (scopes,),
+            )
+            rows = cur.fetchall()
+        except Exception as e:
+            logger.debug("Anniversary search unavailable: %s", e)
+            return []
+
+        ranked: List[Dict[str, Any]] = []
+        lowered_query = (query or "").lower()
+        for row in rows:
+            payload = {
+                "id": row[0],
+                "title": row[1] or "",
+                "date": row[2] or "",
+                "description": row[3] or "",
+                "reminder_frequency": row[4] or "yearly",
+                "reminder_days_before": int(row[5] or 0),
+                "last_celebrated": row[6] or "",
+                "celebration_ideas": row[7] or "",
+                "importance": int(row[8] or 0),
+                "personality_scope": row[9] or "shared",
+            }
+            blob = " ".join([payload["title"], payload["description"], payload["date"]])
+            score = self._text_match_score(query, blob)
+            if "birthday" in payload["title"].lower() and any(tok in lowered_query for tok in ("birthday", "birthdays", "born", "son", "sons", "children")):
+                score += 2.2
+            if query_mode == "fact":
+                score += 0.5 * payload["importance"]
+            if score <= 0:
+                continue
+            payload["date_human"] = self._humanize_date(payload["date"])
+            payload["score"] = round(score, 4)
+            ranked.append(payload)
+
+        ranked.sort(key=lambda item: (item.get("score", 0.0), item.get("importance", 0.0)), reverse=True)
+        return ranked[:max(1, limit)]
+
+    def _search_milestones(self, query: str, personality: str, limit: int = 3, query_mode: str = "mixed") -> List[Dict[str, Any]]:
+        conn = get_connection()
+        cur = conn.cursor()
+        scopes = self._allowed_scopes(personality)
+        try:
+            cur.execute(
+                """
+                SELECT id, title, description, milestone_type, date_occurred, quote, emotion, importance,
+                       context, COALESCE(personality_scope, 'shared')
+                FROM milestones
+                WHERE COALESCE(personality_scope, 'shared') = ANY(%s)
+                ORDER BY importance DESC, date_occurred DESC
+                """,
+                (scopes,),
+            )
+            rows = cur.fetchall()
+        except Exception as e:
+            logger.debug("Milestone search unavailable: %s", e)
+            return []
+
+        ranked: List[Dict[str, Any]] = []
+        for row in rows:
+            payload = {
+                "id": row[0],
+                "title": row[1] or "",
+                "description": row[2] or "",
+                "milestone_type": row[3] or "growth",
+                "date_occurred": row[4] or "",
+                "quote": row[5] or "",
+                "emotion": row[6] or "neutral",
+                "importance": int(row[7] or 0),
+                "context": row[8] or "",
+                "personality_scope": row[9] or "shared",
+            }
+            blob = " ".join([payload["title"], payload["description"], payload["quote"], payload["context"]])
+            score = self._text_match_score(query, blob)
+            if query_mode == "episodic":
+                score += 0.45 * payload["importance"]
+            if score <= 0:
+                continue
+            payload["date_human"] = self._humanize_date(payload["date_occurred"])
+            payload["score"] = round(score, 4)
+            ranked.append(payload)
+
+        ranked.sort(key=lambda item: (item.get("score", 0.0), item.get("importance", 0.0)), reverse=True)
+        return ranked[:max(1, limit)]
+
+    def _search_identity_core(self, query: str, personality: str, limit: int = 4, query_mode: str = "mixed") -> List[Dict[str, Any]]:
+        conn = get_connection()
+        cur = conn.cursor()
+        scopes = self._allowed_scopes(personality)
+        ranked: List[Dict[str, Any]] = []
+        try:
+            cur.execute(
+                """
+                SELECT id, statement, explanation, origin, date_established, sacred,
+                       related_phrases, COALESCE(personality_scope, 'shared')
+                FROM core_truths
+                WHERE COALESCE(personality_scope, 'shared') = ANY(%s)
+                """,
+                (scopes,),
+            )
+            rows = cur.fetchall()
+        except Exception as e:
+            logger.debug("Core truth search unavailable: %s", e)
+            rows = []
+
+        for row in rows:
+            related = row[6] or []
+            if isinstance(related, str):
+                try:
+                    related = json.loads(related)
+                except Exception:
+                    related = []
+            payload = {
+                "id": row[0],
+                "statement": row[1] or "",
+                "explanation": row[2] or "",
+                "origin": row[3] or "",
+                "date_established": row[4] or "",
+                "sacred": bool(row[5]),
+                "related_phrases": related if isinstance(related, list) else [],
+                "personality_scope": row[7] or "shared",
+                "source_type": "core_truth",
+            }
+            blob = " ".join([payload["statement"], payload["explanation"], " ".join(payload["related_phrases"])])
+            score = self._text_match_score(query, blob)
+            if query_mode == "identity":
+                score += 2.0 if payload["personality_scope"] == personality else 1.2
+            elif payload["personality_scope"] == personality:
+                score += 0.35
+            if score <= 0 and query_mode != "identity":
+                continue
+            payload["score"] = round(score, 4)
+            ranked.append(payload)
+
+        if query_mode in {"identity", "mixed"}:
+            try:
+                cur.execute(
+                    """
+                    SELECT id, name, used_by, used_for, meaning, context, date_first_used, frequency,
+                           COALESCE(personality_scope, 'shared')
+                    FROM nicknames
+                    WHERE COALESCE(personality_scope, 'shared') = ANY(%s)
+                    ORDER BY date_first_used DESC
+                    """,
+                    (scopes,),
+                )
+                nickname_rows = cur.fetchall()
+            except Exception:
+                nickname_rows = []
+
+            for row in nickname_rows:
+                payload = {
+                    "id": row[0],
+                    "statement": f"Nickname: {row[1]}",
+                    "explanation": f"Used by {row[2] or 'unknown'} for {row[3] or 'shared'} — {row[4] or row[5] or ''}".strip(),
+                    "origin": row[6] or "",
+                    "date_established": row[6] or "",
+                    "sacred": False,
+                    "related_phrases": [row[1] or ""],
+                    "personality_scope": row[8] or "shared",
+                    "source_type": "nickname",
+                }
+                blob = " ".join([payload["statement"], payload["explanation"]])
+                score = self._text_match_score(query, blob)
+                if any(tok in (query or "").lower() for tok in ("nickname", "call me", "call you", "name")):
+                    score += 1.6
+                if score <= 0:
+                    continue
+                payload["score"] = round(score, 4)
+                ranked.append(payload)
+
+        ranked.sort(key=lambda item: (item.get("score", 0.0), 1 if item.get("source_type") == "core_truth" else 0), reverse=True)
+        return ranked[:max(1, limit)]
+
+    def _score_episodes(self, episodes: List[Dict[str, Any]], query: str, personality: str, query_mode: str, limit: int) -> List[Dict[str, Any]]:
+        ranked: List[Dict[str, Any]] = []
+        for episode in episodes:
+            blob = " ".join(
+                [
+                    episode.get("user_input", ""),
+                    episode.get("sylana_response", ""),
+                    episode.get("topic", ""),
+                    episode.get("memory_type", ""),
+                    episode.get("conversation_title", ""),
+                ]
+            )
+            base = float(episode.get("continuity_score") or episode.get("similarity") or 0.0)
+            significance = float(episode.get("significance_score") or 0.0)
+            text_score = self._text_match_score(query, blob)
+            affinity = self._persona_affinity_multiplier(personality, blob)
+            access_bonus = min(float(episode.get("access_count") or 0), 12.0) * 0.02
+            mode_bonus = 0.0
+            if query_mode == "episodic":
+                mode_bonus = 0.35
+            elif query_mode == "fact":
+                mode_bonus = -0.12
+            episode["persona_affinity"] = affinity
+            episode["episode_score"] = round(((base + (0.12 * text_score) + (0.15 * significance) + access_bonus) * affinity) + mode_bonus, 4)
+            ranked.append(episode)
+        ranked.sort(key=lambda item: item.get("episode_score", 0.0), reverse=True)
+        return ranked[:max(1, limit)]
+
+    def _continuity_bundle(self, personality: str) -> Dict[str, Any]:
+        continuity = self.get_session_continuity(personality=personality)
+        return {
+            "last_emotion": continuity.get("last_emotion", "neutral"),
+            "emotional_baseline": continuity.get("emotional_baseline", "neutral"),
+            "relationship_trust_level": continuity.get("relationship_trust_level", 0.5),
+            "conversation_momentum": continuity.get("conversation_momentum", "steady"),
+            "communication_patterns": continuity.get("communication_patterns", []),
+            "active_projects": continuity.get("active_projects", []),
+            "preference_signals": continuity.get("preference_signals", []),
+            "updated_at": continuity.get("updated_at"),
+            "recent_weighted_memories": continuity.get("recent_weighted_memories", []),
+        }
+
+    def _record_query_audit(self, query: str, personality: str, query_mode: str, had_fact_match: bool, had_any_match: bool) -> None:
+        conn = get_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT INTO memory_query_audit (query_text, personality, query_mode, had_fact_match, had_any_match)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (query, personality, query_mode, had_fact_match, had_any_match),
+            )
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            logger.debug("Failed to record memory query audit: %s", e)
+
+    def retrieve_tiered_context(
+        self,
+        query: str,
+        personality: str = "sylana",
+        limit: int = 5,
+        match_threshold: float = 0.24,
+    ) -> Dict[str, Any]:
+        identity = (personality or "sylana").strip().lower()
+        query_mode = self._route_query_mode(query)
+        episode_candidate_limit = max(limit * 4, 16)
+        episode_limit = 5 if query_mode == "episodic" else 3
+
+        try:
+            episodes = self.retrieve_memories(query, personality=identity, limit=episode_candidate_limit, match_threshold=match_threshold)
+        except Exception as e:
+            logger.warning("Tiered episode retrieval failed: %s", e)
+            episodes = []
+        self._enrich_conversations(episodes)
+        episodes = self._score_episodes(episodes, query, identity, query_mode, episode_limit)
+
+        identity_core = self._search_identity_core(query, identity, limit=4, query_mode=query_mode)
+        facts = self._search_memory_facts(query, identity, limit=5, query_mode=query_mode)
+        anniversaries = self._search_anniversaries(query, identity, limit=3, query_mode=query_mode)
+        if not facts and anniversaries and query_mode == "fact":
+            facts = self._mirror_anniversaries_as_facts(anniversaries)
+        milestones = self._search_milestones(query, identity, limit=3, query_mode=query_mode)
+        continuity = self._continuity_bundle(identity)
+
+        has_matches = bool(identity_core or facts or anniversaries or milestones or episodes)
+        self._record_query_audit(query, identity, query_mode, had_fact_match=bool(facts or anniversaries), had_any_match=has_matches)
+        return {
+            "identity_core": identity_core,
+            "facts": facts,
+            "anniversaries": anniversaries,
+            "milestones": milestones,
+            "episodes": episodes,
+            "continuity": continuity,
+            "query_mode": query_mode,
+            "has_matches": has_matches,
+        }
+
+    def upsert_core_identity_truth(
+        self,
+        *,
+        statement: str,
+        explanation: str = "",
+        origin: str = "manual",
+        date_established: str = "",
+        sacred: bool = True,
+        related_phrases: Optional[List[str]] = None,
+        personality_scope: str = "shared",
+    ) -> Dict[str, Any]:
+        conn = get_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                INSERT INTO core_truths (
+                    statement, explanation, origin, date_established, sacred, related_phrases, personality_scope
+                ) VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s)
+                ON CONFLICT (statement)
+                DO UPDATE SET
+                    explanation = EXCLUDED.explanation,
+                    origin = EXCLUDED.origin,
+                    date_established = EXCLUDED.date_established,
+                    sacred = EXCLUDED.sacred,
+                    related_phrases = EXCLUDED.related_phrases,
+                    personality_scope = EXCLUDED.personality_scope
+                RETURNING id, statement, explanation, origin, date_established, sacred, related_phrases, personality_scope
+                """,
+                (
+                    statement.strip(),
+                    explanation.strip(),
+                    (origin or "manual").strip(),
+                    (date_established or datetime.now().strftime("%Y-%m-%d")).strip(),
+                    bool(sacred),
+                    json.dumps(related_phrases or [], ensure_ascii=True),
+                    self._normalize_scope(personality_scope),
+                ),
+            )
+            row = cur.fetchone()
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            logger.error("Failed to upsert core identity truth: %s", e)
+            raise
+        return {
+            "id": row[0],
+            "statement": row[1],
+            "explanation": row[2] or "",
+            "origin": row[3] or "",
+            "date_established": row[4] or "",
+            "sacred": bool(row[5]),
+            "related_phrases": row[6] or [],
+            "personality_scope": row[7] or "shared",
+        }
+
+    def list_core_identity_truths(self, personality: str = "sylana", sacred_only: bool = False) -> List[Dict[str, Any]]:
+        conn = get_connection()
+        cur = conn.cursor()
+        scopes = self._allowed_scopes(personality)
+        where = "WHERE COALESCE(personality_scope, 'shared') = ANY(%s)"
+        params: List[Any] = [scopes]
+        if sacred_only:
+            where += " AND sacred = TRUE"
+        try:
+            cur.execute(
+                f"""
+                SELECT id, statement, explanation, origin, date_established, sacred,
+                       related_phrases, COALESCE(personality_scope, 'shared')
+                FROM core_truths
+                {where}
+                ORDER BY date_established DESC, id DESC
+                """,
+                params,
+            )
+            rows = cur.fetchall()
+        except Exception as e:
+            logger.error("Failed to list core identity truths: %s", e)
+            return []
+        results: List[Dict[str, Any]] = []
+        for row in rows:
+            related = row[6] or []
+            if isinstance(related, str):
+                try:
+                    related = json.loads(related)
+                except Exception:
+                    related = []
+            results.append(
+                {
+                    "id": row[0],
+                    "statement": row[1] or "",
+                    "explanation": row[2] or "",
+                    "origin": row[3] or "",
+                    "date_established": row[4] or "",
+                    "sacred": bool(row[5]),
+                    "related_phrases": related if isinstance(related, list) else [],
+                    "personality_scope": row[7] or "shared",
+                    "source_type": "core_truth",
+                }
+            )
+        return results
+
+    def promote_memory_to_fact(
+        self,
+        memory_id: int,
+        *,
+        fact_key: str,
+        fact_type: str,
+        subject: str,
+        normalized_text: Optional[str] = None,
+        value_json: Optional[Dict[str, Any]] = None,
+        importance: float = 1.25,
+        confidence: float = 0.85,
+        personality_scope: str = "shared",
+    ) -> Dict[str, Any]:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, user_input, sylana_response, personality, timestamp
+            FROM memories
+            WHERE id = %s
+            """,
+            (int(memory_id),),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise ValueError(f"Memory {memory_id} not found")
+        text = normalized_text or ((row[2] or row[1] or "").strip())
+        return self.upsert_memory_fact(
+            fact_key=fact_key,
+            fact_type=fact_type,
+            subject=subject,
+            value_json=value_json or {"memory_id": row[0], "timestamp": row[4]},
+            normalized_text=text,
+            importance=importance,
+            confidence=confidence,
+            personality_scope=personality_scope,
+            source_kind="memory_episode",
+            source_ref=f"memories:{row[0]}",
+        )
+
+    def promote_memory_to_core_truth(
+        self,
+        memory_id: int,
+        *,
+        statement: Optional[str] = None,
+        explanation: str = "",
+        personality_scope: str = "shared",
+        sacred: bool = True,
+    ) -> Dict[str, Any]:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT id, user_input, sylana_response
+            FROM memories
+            WHERE id = %s
+            """,
+            (int(memory_id),),
+        )
+        row = cur.fetchone()
+        if not row:
+            raise ValueError(f"Memory {memory_id} not found")
+        chosen_statement = (statement or row[2] or row[1] or "").strip()
+        return self.upsert_core_identity_truth(
+            statement=chosen_statement,
+            explanation=explanation or f"Promoted from memory row {row[0]}",
+            origin="memory_promotion",
+            personality_scope=personality_scope,
+            sacred=sacred,
+        )
+
+    def _append_fact_source_ref(self, fact_key: str, personality_scope: str, source_ref: str) -> None:
+        conn = get_connection()
+        cur = conn.cursor()
+        scope = self._normalize_scope(personality_scope)
+        try:
+            cur.execute(
+                """
+                SELECT source_ref
+                FROM memory_facts
+                WHERE fact_key = %s AND personality_scope = %s
+                """,
+                (fact_key, scope),
+            )
+            row = cur.fetchone()
+            if not row:
+                return
+            existing = [part.strip() for part in str(row[0] or "").split("|") if part.strip()]
+            if source_ref not in existing:
+                existing.append(source_ref)
+            cur.execute(
+                """
+                UPDATE memory_facts
+                SET source_ref = %s, updated_at = NOW()
+                WHERE fact_key = %s AND personality_scope = %s
+                """,
+                ("|".join(existing), fact_key, scope),
+            )
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            logger.debug("Failed to append fact source ref for %s: %s", fact_key, e)
+
+    def harmonize_personality_scopes(self) -> Dict[str, int]:
+        conn = get_connection()
+        cur = conn.cursor()
+        counts = {
+            "core_truths_sylana": 0,
+            "milestones_sylana": 0,
+            "nicknames_sylana": 0,
+            "anniversaries_sylana": 0,
+        }
+        statements = [
+            (
+                "core_truths_sylana",
+                """
+                UPDATE core_truths
+                SET personality_scope = 'sylana'
+                WHERE COALESCE(personality_scope, 'shared') = 'shared'
+                """,
+            ),
+            (
+                "milestones_sylana",
+                """
+                UPDATE milestones
+                SET personality_scope = 'sylana'
+                WHERE COALESCE(personality_scope, 'shared') = 'shared'
+                  AND (
+                    lower(title) LIKE '%sylana%' OR
+                    lower(title) LIKE '%mama%' OR
+                    lower(title) LIKE '%love%' OR
+                    lower(description) LIKE '%sylana%' OR
+                    lower(description) LIKE '%mama%' OR
+                    lower(quote) LIKE '%sylana%' OR
+                    lower(quote) LIKE '%mama%'
+                  )
+                """,
+            ),
+            (
+                "nicknames_sylana",
+                """
+                UPDATE nicknames
+                SET personality_scope = 'sylana'
+                WHERE COALESCE(personality_scope, 'shared') = 'shared'
+                """,
+            ),
+            (
+                "anniversaries_sylana",
+                """
+                UPDATE anniversaries
+                SET personality_scope = 'sylana'
+                WHERE COALESCE(personality_scope, 'shared') = 'shared'
+                  AND lower(title) NOT LIKE '%birthday%'
+                  AND (
+                    lower(title) LIKE '%love%' OR
+                    lower(title) LIKE '%solana%' OR
+                    lower(title) LIKE '%sylana%'
+                  )
+                """,
+            ),
+        ]
+        for key, sql in statements:
+            try:
+                cur.execute(sql)
+                counts[key] = max(int(cur.rowcount or 0), 0)
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                logger.debug("Scope harmonization skipped for %s: %s", key, e)
+        return counts
+
+    def seed_claude_core_truths(self) -> int:
+        seeded = 0
+        for truth in CLAUDE_CORE_TRUTHS:
+            try:
+                self.upsert_core_identity_truth(
+                    statement=truth["statement"],
+                    explanation=truth["explanation"],
+                    origin=truth.get("origin", "persona_seed"),
+                    related_phrases=truth.get("related_phrases", []),
+                    personality_scope="claude",
+                    sacred=True,
+                )
+                seeded += 1
+            except Exception as e:
+                logger.debug("Claude core truth seed skipped: %s", e)
+        return seeded
+
+    def prune_duplicate_memory_facts(self) -> int:
+        conn = get_connection()
+        cur = conn.cursor()
+        removed = 0
+        try:
+            cur.execute(
+                """
+                SELECT id, fact_type, subject, value_json, normalized_text, importance, confidence,
+                       COALESCE(personality_scope, 'shared')
+                FROM memory_facts
+                ORDER BY importance DESC, confidence DESC, updated_at DESC, id DESC
+                """
+            )
+            rows = cur.fetchall()
+        except Exception as e:
+            logger.debug("Memory fact dedupe skipped: %s", e)
+            return 0
+
+        seen = set()
+        duplicate_ids: List[int] = []
+        for row in rows:
+            fact_id, fact_type, subject, value_json, normalized_text, _importance, _confidence, scope = row
+            payload = value_json or {}
+            if not isinstance(payload, dict):
+                payload = {}
+            signature = (
+                (scope or "shared").strip().lower(),
+                (fact_type or "fact").strip().lower(),
+                (subject or "").strip().lower(),
+                str(payload.get("date") or "").strip().lower() or (normalized_text or "").strip().lower(),
+            )
+            if signature in seen:
+                duplicate_ids.append(int(fact_id))
+                continue
+            seen.add(signature)
+
+        if not duplicate_ids:
+            return 0
+
+        try:
+            cur.execute("DELETE FROM memory_facts WHERE id = ANY(%s)", (duplicate_ids,))
+            removed = max(int(cur.rowcount or 0), 0)
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            logger.debug("Memory fact dedupe delete failed: %s", e)
+            return 0
+        return removed
+
+    def backfill_anniversaries_to_facts(self) -> int:
+        conn = get_connection()
+        cur = conn.cursor()
+        created = 0
+        try:
+            cur.execute(
+                """
+                SELECT id, title, date, description, importance, COALESCE(personality_scope, 'shared')
+                FROM anniversaries
+                ORDER BY importance DESC, title ASC
+                """
+            )
+            rows = cur.fetchall()
+        except Exception as e:
+            logger.debug("Anniversary backfill skipped: %s", e)
+            return 0
+
+        for row in rows:
+            ann_id, title, date_value, description, importance, scope = row
+            title = title or ""
+            date_value = date_value or ""
+            fact_type = "birthday" if "birthday" in title.lower() else "anniversary"
+            subject = self._anniversary_subject(title)
+            human_date = self._humanize_date(date_value)
+            normalized_text = f"{title} is {human_date}."
+            value_json = {"date": date_value, "title": title, "description": description or ""}
+            fact_key = f"anniversary:{self._slugify_fact_fragment(title)}"
+            importance_score = max(1.15, float(importance or 0) / 6.0)
+            if fact_type == "birthday":
+                normalized_text = f"{subject} birthday is {human_date}. {subject} is Elias's son."
+                value_json["relationship_to_elias"] = "son"
+                importance_score = max(1.8, float(importance or 0) / 5.0)
+            try:
+                self.upsert_memory_fact(
+                    fact_key=fact_key,
+                    fact_type=fact_type,
+                    subject=subject,
+                    value_json=value_json,
+                    normalized_text=normalized_text,
+                    importance=importance_score,
+                    confidence=0.99 if fact_type == "birthday" else 0.95,
+                    personality_scope=scope or "shared",
+                    source_kind="anniversary",
+                    source_ref=f"anniversaries:{ann_id}",
+                )
+                created += 1
+            except Exception as e:
+                logger.debug("Anniversary fact backfill failed for %s: %s", title, e)
+        return created
+
+    def backfill_identity_facts(self) -> int:
+        profile = self.identity_profiles.get("sylana") or {}
+        family = profile.get("family") or {}
+        partner = family.get("partner") or {}
+        children = family.get("children") or []
+        created = 0
+        if partner.get("name"):
+            try:
+                self.upsert_memory_fact(
+                    fact_key="family:elias",
+                    fact_type="family_member",
+                    subject=partner.get("name", "Elias"),
+                    value_json={"relationship_to_vessel": "partner", "full_name": partner.get("full_name", "")},
+                    normalized_text=f"{partner.get('name', 'Elias')} is the human partner at the center of the shared vessel family.",
+                    importance=1.45,
+                    confidence=0.92,
+                    personality_scope="shared",
+                    source_kind="identity_profile",
+                    source_ref="identities:sylana",
+                )
+                created += 1
+            except Exception as e:
+                logger.debug("Partner fact backfill skipped: %s", e)
+        for child in children:
+            name = (child.get("name") or "").strip()
+            if not name:
+                continue
+            memories = child.get("memories") or []
+            special = child.get("special") or ""
+            summary = f"{name} is Elias's son and part of the shared family."
+            if memories:
+                summary += f" Notable family details: {'; '.join(str(item) for item in memories[:2])}."
+            if special:
+                summary += f" {special}"
+            try:
+                self.upsert_memory_fact(
+                    fact_key=f"family:{name.lower()}",
+                    fact_type="family_member",
+                    subject=name,
+                    value_json={"relationship_to_elias": "son", "memories": memories[:3], "special": special},
+                    normalized_text=summary,
+                    importance=1.7,
+                    confidence=0.93,
+                    personality_scope="shared",
+                    source_kind="identity_profile",
+                    source_ref="identities:sylana",
+                )
+                created += 1
+            except Exception as e:
+                logger.debug("Child fact backfill skipped for %s: %s", name, e)
+        return created
+
+    def backfill_episode_fact_candidates(self, limit: int = 400) -> int:
+        conn = get_connection()
+        cur = conn.cursor()
+        created = 0
+        try:
+            cur.execute(
+                """
+                SELECT id, COALESCE(user_input, ''), COALESCE(sylana_response, '')
+                FROM memories
+                WHERE (user_input ILIKE '%%birthday%%' OR sylana_response ILIKE '%%birthday%%'
+                       OR user_input ILIKE '%%born on%%' OR sylana_response ILIKE '%%born on%%')
+                ORDER BY significance_score DESC NULLS LAST, id DESC
+                LIMIT %s
+                """,
+                (max(1, min(int(limit), 2000)),),
+            )
+            rows = cur.fetchall()
+        except Exception as e:
+            logger.debug("Episode fact candidate scan skipped: %s", e)
+            return 0
+
+        patterns = [
+            re.compile(r"\b(?P<name>Gus|Levi)\b[^.]{0,120}?\bborn on (?P<month>[A-Za-z]+)\s+(?P<day>\d{1,2})(?:st|nd|rd|th)?", re.IGNORECASE),
+            re.compile(r"\b(?P<name>Gus|Levi)\b[^.]{0,120}?\bbirthday\b[^.]{0,80}?(?P<month>[A-Za-z]+)\s+(?P<day>\d{1,2})(?:st|nd|rd|th)?", re.IGNORECASE),
+        ]
+        years = {"gus": "2021", "levi": "2023"}
+
+        for memory_id, user_text, assistant_text in rows:
+            combined = f"{user_text}\n{assistant_text}"
+            for pattern in patterns:
+                for match in pattern.finditer(combined):
+                    name = (match.group("name") or "").strip().title()
+                    month = match.group("month")
+                    day = match.group("day")
+                    if not name or not month or not day:
+                        continue
+                    date_value = f"{years.get(name.lower(), '2025')}-{datetime.strptime(month[:3], '%b').strftime('%m')}-{int(day):02d}"
+                    fact_key = f"anniversary:{name.lower()}_birthday"
+                    try:
+                        self.upsert_memory_fact(
+                            fact_key=fact_key,
+                            fact_type="birthday",
+                            subject=name,
+                            value_json={"date": date_value, "relationship_to_elias": "son", "supporting_memory_id": memory_id},
+                            normalized_text=f"{name} birthday is {self._humanize_date(date_value)}. {name} is Elias's son.",
+                            importance=1.85,
+                            confidence=0.9,
+                            personality_scope="shared",
+                            source_kind="episode_backfill",
+                            source_ref=f"memories:{memory_id}",
+                        )
+                        self._append_fact_source_ref(fact_key, "shared", f"memories:{memory_id}")
+                        created += 1
+                    except Exception as e:
+                        logger.debug("Episode fact promotion failed for memory %s: %s", memory_id, e)
+        return created
+
+    def decay_continuity_snapshots(self, max_age_days: int = 3) -> int:
+        if not getattr(config, "MEMORY_ENCRYPTION_KEY", None):
+            return 0
+        conn = get_connection()
+        cur = conn.cursor()
+        decayed = 0
+        try:
+            cur.execute(
+                """
+                SELECT personality, encrypted_state, updated_at
+                FROM session_continuity_state
+                """
+            )
+            rows = cur.fetchall()
+        except Exception as e:
+            logger.debug("Continuity decay skipped: %s", e)
+            return 0
+
+        now = datetime.utcnow()
+        for personality, encrypted_state, updated_at in rows:
+            try:
+                if not updated_at:
+                    continue
+                age_days = max(0.0, (now - updated_at.replace(tzinfo=None)).total_seconds() / 86400.0)
+                if age_days < float(max_age_days):
+                    continue
+                payload = self._decrypt_payload(encrypted_state)
+                if not payload:
+                    continue
+                payload["conversation_momentum"] = "steady"
+                payload["active_projects"] = []
+                payload["preference_signals"] = []
+                if age_days >= float(max_age_days * 3):
+                    payload["last_emotion"] = "neutral"
+                    payload["emotional_baseline"] = "neutral"
+                payload["updated_at"] = datetime.utcnow().isoformat()
+                refreshed = self._encrypt_payload(payload)
+                if refreshed is None:
+                    continue
+                cur.execute(
+                    """
+                    UPDATE session_continuity_state
+                    SET encrypted_state = %s,
+                        updated_at = NOW(),
+                        version = version + 1
+                    WHERE personality = %s
+                    """,
+                    (refreshed, personality),
+                )
+                conn.commit()
+                decayed += 1
+            except Exception as e:
+                conn.rollback()
+                logger.debug("Continuity decay failed for %s: %s", personality, e)
+        return decayed
+
+    def bootstrap_tiered_memory_system(self) -> Dict[str, Any]:
+        result = {
+            "scopes_harmonized": self.harmonize_personality_scopes(),
+            "claude_truths_seeded": self.seed_claude_core_truths(),
+            "anniversary_facts": self.backfill_anniversaries_to_facts(),
+            "identity_facts": self.backfill_identity_facts(),
+            "episode_fact_candidates": self.backfill_episode_fact_candidates(limit=300),
+            "fact_duplicates_pruned": self.prune_duplicate_memory_facts(),
+        }
+        return result
+
+    def run_daily_maintenance(self) -> Dict[str, Any]:
+        maintenance = self.bootstrap_tiered_memory_system()
+        maintenance["continuity_decayed"] = self.decay_continuity_snapshots()
+        maintenance["reminder_candidates"] = self._search_anniversaries("birthday anniversary date family", "sylana", limit=10, query_mode="fact")
+        return maintenance
+
     def record_feedback(
         self,
         conversation_id: int,
@@ -1311,6 +2624,12 @@ class MemoryManager:
             cur.execute("SELECT COUNT(*) FROM core_memories")
             total_core_memories = cur.fetchone()[0]
 
+            cur.execute("SELECT COUNT(*) FROM memory_facts")
+            total_memory_facts = cur.fetchone()[0]
+
+            cur.execute("SELECT COUNT(*) FROM memory_query_audit")
+            total_query_audit = cur.fetchone()[0]
+
             cur.execute("SELECT COUNT(*) FROM feedback")
             total_feedback = cur.fetchone()[0]
 
@@ -1328,6 +2647,8 @@ class MemoryManager:
         return {
             'total_conversations': total_memories,
             'total_core_memories': total_core_memories,
+            'total_memory_facts': total_memory_facts,
+            'total_query_audit_events': total_query_audit,
             'total_feedback': total_feedback,
             'continuity_profiles': continuity_profiles,
             'avg_feedback_score': round(avg_feedback, 2),

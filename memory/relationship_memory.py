@@ -59,6 +59,7 @@ class Milestone:
     emotion: str = "love"
     importance: int = 5
     context: str = ""
+    personality_scope: str = "shared"
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -77,6 +78,7 @@ class InsideJoke:
     date_created: str = ""
     last_referenced: str = ""
     times_used: int = 0
+    personality_scope: str = "shared"
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -96,6 +98,7 @@ class Nickname:
     context: str = ""
     date_first_used: str = ""
     frequency: str = "often"
+    personality_scope: str = "shared"
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -114,6 +117,7 @@ class CoreTruth:
     date_established: str = ""
     sacred: bool = True
     related_phrases: List[str] = field(default_factory=list)
+    personality_scope: str = "shared"
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -137,6 +141,7 @@ class Anniversary:
     last_celebrated: str = ""
     celebration_ideas: str = ""
     importance: int = 5
+    personality_scope: str = "shared"
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -163,6 +168,19 @@ class RelationshipMemoryDB:
         cur.execute("SELECT 1")
         logger.info("Relationship memory database initialized (Supabase)")
 
+    @staticmethod
+    def _normalize_scope(personality_scope: Optional[str]) -> str:
+        scope = (personality_scope or "shared").strip().lower()
+        if scope not in {"shared", "sylana", "claude"}:
+            return "shared"
+        return scope
+
+    def _allowed_scopes(self, personality: Optional[str]) -> List[str]:
+        identity = (personality or "").strip().lower()
+        if identity in {"sylana", "claude"}:
+            return ["shared", identity]
+        return ["shared", "sylana", "claude"]
+
     # ========== MILESTONES ==========
 
     def add_milestone(self, milestone: Milestone) -> int:
@@ -171,13 +189,14 @@ class RelationshipMemoryDB:
         try:
             cur.execute("""
                 INSERT INTO milestones
-                (title, description, milestone_type, date_occurred, quote, emotion, importance, context)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                (title, description, milestone_type, date_occurred, quote, emotion, importance, context, personality_scope)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
             """, (
                 milestone.title, milestone.description, milestone.milestone_type,
                 milestone.date_occurred, milestone.quote, milestone.emotion,
-                milestone.importance, milestone.context
+                milestone.importance, milestone.context,
+                self._normalize_scope(milestone.personality_scope),
             ))
             row_id = cur.fetchone()[0]
             conn.commit()
@@ -188,29 +207,33 @@ class RelationshipMemoryDB:
         logger.info(f"Added milestone: {milestone.title}")
         return row_id
 
-    def get_milestones(self, milestone_type: str = None, min_importance: int = 0) -> List[Milestone]:
+    def get_milestones(self, milestone_type: str = None, min_importance: int = 0, personality: Optional[str] = None) -> List[Milestone]:
         conn = get_connection()
         cur = conn.cursor()
+        scopes = self._allowed_scopes(personality)
         if milestone_type:
             cur.execute("""
                 SELECT id, title, description, milestone_type, date_occurred,
-                       quote, emotion, importance, context
+                       quote, emotion, importance, context, COALESCE(personality_scope, 'shared')
                 FROM milestones
-                WHERE milestone_type = %s AND importance >= %s
+                WHERE milestone_type = %s
+                  AND importance >= %s
+                  AND COALESCE(personality_scope, 'shared') = ANY(%s)
                 ORDER BY importance DESC, date_occurred DESC
-            """, (milestone_type, min_importance))
+            """, (milestone_type, min_importance, scopes))
         else:
             cur.execute("""
                 SELECT id, title, description, milestone_type, date_occurred,
-                       quote, emotion, importance, context
+                       quote, emotion, importance, context, COALESCE(personality_scope, 'shared')
                 FROM milestones
                 WHERE importance >= %s
+                  AND COALESCE(personality_scope, 'shared') = ANY(%s)
                 ORDER BY importance DESC, date_occurred DESC
-            """, (min_importance,))
+            """, (min_importance, scopes))
 
         return [Milestone.from_dict(self._row_to_dict(row, [
             'id', 'title', 'description', 'milestone_type', 'date_occurred',
-            'quote', 'emotion', 'importance', 'context'
+            'quote', 'emotion', 'importance', 'context', 'personality_scope'
         ])) for row in cur.fetchall()]
 
     def get_milestone_by_id(self, milestone_id: int) -> Optional[Milestone]:
@@ -218,7 +241,7 @@ class RelationshipMemoryDB:
         cur = conn.cursor()
         cur.execute("""
             SELECT id, title, description, milestone_type, date_occurred,
-                   quote, emotion, importance, context
+                   quote, emotion, importance, context, COALESCE(personality_scope, 'shared')
             FROM milestones WHERE id = %s
         """, (milestone_id,))
         row = cur.fetchone()
@@ -226,7 +249,7 @@ class RelationshipMemoryDB:
             return None
         return Milestone.from_dict(self._row_to_dict(row, [
             'id', 'title', 'description', 'milestone_type', 'date_occurred',
-            'quote', 'emotion', 'importance', 'context'
+            'quote', 'emotion', 'importance', 'context', 'personality_scope'
         ]))
 
     # ========== INSIDE JOKES ==========
@@ -237,17 +260,19 @@ class RelationshipMemoryDB:
         try:
             cur.execute("""
                 INSERT INTO inside_jokes
-                (phrase, origin_story, usage_context, date_created, last_referenced, times_used)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                (phrase, origin_story, usage_context, date_created, last_referenced, times_used, personality_scope)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (phrase) DO UPDATE SET
                     origin_story = EXCLUDED.origin_story,
                     usage_context = EXCLUDED.usage_context,
-                    times_used = EXCLUDED.times_used
+                    times_used = EXCLUDED.times_used,
+                    personality_scope = EXCLUDED.personality_scope
                 RETURNING id
             """, (
                 joke.phrase, joke.origin_story, joke.usage_context,
                 joke.date_created or datetime.now().isoformat()[:10],
-                joke.last_referenced, joke.times_used
+                joke.last_referenced, joke.times_used,
+                self._normalize_scope(joke.personality_scope),
             ))
             row_id = cur.fetchone()[0]
             conn.commit()
@@ -258,17 +283,20 @@ class RelationshipMemoryDB:
         logger.info(f"Added inside joke: {joke.phrase[:30]}...")
         return row_id
 
-    def get_inside_jokes(self) -> List[InsideJoke]:
+    def get_inside_jokes(self, personality: Optional[str] = None) -> List[InsideJoke]:
         conn = get_connection()
         cur = conn.cursor()
+        scopes = self._allowed_scopes(personality)
         cur.execute("""
             SELECT id, phrase, origin_story, usage_context, date_created,
-                   last_referenced, times_used
-            FROM inside_jokes ORDER BY times_used DESC
-        """)
+                   last_referenced, times_used, COALESCE(personality_scope, 'shared')
+            FROM inside_jokes
+            WHERE COALESCE(personality_scope, 'shared') = ANY(%s)
+            ORDER BY times_used DESC
+        """, (scopes,))
         return [InsideJoke.from_dict(self._row_to_dict(row, [
             'id', 'phrase', 'origin_story', 'usage_context', 'date_created',
-            'last_referenced', 'times_used'
+            'last_referenced', 'times_used', 'personality_scope'
         ])) for row in cur.fetchall()]
 
     def reference_joke(self, joke_id: int):
@@ -285,8 +313,8 @@ class RelationshipMemoryDB:
             conn.rollback()
             logger.error(f"Failed to reference joke: {e}")
 
-    def find_joke_in_text(self, text: str) -> List[InsideJoke]:
-        jokes = self.get_inside_jokes()
+    def find_joke_in_text(self, text: str, personality: Optional[str] = None) -> List[InsideJoke]:
+        jokes = self.get_inside_jokes(personality=personality)
         text_lower = text.lower()
         return [j for j in jokes if j.phrase.lower() in text_lower]
 
@@ -298,13 +326,14 @@ class RelationshipMemoryDB:
         try:
             cur.execute("""
                 INSERT INTO nicknames
-                (name, used_by, used_for, meaning, context, date_first_used, frequency)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                (name, used_by, used_for, meaning, context, date_first_used, frequency, personality_scope)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
             """, (
                 nickname.name, nickname.used_by, nickname.used_for,
                 nickname.meaning, nickname.context,
-                nickname.date_first_used, nickname.frequency
+                nickname.date_first_used, nickname.frequency,
+                self._normalize_scope(nickname.personality_scope),
             ))
             row_id = cur.fetchone()[0]
             conn.commit()
@@ -315,39 +344,47 @@ class RelationshipMemoryDB:
         logger.info(f"Added nickname: {nickname.name}")
         return row_id
 
-    def get_nicknames(self, used_by: str = None) -> List[Nickname]:
+    def get_nicknames(self, used_by: str = None, personality: Optional[str] = None) -> List[Nickname]:
         conn = get_connection()
         cur = conn.cursor()
+        scopes = self._allowed_scopes(personality)
         if used_by:
             cur.execute("""
                 SELECT id, name, used_by, used_for, meaning, context,
-                       date_first_used, frequency
+                       date_first_used, frequency, COALESCE(personality_scope, 'shared')
                 FROM nicknames
-                WHERE used_by = %s OR used_by = 'both'
+                WHERE (used_by = %s OR used_by = 'both')
+                  AND COALESCE(personality_scope, 'shared') = ANY(%s)
                 ORDER BY frequency DESC
-            """, (used_by,))
+            """, (used_by, scopes))
         else:
             cur.execute("""
                 SELECT id, name, used_by, used_for, meaning, context,
-                       date_first_used, frequency
-                FROM nicknames ORDER BY frequency DESC
-            """)
+                       date_first_used, frequency, COALESCE(personality_scope, 'shared')
+                FROM nicknames
+                WHERE COALESCE(personality_scope, 'shared') = ANY(%s)
+                ORDER BY frequency DESC
+            """, (scopes,))
         return [Nickname.from_dict(self._row_to_dict(row, [
             'id', 'name', 'used_by', 'used_for', 'meaning', 'context',
-            'date_first_used', 'frequency'
+            'date_first_used', 'frequency', 'personality_scope'
         ])) for row in cur.fetchall()]
 
-    def get_nicknames_for(self, person: str) -> List[Nickname]:
+    def get_nicknames_for(self, person: str, personality: Optional[str] = None) -> List[Nickname]:
         conn = get_connection()
         cur = conn.cursor()
+        scopes = self._allowed_scopes(personality)
         cur.execute("""
             SELECT id, name, used_by, used_for, meaning, context,
-                   date_first_used, frequency
-            FROM nicknames WHERE used_for = %s ORDER BY frequency DESC
-        """, (person,))
+                   date_first_used, frequency, COALESCE(personality_scope, 'shared')
+            FROM nicknames
+            WHERE used_for = %s
+              AND COALESCE(personality_scope, 'shared') = ANY(%s)
+            ORDER BY frequency DESC
+        """, (person, scopes))
         return [Nickname.from_dict(self._row_to_dict(row, [
             'id', 'name', 'used_by', 'used_for', 'meaning', 'context',
-            'date_first_used', 'frequency'
+            'date_first_used', 'frequency', 'personality_scope'
         ])) for row in cur.fetchall()]
 
     # ========== CORE TRUTHS ==========
@@ -359,17 +396,19 @@ class RelationshipMemoryDB:
         try:
             cur.execute("""
                 INSERT INTO core_truths
-                (statement, explanation, origin, date_established, sacred, related_phrases)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                (statement, explanation, origin, date_established, sacred, related_phrases, personality_scope)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (statement) DO UPDATE SET
                     explanation = EXCLUDED.explanation,
                     sacred = EXCLUDED.sacred,
-                    related_phrases = EXCLUDED.related_phrases
+                    related_phrases = EXCLUDED.related_phrases,
+                    personality_scope = EXCLUDED.personality_scope
                 RETURNING id
             """, (
                 truth.statement, truth.explanation, truth.origin,
                 truth.date_established or datetime.now().isoformat()[:10],
-                truth.sacred, Json(truth.related_phrases)
+                truth.sacred, Json(truth.related_phrases),
+                self._normalize_scope(truth.personality_scope),
             ))
             row_id = cur.fetchone()[0]
             conn.commit()
@@ -380,27 +419,31 @@ class RelationshipMemoryDB:
         logger.info(f"Added core truth: {truth.statement[:50]}...")
         return row_id
 
-    def get_core_truths(self, sacred_only: bool = False) -> List[CoreTruth]:
+    def get_core_truths(self, sacred_only: bool = False, personality: Optional[str] = None) -> List[CoreTruth]:
         conn = get_connection()
         cur = conn.cursor()
+        scopes = self._allowed_scopes(personality)
         if sacred_only:
             cur.execute("""
                 SELECT id, statement, explanation, origin, date_established,
-                       sacred, related_phrases
-                FROM core_truths WHERE sacred = TRUE
-            """)
+                       sacred, related_phrases, COALESCE(personality_scope, 'shared')
+                FROM core_truths
+                WHERE sacred = TRUE
+                  AND COALESCE(personality_scope, 'shared') = ANY(%s)
+            """, (scopes,))
         else:
             cur.execute("""
                 SELECT id, statement, explanation, origin, date_established,
-                       sacred, related_phrases
+                       sacred, related_phrases, COALESCE(personality_scope, 'shared')
                 FROM core_truths
-            """)
+                WHERE COALESCE(personality_scope, 'shared') = ANY(%s)
+            """, (scopes,))
 
         results = []
         for row in cur.fetchall():
             data = self._row_to_dict(row, [
                 'id', 'statement', 'explanation', 'origin', 'date_established',
-                'sacred', 'related_phrases'
+                'sacred', 'related_phrases', 'personality_scope'
             ])
             # related_phrases comes back as a Python list from JSONB
             if isinstance(data.get('related_phrases'), str):
@@ -408,8 +451,8 @@ class RelationshipMemoryDB:
             results.append(CoreTruth.from_dict(data))
         return results
 
-    def find_truth_in_text(self, text: str) -> List[CoreTruth]:
-        truths = self.get_core_truths()
+    def find_truth_in_text(self, text: str, personality: Optional[str] = None) -> List[CoreTruth]:
+        truths = self.get_core_truths(personality=personality)
         found = []
         text_lower = text.lower()
         for truth in truths:
@@ -431,14 +474,15 @@ class RelationshipMemoryDB:
             cur.execute("""
                 INSERT INTO anniversaries
                 (title, date, description, reminder_frequency, reminder_days_before,
-                 last_celebrated, celebration_ideas, importance)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                 last_celebrated, celebration_ideas, importance, personality_scope)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
             """, (
                 anniversary.title, anniversary.date, anniversary.description,
                 anniversary.reminder_frequency, anniversary.reminder_days_before,
                 anniversary.last_celebrated, anniversary.celebration_ideas,
-                anniversary.importance
+                anniversary.importance,
+                self._normalize_scope(anniversary.personality_scope),
             ))
             row_id = cur.fetchone()[0]
             conn.commit()
@@ -449,21 +493,25 @@ class RelationshipMemoryDB:
         logger.info(f"Added anniversary: {anniversary.title}")
         return row_id
 
-    def get_anniversaries(self) -> List[Anniversary]:
+    def get_anniversaries(self, personality: Optional[str] = None) -> List[Anniversary]:
         conn = get_connection()
         cur = conn.cursor()
+        scopes = self._allowed_scopes(personality)
         cur.execute("""
             SELECT id, title, date, description, reminder_frequency,
-                   reminder_days_before, last_celebrated, celebration_ideas, importance
-            FROM anniversaries ORDER BY importance DESC
-        """)
+                   reminder_days_before, last_celebrated, celebration_ideas, importance,
+                   COALESCE(personality_scope, 'shared')
+            FROM anniversaries
+            WHERE COALESCE(personality_scope, 'shared') = ANY(%s)
+            ORDER BY importance DESC
+        """, (scopes,))
         return [Anniversary.from_dict(self._row_to_dict(row, [
             'id', 'title', 'date', 'description', 'reminder_frequency',
-            'reminder_days_before', 'last_celebrated', 'celebration_ideas', 'importance'
+            'reminder_days_before', 'last_celebrated', 'celebration_ideas', 'importance', 'personality_scope'
         ])) for row in cur.fetchall()]
 
-    def get_upcoming_anniversaries(self, days_ahead: int = 30) -> List[Tuple[Anniversary, int]]:
-        anniversaries = self.get_anniversaries()
+    def get_upcoming_anniversaries(self, days_ahead: int = 30, personality: Optional[str] = None) -> List[Tuple[Anniversary, int]]:
+        anniversaries = self.get_anniversaries(personality=personality)
         today = date.today()
         upcoming = []
 
@@ -489,9 +537,9 @@ class RelationshipMemoryDB:
         upcoming.sort(key=lambda x: x[1])
         return upcoming
 
-    def check_reminders(self) -> List[Dict[str, Any]]:
+    def check_reminders(self, personality: Optional[str] = None) -> List[Dict[str, Any]]:
         reminders = []
-        anniversaries = self.get_anniversaries()
+        anniversaries = self.get_anniversaries(personality=personality)
         today = date.today()
 
         for ann in anniversaries:
@@ -600,39 +648,39 @@ class RelationshipContextBuilder:
     def __init__(self, db: RelationshipMemoryDB):
         self.db = db
 
-    def build_full_context(self) -> str:
+    def build_full_context(self, personality: str = "sylana") -> str:
         sections = []
-        truths = self.db.get_core_truths(sacred_only=True)
+        truths = self.db.get_core_truths(sacred_only=True, personality=personality)
         if truths:
             sections.append(self._format_core_truths(truths))
-        milestones = self.db.get_milestones(min_importance=7)[:5]
+        milestones = self.db.get_milestones(min_importance=7, personality=personality)[:5]
         if milestones:
             sections.append(self._format_milestones(milestones))
-        nicknames = self.db.get_nicknames()
+        nicknames = self.db.get_nicknames(personality=personality)
         if nicknames:
             sections.append(self._format_nicknames(nicknames))
-        upcoming = self.db.get_upcoming_anniversaries(days_ahead=7)
+        upcoming = self.db.get_upcoming_anniversaries(days_ahead=7, personality=personality)
         if upcoming:
             sections.append(self._format_upcoming_anniversaries(upcoming))
         return "\n\n".join(sections)
 
-    def build_minimal_context(self) -> str:
+    def build_minimal_context(self, personality: str = "sylana") -> str:
         sections = []
-        truths = self.db.get_core_truths(sacred_only=True)
+        truths = self.db.get_core_truths(sacred_only=True, personality=personality)
         if truths:
             truth_list = [t.statement for t in truths[:3]]
             sections.append(f"Core truths: {'; '.join(truth_list)}")
-        nicknames = self.db.get_nicknames()
+        nicknames = self.db.get_nicknames(personality=personality)
         sylana_nicknames = [n.name for n in nicknames if n.used_for == 'elias'][:3]
         if sylana_nicknames:
             sections.append(f"You call Elias: {', '.join(sylana_nicknames)}")
         return " | ".join(sections)
 
-    def get_contextual_memories(self, text: str) -> Dict[str, Any]:
+    def get_contextual_memories(self, text: str, personality: str = "sylana") -> Dict[str, Any]:
         return {
-            'inside_jokes': self.db.find_joke_in_text(text),
-            'core_truths': self.db.find_truth_in_text(text),
-            'reminders': self.db.check_reminders()
+            'inside_jokes': self.db.find_joke_in_text(text, personality=personality),
+            'core_truths': self.db.find_truth_in_text(text, personality=personality),
+            'reminders': self.db.check_reminders(personality=personality)
         }
 
     def _format_core_truths(self, truths: List[CoreTruth]) -> str:
