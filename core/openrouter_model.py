@@ -145,6 +145,57 @@ class OpenRouterModel:
             return {}
         return (choices[0] or {}).get("message") or {}
 
+    def _finalize_empty_response(
+        self,
+        *,
+        convo: List[Dict[str, Any]],
+        message: Dict[str, Any],
+        max_tokens: int,
+    ) -> str:
+        tool_calls = message.get("tool_calls") or []
+        content = message.get("content")
+        if tool_calls:
+            convo.append(
+                {
+                    "role": "assistant",
+                    "content": content if isinstance(content, str) else "",
+                    "tool_calls": tool_calls,
+                }
+            )
+            for call in tool_calls:
+                function = call.get("function") or {}
+                try:
+                    parsed_args = json.loads(function.get("arguments") or "{}")
+                except Exception:
+                    parsed_args = {}
+                tool_output = self._run_tool_call(str(function.get("name") or ""), parsed_args)
+                convo.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": str(call.get("id") or ""),
+                        "content": json.dumps(tool_output),
+                    }
+                )
+        convo.append(
+            {
+                "role": "user",
+                "content": (
+                    "Answer Elias directly in plain text now using the tool results and context already gathered. "
+                    "Do not call more tools."
+                ),
+            }
+        )
+        payload: Dict[str, Any] = {
+            "model": self.model,
+            "messages": convo,
+            "max_tokens": max_tokens,
+            "temperature": 0.9,
+        }
+        response = self._post_chat(payload)
+        final_message = self._extract_message(response)
+        final_content = final_message.get("content")
+        return final_content.strip() if isinstance(final_content, str) and final_content.strip() else ""
+
     def _generate_with_tools(
         self,
         system_prompt: str,
@@ -200,6 +251,18 @@ class OpenRouterModel:
                     }
                 )
 
+        logger.warning(
+            "OpenRouterModel returned empty text after tool loop (tools=%s)",
+            [tool.get("name") for tool in tools],
+        )
+        recovery_text = self._finalize_empty_response(
+            convo=convo,
+            message=message,
+            max_tokens=max_tokens,
+        )
+        if recovery_text:
+            return recovery_text
+        logger.warning("OpenRouterModel recovery still produced empty text")
         return ""
 
     def generate(

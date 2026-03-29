@@ -119,6 +119,53 @@ class ClaudeModel:
                 parts.append(text)
         return "".join(parts).strip()
 
+    def _finalize_empty_response(
+        self,
+        *,
+        convo: List[Dict[str, Any]],
+        response: Any,
+        system_with_time: str,
+        max_tokens: int,
+    ) -> str:
+        stop_reason = getattr(response, "stop_reason", None)
+        if stop_reason == "tool_use":
+            assistant_blocks = [self._response_block_to_dict(b) for b in (response.content or [])]
+            tool_results = []
+            for block in response.content or []:
+                if getattr(block, "type", None) == "tool_use":
+                    tool_output = self._run_tool_call(
+                        getattr(block, "name", ""),
+                        getattr(block, "input", {}) or {},
+                    )
+                    tool_results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": getattr(block, "id", ""),
+                            "content": json.dumps(tool_output),
+                        }
+                    )
+            if assistant_blocks:
+                convo.append({"role": "assistant", "content": assistant_blocks})
+            if tool_results:
+                convo.append({"role": "user", "content": tool_results})
+
+        convo.append(
+            {
+                "role": "user",
+                "content": (
+                    "Answer Elias directly in plain text now using the tool results and context already gathered. "
+                    "Do not call more tools."
+                ),
+            }
+        )
+        response = self.client.messages.create(
+            model=self.model,
+            max_tokens=max_tokens,
+            system=system_with_time,
+            messages=convo,
+        )
+        return self._extract_text_from_response(response)
+
     def _tools(self, active_tools: Optional[List[str]] = None) -> List[Dict[str, Any]]:
         tools: List[Dict[str, Any]] = []
         allow_web_search = True
@@ -259,7 +306,24 @@ class ClaudeModel:
                 loop_kwargs["tools"] = tools
             response = self.client.messages.create(**loop_kwargs)
 
-        return self._extract_text_from_response(response)
+        text = self._extract_text_from_response(response)
+        if text:
+            return text
+        logger.warning(
+            "ClaudeModel returned empty text after tool loop (stop_reason=%s, tools=%s)",
+            getattr(response, "stop_reason", None),
+            [tool.get("name") for tool in tools],
+        )
+        recovery_text = self._finalize_empty_response(
+            convo=convo,
+            response=response,
+            system_with_time=system_with_time,
+            max_tokens=max_tokens,
+        )
+        if recovery_text:
+            return recovery_text
+        logger.warning("ClaudeModel recovery still produced empty text")
+        return ""
 
     def generate(
         self,

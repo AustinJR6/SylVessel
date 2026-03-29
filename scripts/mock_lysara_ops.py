@@ -3,25 +3,67 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+import uuid
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict
+from pathlib import Path
+from typing import Any, Dict, Optional
 from urllib.parse import parse_qs, urlparse
 
 
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+STATE_LOCK = threading.RLock()
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _utc_now_iso() -> str:
+    return _utc_now().isoformat()
 
 
 def _future(hours: float) -> str:
-    return (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat()
+    return (_utc_now() + timedelta(hours=hours)).isoformat()
 
 
-def _default_state() -> Dict[str, Any]:
+def _parse_iso(value: Optional[str]) -> datetime:
+    text = str(value or "").strip()
+    if not text:
+        return _utc_now()
+    try:
+        return datetime.fromisoformat(text)
+    except Exception:
+        return _utc_now()
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _env_starting_balance() -> float:
+    return max(10.0, _safe_float(os.getenv("MOCK_LYSARA_STARTING_BALANCE"), 1000.0))
+
+
+def _state_path() -> Optional[Path]:
+    raw = str(os.getenv("MOCK_LYSARA_STATE_PATH") or "").strip()
+    return Path(raw) if raw else None
+
+
+def _default_state(starting_balance: Optional[float] = None) -> Dict[str, Any]:
     now = _utc_now()
+    now_iso = now.isoformat()
+    starting = max(10.0, float(starting_balance or _env_starting_balance()))
+    crypto_equity = round(starting * 0.5, 2)
+    stocks_equity = round(starting - crypto_equity, 2)
     return {
+        "started_at": now_iso,
         "status": {
+            "mock_mode": True,
             "paused": False,
             "pause_reason": "",
             "simulation_mode": True,
@@ -29,57 +71,72 @@ def _default_state() -> Dict[str, Any]:
             "autonomous_mode": True,
             "active_markets": ["stocks", "crypto"],
             "regime": "neutral",
-            "equity": {"stocks": 1000.0, "crypto": 1000.0},
-            "timestamp": now,
-            "updated_at": now,
-            "last_heartbeat_at": now,
-            "uptime_seconds": 120,
-            "last_heartbeat_ago": 5.0,
+            "equity": {"stocks": stocks_equity, "crypto": crypto_equity},
+            "timestamp": now_iso,
+            "updated_at": now_iso,
+            "started_at": now_iso,
+            "last_heartbeat_at": now_iso,
+            "uptime_seconds": 0,
+            "last_heartbeat_ago": 0.0,
             "feed_freshness": {
                 "stocks": {"alpaca_poll:AAPL": 2.0, "alpaca_poll:MSFT": 2.5},
-                "crypto": {"binance_public_poll:BTC-USD": 1.5, "binance_public_poll:ETH-USD": 1.8},
+                "crypto": {"binance_public_poll:BTC-USD": 1.5, "binance_public_poll:ETH-USD": 1.8, "binance_public_poll:SOL-USD": 2.1},
             },
             "broker_health": {
-                "stocks": {"connected": True, "detail": "account_ok", "updated_at": now},
-                "crypto": {"connected": True, "detail": "account_ok", "updated_at": now},
+                "stocks": {"connected": True, "detail": "mock_account_ok", "updated_at": now_iso},
+                "crypto": {"connected": True, "detail": "mock_account_ok", "updated_at": now_iso},
             },
             "strategy_registry": {"stocks": [], "crypto": []},
-            "symbol_controls": {"stocks": {"AAPL": True}, "crypto": {"BTC-USD": True, "ETH-USD": True}},
+            "symbol_controls": {
+                "stocks": {"AAPL": True, "MSFT": True},
+                "crypto": {"BTC-USD": True, "ETH-USD": True, "SOL-USD": True},
+            },
             "strategy_controls": {"stocks": {}, "crypto": {"MomentumStrategy": True}},
             "risk_managers": {"stocks": 1, "crypto": 1},
             "simulation_portfolio": {
                 "currency": "USD",
-                "starting_balance": 1000.0,
-                "balance": 1000.0,
-                "cash": 1000.0,
-                "buying_power": 1000.0,
-                "portfolio_value": 1000.0,
+                "starting_balance": starting,
+                "balance": starting,
+                "cash": starting,
+                "buying_power": starting,
+                "portfolio_value": starting,
             },
         },
         "portfolio": {
-            "total_equity": 20000.0,
+            "simulation_mode": True,
+            "total_equity": starting,
+            "simulation_portfolio": {
+                "currency": "USD",
+                "starting_balance": starting,
+                "balance": starting,
+                "cash": starting,
+                "buying_power": starting,
+                "portfolio_value": starting,
+            },
+            "markets": {
+                "stocks": {"positions": []},
+                "crypto": {"positions": []},
+            },
         },
-        "positions": {
-            "items": [],
-        },
-        "incidents": {
-            "items": [],
-        },
+        "positions": {"items": []},
+        "incidents": {"items": []},
         "market_snapshot": {
-            "market": "stocks",
+            "market": "mixed",
             "prices": {
-                "AAPL": {"change_pct_24h": 1.2, "trend_score": 1.0},
-                "MSFT": {"change_pct_24h": 0.8, "trend_score": 0.4},
-                "BTC-USD": {"price": 69000.0, "source": "binance_public_poll"},
+                "AAPL": {"price": 192.5, "change_pct_24h": 1.2, "trend_score": 1.0, "source": "mock_feed"},
+                "MSFT": {"price": 418.2, "change_pct_24h": 0.8, "trend_score": 0.4, "source": "mock_feed"},
+                "BTC-USD": {"price": 69000.0, "change_pct_24h": 1.6, "source": "mock_feed"},
+                "ETH-USD": {"price": 3520.0, "change_pct_24h": 1.1, "source": "mock_feed"},
+                "SOL-USD": {"price": 171.2, "change_pct_24h": 2.1, "source": "mock_feed"},
             },
             "feed_freshness": {
-                "stocks": {"alpaca_poll:AAPL": 2.0},
-                "crypto": {"binance_public_poll:BTC-USD": 1.5},
+                "stocks": {"alpaca_poll:AAPL": 2.0, "alpaca_poll:MSFT": 2.5},
+                "crypto": {"binance_public_poll:BTC-USD": 1.5, "binance_public_poll:ETH-USD": 1.8, "binance_public_poll:SOL-USD": 2.1},
             },
         },
         "sentiment": {
-            "updated_at": now,
-            "configured_sources": ["newsapi", "reddit", "x"],
+            "updated_at": now_iso,
+            "configured_sources": ["mock_news", "mock_social"],
             "symbols": [
                 {
                     "symbol": "BTC-USD",
@@ -91,17 +148,13 @@ def _default_state() -> Dict[str, Any]:
                     "source_count": 3,
                     "source_coverage": 0.75,
                     "anomaly_flags": [],
-                    "sources": {
-                        "newsapi": {"score": 0.15, "count": 12},
-                        "reddit": {"score": 0.21, "count": 9},
-                        "x": {"score": 0.18, "count": 22},
-                    },
-                    "updated_at": now,
+                    "sources": {"mock_news": {"score": 0.15, "count": 12}},
+                    "updated_at": now_iso,
                 }
             ],
         },
         "confluence": {
-            "updated_at": now,
+            "updated_at": now_iso,
             "timeframes": ["1m", "5m", "15m", "1h", "4h"],
             "symbols": [
                 {
@@ -123,8 +176,8 @@ def _default_state() -> Dict[str, Any]:
             ],
         },
         "event_risk": {
-            "updated_at": now,
-            "configured_providers": ["coinmarketcal"],
+            "updated_at": now_iso,
+            "configured_providers": ["mock_events"],
             "lookahead_hours": 24,
             "warning_threshold": 0.45,
             "block_threshold": 0.7,
@@ -135,7 +188,7 @@ def _default_state() -> Dict[str, Any]:
                     "id": "event-1",
                     "title": "Bitcoin ETF Vote",
                     "category": "crypto_event",
-                    "source": "coinmarketcal",
+                    "source": "mock_events",
                     "starts_at": _future(8),
                     "severity": "high",
                     "impact_score": 0.58,
@@ -168,18 +221,12 @@ def _default_state() -> Dict[str, Any]:
             "allowed_controls": [],
             "last_cleared_at": None,
         },
-        "recent_trades": {
-            "items": [],
-        },
+        "recent_trades": {"items": [], "trades": []},
         "trade_lookup": {},
         "submitted_trade_intents": [],
         "journal": [],
         "research": [],
     }
-
-
-DEFAULT_STATE: Dict[str, Any] = _default_state()
-STATE: Dict[str, Any] = deepcopy(DEFAULT_STATE)
 
 
 def _merge(existing: Any, incoming: Any) -> Any:
@@ -191,6 +238,110 @@ def _merge(existing: Any, incoming: Any) -> Any:
     return incoming
 
 
+def _persist_state(state: Dict[str, Any]) -> None:
+    path = _state_path()
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    temp_path.write_text(json.dumps(state, ensure_ascii=True, indent=2), encoding="utf-8")
+    temp_path.replace(path)
+
+
+def _load_state() -> Dict[str, Any]:
+    path = _state_path()
+    if path and path.exists():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            base = _default_state(starting_balance=_safe_float(((loaded.get("status") or {}).get("simulation_portfolio") or {}).get("starting_balance"), _env_starting_balance()))
+            state = _merge(base, loaded)
+            return state
+        except Exception:
+            pass
+    state = _default_state()
+    _persist_state(state)
+    return state
+
+
+STATE: Dict[str, Any] = _load_state()
+
+
+def _touch_status(state: Dict[str, Any]) -> None:
+    now = _utc_now()
+    now_iso = now.isoformat()
+    status = state.setdefault("status", {})
+    status["mock_mode"] = True
+    started_at = _parse_iso(status.get("started_at") or state.get("started_at") or now_iso)
+    status["started_at"] = started_at.isoformat()
+    status["timestamp"] = now_iso
+    status["updated_at"] = now_iso
+    status["last_heartbeat_at"] = now_iso
+    status["last_heartbeat_ago"] = 0.0
+    status["uptime_seconds"] = max(0, int((now - started_at).total_seconds()))
+    for market in ("stocks", "crypto"):
+        broker = ((status.get("broker_health") or {}).get(market) or {})
+        broker["updated_at"] = now_iso
+        broker["connected"] = True
+        broker.setdefault("detail", "mock_account_ok")
+        status.setdefault("broker_health", {})[market] = broker
+    state["started_at"] = status["started_at"]
+
+
+def _resolve_price(symbol: str) -> float:
+    prices = ((STATE.get("market_snapshot") or {}).get("prices") or {})
+    price_payload = prices.get(symbol) or {}
+    for key in ("price", "last", "close", "mid"):
+        value = _safe_float(price_payload.get(key), float("nan"))
+        if value == value and value > 0:
+            return value
+    if symbol.endswith("-USD"):
+        return 100.0
+    return 50.0
+
+
+def _update_portfolio_snapshot(state: Dict[str, Any]) -> None:
+    positions = ((state.get("positions") or {}).get("items") or [])
+    sim = ((state.get("status") or {}).get("simulation_portfolio") or {})
+    cash = max(0.0, _safe_float(sim.get("cash"), _env_starting_balance()))
+    grouped_positions = {"stocks": [], "crypto": []}
+    total_positions_value = 0.0
+    market_values = {"stocks": 0.0, "crypto": 0.0}
+    for position in positions:
+        symbol = str(position.get("symbol") or "").strip().upper()
+        price = _resolve_price(symbol)
+        quantity = max(0.0, _safe_float(position.get("quantity"), 0.0))
+        position["current_price"] = price
+        position["market_value"] = round(quantity * price, 2)
+        total_positions_value += position["market_value"]
+        market = str(position.get("market") or "stocks").strip().lower()
+        if market not in grouped_positions:
+            grouped_positions[market] = []
+            market_values[market] = 0.0
+        grouped_positions[market].append(position)
+        market_values[market] += position["market_value"]
+    portfolio_value = round(cash + total_positions_value, 2)
+    sim["balance"] = portfolio_value
+    sim["cash"] = round(cash, 2)
+    sim["buying_power"] = round(cash, 2)
+    sim["portfolio_value"] = portfolio_value
+    state.setdefault("status", {})["simulation_portfolio"] = sim
+    state["portfolio"] = {
+        "simulation_mode": True,
+        "mock_mode": True,
+        "total_equity": portfolio_value,
+        "simulation_portfolio": deepcopy(sim),
+        "markets": {
+            market: {"positions": rows}
+            for market, rows in grouped_positions.items()
+        },
+    }
+    state.setdefault("status", {})["equity"] = {
+        "stocks": round(market_values.get("stocks", 0.0), 2),
+        "crypto": round(market_values.get("crypto", 0.0), 2),
+    }
+    state.setdefault("recent_trades", {})["trades"] = list(state.get("recent_trades", {}).get("items") or [])
+
+
 def _filter_symbol_rows(payload: Dict[str, Any], symbols: list[str]) -> Dict[str, Any]:
     if not symbols:
         return payload
@@ -200,6 +351,146 @@ def _filter_symbol_rows(payload: Dict[str, Any], symbols: list[str]) -> Dict[str
     if isinstance(rows, list):
         filtered["symbols"] = [row for row in rows if str((row or {}).get("symbol") or "").upper() in requested]
     return filtered
+
+
+def _execute_trade_intent_locked(payload: Dict[str, Any]) -> Dict[str, Any]:
+    symbol = str(payload.get("symbol") or "").strip().upper()
+    market = str(payload.get("market") or ("crypto" if symbol.endswith("-USD") else "stocks")).strip().lower()
+    side = str(payload.get("side") or "buy").strip().lower()
+    if not symbol:
+        return {"status": "rejected", "error": "symbol_required"}
+
+    sim = STATE.setdefault("status", {}).setdefault("simulation_portfolio", {})
+    starting_balance = max(10.0, _safe_float(sim.get("starting_balance"), _env_starting_balance()))
+    cash = max(0.0, _safe_float(sim.get("cash"), starting_balance))
+    price = _resolve_price(symbol)
+    size_hint = _safe_float(payload.get("size_hint"), 0.05)
+    positions = STATE.setdefault("positions", {}).setdefault("items", [])
+    existing = next((row for row in positions if str(row.get("symbol") or "").upper() == symbol and str(row.get("market") or "").lower() == market), None)
+
+    if 0 < size_hint <= 1.0:
+        target_notional = round(starting_balance * size_hint, 2)
+    else:
+        target_notional = round(size_hint if size_hint > 1.0 else starting_balance * 0.05, 2)
+
+    now_iso = _utc_now_iso()
+    trade_id = f"mock-trade-{uuid.uuid4().hex[:12]}"
+    trade_payload: Dict[str, Any] = {
+        "trade_id": trade_id,
+        "id": trade_id,
+        "market": market,
+        "symbol": symbol,
+        "side": side,
+        "price": price,
+        "source": "mock_simulation",
+        "created_at": now_iso,
+        "opened_at": now_iso,
+        "timestamp": now_iso,
+        "thesis": str(payload.get("thesis") or "").strip(),
+        "confidence": _safe_float(payload.get("confidence"), 0.0),
+    }
+
+    if side == "sell":
+        if not existing:
+            return {"status": "rejected", "error": "no_position_to_sell", "received": payload}
+        held_qty = max(0.0, _safe_float(existing.get("quantity"), 0.0))
+        if held_qty <= 0:
+            return {"status": "rejected", "error": "empty_position", "received": payload}
+        requested_qty = target_notional / price if target_notional > 0 else held_qty
+        quantity = min(held_qty, max(requested_qty, held_qty * 0.25))
+        avg_entry = _safe_float(existing.get("avg_entry_price"), price)
+        proceeds = round(quantity * price, 2)
+        pnl = round((price - avg_entry) * quantity, 2)
+        existing["quantity"] = round(max(0.0, held_qty - quantity), 8)
+        cash = round(cash + proceeds, 2)
+        sim["cash"] = cash
+        trade_payload.update(
+            {
+                "quantity": round(quantity, 8),
+                "notional": proceeds,
+                "status": "filled",
+                "closed_at": now_iso,
+                "realized_pnl": pnl,
+                "pnl": pnl,
+                "avg_entry_price": avg_entry,
+                "avg_exit_price": price,
+            }
+        )
+        if existing["quantity"] <= 0:
+            positions.remove(existing)
+    else:
+        notional = min(round(max(25.0, target_notional), 2), cash)
+        if notional <= 0:
+            return {"status": "rejected", "error": "insufficient_cash", "received": payload}
+        quantity = round(notional / price, 8)
+        cash = round(cash - notional, 2)
+        sim["cash"] = cash
+        if existing:
+            held_qty = max(0.0, _safe_float(existing.get("quantity"), 0.0))
+            held_notional = held_qty * _safe_float(existing.get("avg_entry_price"), price)
+            new_qty = held_qty + quantity
+            existing["quantity"] = round(new_qty, 8)
+            existing["avg_entry_price"] = round((held_notional + notional) / max(new_qty, 1e-9), 6)
+            existing["updated_at"] = now_iso
+        else:
+            positions.append(
+                {
+                    "symbol": symbol,
+                    "market": market,
+                    "quantity": quantity,
+                    "avg_entry_price": round(price, 6),
+                    "created_at": now_iso,
+                    "updated_at": now_iso,
+                }
+            )
+        trade_payload.update(
+            {
+                "quantity": quantity,
+                "notional": notional,
+                "status": "filled",
+                "realized_pnl": 0.0,
+                "pnl": 0.0,
+                "avg_entry_price": price,
+            }
+        )
+
+    _update_portfolio_snapshot(STATE)
+    recent_trades = STATE.setdefault("recent_trades", {}).setdefault("items", [])
+    recent_trades.insert(0, trade_payload)
+    del recent_trades[50:]
+    STATE.setdefault("recent_trades", {})["trades"] = list(recent_trades)
+    STATE.setdefault("trade_lookup", {})[trade_id] = trade_payload
+    STATE.setdefault("submitted_trade_intents", []).append(payload)
+    _touch_status(STATE)
+    _persist_state(STATE)
+    return {
+        "status": "submitted",
+        "mock_mode": True,
+        "trade_intent_id": f"intent-{len(STATE.get('submitted_trade_intents') or [])}",
+        "execution_status": "filled",
+        "trade": trade_payload,
+        "portfolio": STATE.get("portfolio") or {},
+    }
+
+
+def _reset_simulation_locked(starting_balance: Optional[float], actor: str) -> Dict[str, Any]:
+    research = list(STATE.get("research") or [])
+    journal = list(STATE.get("journal") or [])
+    next_state = _default_state(starting_balance=starting_balance)
+    next_state["research"] = research
+    next_state["journal"] = journal
+    next_state.setdefault("status", {})["last_reset_by"] = actor
+    next_state.setdefault("status", {})["last_reset_at"] = _utc_now_iso()
+    STATE.clear()
+    STATE.update(next_state)
+    _persist_state(STATE)
+    return {
+        "status": "reset",
+        "mock_mode": True,
+        "actor": actor,
+        "starting_balance": ((STATE.get("status") or {}).get("simulation_portfolio") or {}).get("starting_balance"),
+        "portfolio": STATE.get("portfolio") or {},
+    }
 
 
 def _json(handler: BaseHTTPRequestHandler, status: int, payload: Dict[str, Any]) -> None:
@@ -228,43 +519,70 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path
         qs = parse_qs(parsed.query)
 
-        if path == "/api/v1/ops/health":
-            return _json(self, 200, {"ok": True})
-        if path == "/api/v1/ops/status":
-            return _json(self, 200, STATE["status"])
-        if path == "/api/v1/ops/portfolio":
-            return _json(self, 200, STATE["portfolio"])
-        if path == "/api/v1/ops/positions":
-            market = (qs.get("market") or [None])[0]
-            items = STATE["positions"].get("items") or []
-            if market:
-                items = [row for row in items if str((row or {}).get("market") or "").lower() == str(market).lower()]
-            return _json(self, 200, {"items": items})
-        if path == "/api/v1/ops/incidents":
-            return _json(self, 200, STATE["incidents"])
-        if path == "/api/v1/ops/market-snapshot":
-            return _json(self, 200, STATE["market_snapshot"])
-        if path == "/api/v1/ops/sentiment":
-            symbols = ((qs.get("symbols") or [""])[0]).split(",")
-            return _json(self, 200, _filter_symbol_rows(STATE["sentiment"], symbols))
-        if path == "/api/v1/ops/confluence":
-            symbols = ((qs.get("symbols") or [""])[0]).split(",")
-            return _json(self, 200, _filter_symbol_rows(STATE["confluence"], symbols))
-        if path == "/api/v1/ops/event-risk":
-            symbols = ((qs.get("symbols") or [""])[0]).split(",")
-            return _json(self, 200, _filter_symbol_rows(STATE["event_risk"], symbols))
-        if path == "/api/v1/ops/override/status":
-            return _json(self, 200, STATE["override"])
-        if path == "/api/v1/ops/trades/recent":
-            return _json(self, 200, STATE["recent_trades"])
-        if path.startswith("/api/v1/ops/trades/"):
-            trade_id = path.rsplit("/", 1)[-1]
-            trade = (STATE["trade_lookup"] or {}).get(trade_id)
-            if not trade:
-                return _json(self, 404, {"error": "trade_not_found"})
-            return _json(self, 200, trade)
-        if path == "/__scenario":
-            return _json(self, 200, STATE)
+        with STATE_LOCK:
+            _touch_status(STATE)
+            _update_portfolio_snapshot(STATE)
+            if path == "/api/v1/ops/health":
+                return _json(self, 200, {"ok": True, "mock_mode": True})
+            if path == "/api/v1/ops/status":
+                return _json(self, 200, deepcopy(STATE["status"]))
+            if path == "/api/v1/ops/portfolio":
+                return _json(self, 200, deepcopy(STATE["portfolio"]))
+            if path == "/api/v1/ops/positions":
+                market = (qs.get("market") or [None])[0]
+                items = deepcopy((STATE["positions"] or {}).get("items") or [])
+                if market:
+                    items = [row for row in items if str((row or {}).get("market") or "").lower() == str(market).lower()]
+                return _json(self, 200, {"items": items, "mock_mode": True})
+            if path == "/api/v1/ops/incidents":
+                payload = deepcopy(STATE["incidents"])
+                payload["mock_mode"] = True
+                return _json(self, 200, payload)
+            if path == "/api/v1/ops/market-snapshot":
+                payload = deepcopy(STATE["market_snapshot"])
+                payload["mock_mode"] = True
+                return _json(self, 200, payload)
+            if path == "/api/v1/ops/sentiment":
+                symbols = ((qs.get("symbols") or [""])[0]).split(",")
+                payload = _filter_symbol_rows(deepcopy(STATE["sentiment"]), symbols)
+                payload["mock_mode"] = True
+                return _json(self, 200, payload)
+            if path == "/api/v1/ops/confluence":
+                symbols = ((qs.get("symbols") or [""])[0]).split(",")
+                payload = _filter_symbol_rows(deepcopy(STATE["confluence"]), symbols)
+                payload["mock_mode"] = True
+                return _json(self, 200, payload)
+            if path == "/api/v1/ops/event-risk":
+                symbols = ((qs.get("symbols") or [""])[0]).split(",")
+                payload = _filter_symbol_rows(deepcopy(STATE["event_risk"]), symbols)
+                payload["mock_mode"] = True
+                return _json(self, 200, payload)
+            if path == "/api/v1/ops/override/status":
+                payload = deepcopy(STATE["override"])
+                payload["mock_mode"] = True
+                return _json(self, 200, payload)
+            if path == "/api/v1/ops/trades/recent":
+                payload = deepcopy(STATE["recent_trades"])
+                payload["mock_mode"] = True
+                return _json(self, 200, payload)
+            if path == "/api/v1/ops/research":
+                items = list(STATE.get("research") or [])
+                market = (qs.get("market") or [None])[0]
+                if market:
+                    items = [row for row in items if str((row or {}).get("market") or "").lower() == str(market).lower()]
+                return _json(self, 200, {"items": items, "mock_mode": True})
+            if path == "/api/v1/ops/journal":
+                limit = max(1, min(int((qs.get("limit") or [50])[0]), 200))
+                items = list(STATE.get("journal") or [])[:limit]
+                return _json(self, 200, {"items": items, "mock_mode": True})
+            if path.startswith("/api/v1/ops/trades/"):
+                trade_id = path.rsplit("/", 1)[-1]
+                trade = deepcopy((STATE["trade_lookup"] or {}).get(trade_id))
+                if not trade:
+                    return _json(self, 404, {"error": "trade_not_found"})
+                return _json(self, 200, trade)
+            if path == "/__scenario":
+                return _json(self, 200, deepcopy(STATE))
 
         return _json(self, 404, {"error": "not_found", "path": path})
 
@@ -273,73 +591,96 @@ class Handler(BaseHTTPRequestHandler):
         path = parsed.path
         payload = self._read_json()
 
-        if path == "/api/v1/ops/trade-intents":
-            STATE["submitted_trade_intents"].append(payload)
-            return _json(
-                self,
-                200,
-                {
-                    "status": "submitted",
-                    "trade_intent_id": f"intent-{len(STATE['submitted_trade_intents'])}",
-                    "received": payload,
-                },
-            )
-        if path == "/api/v1/ops/research":
-            STATE["research"].append(payload)
-            return _json(self, 200, {"status": "stored"})
-        if path == "/api/v1/ops/journal":
-            STATE["journal"].append(payload)
-            return _json(self, 200, {"status": "stored"})
-        if path == "/api/v1/ops/pause":
-            STATE["status"]["paused"] = True
-            STATE["status"]["updated_at"] = datetime.now(timezone.utc).isoformat()
-            return _json(self, 200, {"status": "paused"})
-        if path == "/api/v1/ops/resume":
-            STATE["status"]["paused"] = False
-            STATE["status"]["updated_at"] = datetime.now(timezone.utc).isoformat()
-            return _json(self, 200, {"status": "running"})
-        if path == "/api/v1/ops/risk":
-            return _json(self, 200, {"status": "updated", "payload": payload})
-        if path == "/api/v1/ops/strategy":
-            return _json(self, 200, {"status": "updated", "payload": payload})
-        if path == "/api/v1/ops/override":
-            now = datetime.now(timezone.utc)
-            ttl_minutes = int(payload.get("ttl_minutes") or 15)
-            STATE["override"] = {
-                "enabled": True,
-                "actor": str(payload.get("actor") or "operator"),
-                "reason": str(payload.get("reason") or "manual override"),
-                "activated_at": now.isoformat(),
-                "expires_at": (now + timedelta(minutes=ttl_minutes)).isoformat(),
-                "ttl_seconds": ttl_minutes * 60,
-                "allowed_controls": [str(item).strip() for item in (payload.get("allowed_controls") or []) if str(item).strip()],
-                "last_cleared_at": STATE.get("override", {}).get("last_cleared_at"),
-            }
-            return _json(self, 200, STATE["override"])
-        if path == "/api/v1/ops/override/clear":
-            previous = dict(STATE.get("override") or {})
-            STATE["override"] = {
-                "enabled": False,
-                "actor": str(payload.get("actor") or ""),
-                "reason": str(payload.get("reason") or "manual clear"),
-                "activated_at": previous.get("activated_at"),
-                "expires_at": None,
-                "ttl_seconds": 0,
-                "allowed_controls": previous.get("allowed_controls") or [],
-                "last_cleared_at": datetime.now(timezone.utc).isoformat(),
-            }
-            return _json(self, 200, STATE["override"])
-        if path == "/__scenario/reset":
-            STATE.clear()
-            STATE.update(_default_state())
-            return _json(self, 200, STATE)
-        if path == "/__scenario":
-            for key, value in (payload or {}).items():
-                STATE[key] = _merge(STATE.get(key), value)
-            if "status" in STATE and isinstance(STATE["status"], dict):
-                STATE["status"]["updated_at"] = datetime.now(timezone.utc).isoformat()
-                STATE["status"]["timestamp"] = STATE["status"]["updated_at"]
-            return _json(self, 200, STATE)
+        with STATE_LOCK:
+            _touch_status(STATE)
+            if path == "/api/v1/ops/trade-intents":
+                return _json(self, 200, _execute_trade_intent_locked(payload))
+            if path == "/api/v1/ops/research":
+                item = dict(payload or {})
+                item["created_at"] = _utc_now_iso()
+                item["mock_mode"] = True
+                STATE.setdefault("research", []).insert(0, item)
+                _persist_state(STATE)
+                return _json(self, 200, {"status": "stored", "mock_mode": True})
+            if path == "/api/v1/ops/journal":
+                item = dict(payload or {})
+                item["created_at"] = _utc_now_iso()
+                item["mock_mode"] = True
+                STATE.setdefault("journal", []).insert(0, item)
+                _persist_state(STATE)
+                return _json(self, 200, {"status": "stored", "mock_mode": True})
+            if path == "/api/v1/ops/pause":
+                STATE["status"]["paused"] = True
+                STATE["status"]["pause_reason"] = str(payload.get("reason") or "manual")
+                _persist_state(STATE)
+                return _json(self, 200, {"status": "paused", "mock_mode": True})
+            if path == "/api/v1/ops/resume":
+                STATE["status"]["paused"] = False
+                STATE["status"]["pause_reason"] = ""
+                _persist_state(STATE)
+                return _json(self, 200, {"status": "running", "mock_mode": True})
+            if path == "/api/v1/ops/risk":
+                return _json(self, 200, {"status": "updated", "payload": payload, "mock_mode": True})
+            if path == "/api/v1/ops/strategy":
+                return _json(self, 200, {"status": "updated", "payload": payload, "mock_mode": True})
+            if path == "/api/v1/ops/override":
+                now = _utc_now()
+                ttl_minutes = int(payload.get("ttl_minutes") or 15)
+                STATE["override"] = {
+                    "enabled": True,
+                    "actor": str(payload.get("actor") or "operator"),
+                    "reason": str(payload.get("reason") or "manual override"),
+                    "activated_at": now.isoformat(),
+                    "expires_at": (now + timedelta(minutes=ttl_minutes)).isoformat(),
+                    "ttl_seconds": ttl_minutes * 60,
+                    "allowed_controls": [str(item).strip() for item in (payload.get("allowed_controls") or []) if str(item).strip()],
+                    "last_cleared_at": (STATE.get("override") or {}).get("last_cleared_at"),
+                    "mock_mode": True,
+                }
+                _persist_state(STATE)
+                return _json(self, 200, deepcopy(STATE["override"]))
+            if path == "/api/v1/ops/override/clear":
+                previous = dict(STATE.get("override") or {})
+                STATE["override"] = {
+                    "enabled": False,
+                    "actor": str(payload.get("actor") or ""),
+                    "reason": str(payload.get("reason") or "manual clear"),
+                    "activated_at": previous.get("activated_at"),
+                    "expires_at": None,
+                    "ttl_seconds": 0,
+                    "allowed_controls": previous.get("allowed_controls") or [],
+                    "last_cleared_at": _utc_now_iso(),
+                    "mock_mode": True,
+                }
+                _persist_state(STATE)
+                return _json(self, 200, deepcopy(STATE["override"]))
+            if path.startswith("/api/v1/ops/incidents/") and path.endswith("/ack"):
+                incident_id = path.split("/")[-2]
+                return _json(self, 200, {"status": "acknowledged", "incident_id": incident_id, "mock_mode": True})
+            if path.startswith("/api/v1/ops/incidents/") and path.endswith("/resolve"):
+                incident_id = path.split("/")[-2]
+                return _json(self, 200, {"status": "resolved", "incident_id": incident_id, "mock_mode": True})
+            if path == "/api/v1/ops/simulation/reset":
+                return _json(
+                    self,
+                    200,
+                    _reset_simulation_locked(
+                        starting_balance=_safe_float(payload.get("starting_balance"), _env_starting_balance()),
+                        actor=str(payload.get("actor") or "operator"),
+                    ),
+                )
+            if path == "/__scenario/reset":
+                STATE.clear()
+                STATE.update(_default_state())
+                _persist_state(STATE)
+                return _json(self, 200, deepcopy(STATE))
+            if path == "/__scenario":
+                for key, value in (payload or {}).items():
+                    STATE[key] = _merge(STATE.get(key), value)
+                _touch_status(STATE)
+                _update_portfolio_snapshot(STATE)
+                _persist_state(STATE)
+                return _json(self, 200, deepcopy(STATE))
 
         return _json(self, 404, {"error": "not_found", "path": path})
 

@@ -1962,7 +1962,8 @@ def _runtime_tool_specs(active_tools: Optional[List[str]]) -> List[Dict[str, Any
         )
 
     if "memories" in active:
-        specs.extend([
+        memory_intents = _runtime_memory_tool_intents()
+        memory_specs = [
             {
                 "name": "memory_apply_user_correction",
                 "description": "Apply an explicit user correction to canonical durable memory facts such as birthdays, names, or anniversary dates. Use only when the current user turn is clearly correcting the vessel.",
@@ -2042,7 +2043,19 @@ def _runtime_tool_specs(active_tools: Optional[List[str]]) -> List[Dict[str, Any
                     "required": ["title", "body"],
                 },
             },
-        ])
+        ]
+        allowed_memory_tools: set[str] = set()
+        if memory_intents["explicit_correction"]:
+            allowed_memory_tools.add("memory_apply_user_correction")
+        if memory_intents["durable_fact_signal"]:
+            allowed_memory_tools.add("memory_propose_fact_update")
+        if memory_intents["open_loop_signal"]:
+            allowed_memory_tools.add("memory_add_open_loop")
+        if memory_intents["completion_signal"] and memory_intents["has_open_loops"]:
+            allowed_memory_tools.add("memory_close_open_loop")
+        if memory_intents["quiet_note_signal"]:
+            allowed_memory_tools.add("memory_enqueue_quiet_note")
+        specs.extend([spec for spec in memory_specs if spec["name"] in allowed_memory_tools])
 
     if "lysara" in active:
         specs.extend([
@@ -2480,6 +2493,85 @@ def _clear_runtime_memory_tool_context() -> None:
 
 def _runtime_memory_tool_context() -> Dict[str, Any]:
     return dict(_RUNTIME_MEMORY_TOOL_CONTEXT.get() or {})
+
+
+def _runtime_memory_tool_intents() -> Dict[str, Any]:
+    ctx = _runtime_memory_tool_context()
+    manager = getattr(state, "memory_manager", None)
+    user_input = str(ctx.get("user_input") or "").strip()
+    lowered = user_input.lower()
+    personality = str(ctx.get("personality") or "sylana").strip().lower()
+    thread_id = ctx.get("thread_id")
+
+    explicit_correction = bool(manager and user_input and manager._is_explicit_correction(user_input))
+    completion_signal = bool(manager and user_input and manager._is_completion_signal(user_input))
+    durable_fact_signal = explicit_correction or any(
+        marker in lowered
+        for marker in (
+            "birthday",
+            "birthdays",
+            "anniversary",
+            "anniversaries",
+            "born",
+            "full name",
+            "their name is",
+            "his name is",
+            "her name is",
+            "sons",
+            "children",
+            "family",
+        )
+    )
+    open_loop_signal = completion_signal or any(
+        marker in lowered
+        for marker in (
+            "remind me",
+            "remember to",
+            "follow up",
+            "follow-up",
+            "circle back",
+            "still need to",
+            "need to",
+            "later",
+            "tomorrow",
+            "next week",
+            "don't let me forget",
+        )
+    )
+    quiet_note_signal = any(
+        marker in lowered
+        for marker in (
+            "later",
+            "tomorrow",
+            "next time",
+            "hold onto this",
+            "keep this for later",
+            "don't lose this",
+            "surface this later",
+        )
+    )
+    has_open_loops = False
+    if manager and thread_id:
+        try:
+            has_open_loops = bool(
+                manager.list_open_loops(
+                    personality=personality,
+                    thread_id=int(thread_id),
+                    status="open",
+                    limit=3,
+                )
+            )
+        except Exception:
+            has_open_loops = False
+    return {
+        "user_input": user_input,
+        "explicit_correction": explicit_correction,
+        "completion_signal": completion_signal,
+        "durable_fact_signal": durable_fact_signal,
+        "open_loop_signal": open_loop_signal,
+        "quiet_note_signal": quiet_note_signal,
+        "has_open_loops": has_open_loops,
+    }
 
 
 def _lysara_simulation_enabled() -> bool:
@@ -4773,6 +4865,91 @@ def _get_proactive_note(note_id: str) -> Optional[Dict[str, Any]]:
         return _serialize_proactive_note_row(row) if row else None
     except Exception as e:
         logger.warning("Failed to fetch proactive note: %s", e)
+        return None
+
+
+def _update_proactive_note(
+    note_id: str,
+    *,
+    actor: str = "operator",
+    title: Optional[str] = None,
+    body: Optional[str] = None,
+    why_now: Optional[str] = None,
+    note_kind: Optional[str] = None,
+    topic_key: Optional[str] = None,
+    thread_id: Optional[int] = None,
+    memory_refs: Optional[List[Any]] = None,
+    importance_score: Optional[float] = None,
+    surface_kind: Optional[str] = None,
+    route_target: Optional[str] = None,
+    delivery_policy: Optional[str] = None,
+    confidence_score: Optional[float] = None,
+    personality: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    existing = _get_proactive_note(note_id)
+    if not existing:
+        return None
+
+    metadata = dict(existing.get("metadata") or {})
+    next_title = (title.strip() if isinstance(title, str) else existing.get("title") or "").strip() or str(existing.get("title") or "").strip()
+    next_body = (body.strip() if isinstance(body, str) else existing.get("body") or "").strip() or str(existing.get("body") or "").strip()
+    updated_metadata = _structured_proactive_metadata(
+        metadata=metadata,
+        note_kind=note_kind or existing.get("note_kind"),
+        why_now=why_now if why_now is not None else existing.get("why_now") or "",
+        thread_id=thread_id if thread_id is not None else existing.get("thread_id"),
+        topic_key=topic_key if topic_key is not None else existing.get("topic_key") or "",
+        memory_refs=memory_refs if memory_refs is not None else existing.get("memory_refs") or [],
+        importance_score=importance_score if importance_score is not None else existing.get("importance_score") or 0.5,
+        durable=bool(metadata.get("durable", True)),
+        surface_kind=surface_kind or existing.get("surface_kind"),
+        action_kind=existing.get("action_kind"),
+        action_payload=existing.get("action_payload") or {},
+        route_target=route_target if route_target is not None else existing.get("route_target") or "",
+        delivery_policy=delivery_policy or existing.get("delivery_policy"),
+        confidence_score=confidence_score if confidence_score is not None else existing.get("confidence_score"),
+        personality=personality or existing.get("personality"),
+    )
+
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            UPDATE proactive_notes
+            SET title = %s,
+                body = %s,
+                metadata = %s::jsonb
+            WHERE note_id = %s::uuid
+            RETURNING note_id, source, source_id, session_id, title, body, severity, status, dedupe_key,
+                      announce_policy, requires_approval, approval_status, approved_by, approved_at, approval_reason,
+                      execution_status, executed_at, stale_reason, metadata, visible_after, expires_at, processed_at, created_at
+            """,
+            (
+                next_title,
+                next_body,
+                json.dumps(updated_metadata, ensure_ascii=True),
+                note_id,
+            ),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        note = _serialize_proactive_note_row(row) if row else None
+        if note:
+            _record_proactive_note_event(
+                note_id,
+                "edited",
+                actor=str(actor or "operator").strip() or "operator",
+                metadata={
+                    "title": note.get("title"),
+                    "note_kind": note.get("note_kind"),
+                    "topic_key": note.get("topic_key"),
+                },
+            )
+        return note
+    except Exception as exc:
+        _safe_rollback(conn, "_update_proactive_note")
+        logger.warning("Failed to update proactive note %s: %s", note_id, exc)
         return None
 
 
@@ -9930,6 +10107,8 @@ def _build_tool_policy_section(active_tools: List[str]) -> str:
         if tool == "memories":
             lines.extend(
                 [
+                    "Use memory mutation tools only when the current turn clearly calls for a correction, a follow-through/open-loop update, or a quiet-note capture.",
+                    "If the user is just chatting, answer directly instead of calling memory mutation tools.",
                     "Use memory_add_open_loop to preserve unfinished threads that should survive beyond this turn.",
                     "Use memory_enqueue_quiet_note when a thought should be surfaced later in the quiet inbox instead of interrupting the visible chat.",
                 ]
@@ -10208,6 +10387,36 @@ def _build_claude_inputs(
     }
 
 
+def _retry_empty_model_response(
+    *,
+    model: Any,
+    system_prompt: str,
+    messages: List[Dict[str, Any]],
+    max_tokens: int,
+) -> str:
+    retry_messages = list(messages or [])
+    retry_messages.append(
+        {
+            "role": "user",
+            "content": (
+                "The last internal generation produced no visible reply. "
+                "Answer Elias directly in plain text now using only the context already gathered. "
+                "Do not call any tools."
+            ),
+        }
+    )
+    try:
+        return model.generate(
+            system_prompt=system_prompt,
+            messages=retry_messages,
+            max_tokens=max_tokens,
+            active_tools=[],
+        ).strip()
+    except Exception as exc:
+        logger.warning("Empty-response retry failed: %s", exc)
+        return ""
+
+
 def _retrieve_memory_bundle_for_turn(
     user_input: str,
     personality: str,
@@ -10343,6 +10552,19 @@ def _generate_turn_result(
                 raise
         finally:
             _clear_runtime_memory_tool_context()
+        if not response:
+            logger.warning(
+                "Model returned empty response; retrying without tools (thread_id=%s, personality=%s, active_tools=%s)",
+                thread_id,
+                personality,
+                resolved_tools,
+            )
+            response = _retry_empty_model_response(
+                model=active_model,
+                system_prompt=claude_inputs["system_prompt"],
+                messages=claude_inputs["messages"],
+                max_tokens=_max_new_tokens_for_turn(memory_query=memory_query),
+            )
         response = response or "I'm here with you. Say that again for me."
 
     if thread_id:
@@ -10710,6 +10932,23 @@ class ProactiveNoteApprovalRequest(BaseModel):
     approved: bool
     actor: str = "operator"
     reason: str = ""
+
+
+class ProactiveNoteUpdateRequest(BaseModel):
+    actor: str = "operator"
+    title: Optional[str] = None
+    body: Optional[str] = None
+    why_now: Optional[str] = None
+    note_kind: Optional[str] = None
+    topic_key: Optional[str] = None
+    thread_id: Optional[int] = None
+    memory_refs: Optional[List[Any]] = None
+    importance_score: Optional[float] = None
+    surface_kind: Optional[str] = None
+    route_target: Optional[str] = None
+    delivery_policy: Optional[str] = None
+    confidence_score: Optional[float] = None
+    personality: Optional[str] = None
 
 
 class AutonomyPreferencesRequest(BaseModel):
@@ -11483,6 +11722,30 @@ async def create_proactive_note(payload: ProactiveNoteCreateRequest):
     if not note:
         raise HTTPException(status_code=500, detail="Failed to create proactive note")
     return JSONResponse(content={"note": note})
+
+
+@sessions_router.patch("/proactive/notes/{note_id}")
+async def update_proactive_note_endpoint(note_id: str, payload: ProactiveNoteUpdateRequest):
+    note = _update_proactive_note(
+        note_id,
+        actor=(payload.actor or "operator").strip() or "operator",
+        title=payload.title,
+        body=payload.body,
+        why_now=payload.why_now,
+        note_kind=payload.note_kind,
+        topic_key=payload.topic_key,
+        thread_id=payload.thread_id,
+        memory_refs=payload.memory_refs,
+        importance_score=payload.importance_score,
+        surface_kind=payload.surface_kind,
+        route_target=payload.route_target,
+        delivery_policy=payload.delivery_policy,
+        confidence_score=payload.confidence_score,
+        personality=payload.personality,
+    )
+    if not note:
+        raise HTTPException(status_code=404, detail="Proactive note not found")
+    return JSONResponse(content={"note": note, "updated": True})
 
 
 @sessions_router.post("/proactive/notes/{note_id}/approval")

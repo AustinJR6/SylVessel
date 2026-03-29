@@ -3483,6 +3483,33 @@ class MemoryManager:
         logger.info(f"Added core memory {memory_id}: {event[:50]}...")
         return memory_id
 
+    @staticmethod
+    def _fact_source_rank(source_kind: str) -> int:
+        ranks = {
+            "user_correction": 5,
+            "manual": 4,
+            "anniversary": 4,
+            "memory_promotion": 3,
+            "episode_backfill": 2,
+            "anniversary_fallback": 1,
+        }
+        return ranks.get(str(source_kind or "").strip().lower(), 2)
+
+    def _should_preserve_existing_fact(self, existing: Optional[Dict[str, Any]], incoming_source_kind: str, incoming_confidence: float) -> bool:
+        if not existing:
+            return False
+        existing_rank = self._fact_source_rank(existing.get("source_kind") or "")
+        incoming_rank = self._fact_source_rank(incoming_source_kind)
+        try:
+            existing_confidence = float(existing.get("confidence") or 0.0)
+        except Exception:
+            existing_confidence = 0.0
+        if incoming_rank < existing_rank and existing_confidence >= float(incoming_confidence or 0.0):
+            return True
+        if (existing.get("source_kind") or "").strip().lower() == "user_correction" and incoming_rank <= existing_rank:
+            return True
+        return False
+
     def _humanize_date(self, value: str) -> str:
         raw = (value or "").strip()
         if not raw:
@@ -3541,9 +3568,12 @@ class MemoryManager:
         source_kind: str = "manual",
         source_ref: str = "",
     ) -> Dict[str, Any]:
+        scope = self._normalize_scope(personality_scope)
+        existing = self._get_memory_fact(fact_key, scope)
+        if self._should_preserve_existing_fact(existing, source_kind, float(confidence)):
+            return existing
         conn = get_connection()
         cur = conn.cursor()
-        scope = self._normalize_scope(personality_scope)
         payload = value_json or {}
         try:
             cur.execute(

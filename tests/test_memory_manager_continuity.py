@@ -328,6 +328,36 @@ class MemoryContinuityTests(unittest.TestCase):
         self.assertNotIn("recorded_at", insert_sql)
         self.assertNotIn("conversation_at", insert_sql)
 
+    def test_upsert_memory_fact_preserves_explicit_user_correction(self):
+        protected_fact = {
+            "id": 9,
+            "fact_key": "anniversary:gus_birthday",
+            "fact_type": "birthday",
+            "subject": "Gus",
+            "value_json": {"date": "2022-01-13"},
+            "normalized_text": "Gus birthday is January 13, 2022. Gus is Elias's son.",
+            "confidence": 0.99,
+            "importance": 1.85,
+            "personality_scope": "shared",
+            "source_kind": "user_correction",
+            "source_ref": "user_correction",
+        }
+        with patch.object(self.manager, "_get_memory_fact", return_value=protected_fact):
+            with patch.object(memory_manager, "get_connection", side_effect=AssertionError("db should not be touched")):
+                fact = self.manager.upsert_memory_fact(
+                    fact_key="anniversary:gus_birthday",
+                    fact_type="birthday",
+                    subject="Gus",
+                    value_json={"date": "2021-01-13"},
+                    normalized_text="Gus birthday is January 13, 2021. Gus is Elias's son.",
+                    confidence=0.9,
+                    personality_scope="shared",
+                    source_kind="episode_backfill",
+                )
+
+        self.assertEqual(fact["value_json"]["date"], "2022-01-13")
+        self.assertEqual(fact["source_kind"], "user_correction")
+
 
 if __name__ == "__main__":
     unittest.main()

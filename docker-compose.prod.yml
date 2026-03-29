@@ -22,8 +22,11 @@ services:
     environment:
       - MOCK_LYSARA_HOST=0.0.0.0
       - MOCK_LYSARA_PORT=18791
+      - MOCK_LYSARA_STATE_PATH=/app/data/mock_lysara_state.json
     expose:
       - "18791"
+    volumes:
+      - lysara_data:/app/data
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:18791/api/v1/ops/health')"]
       interval: 30s
@@ -82,5 +85,6 @@ networks:
 
 volumes:
   vessel_data:
+  lysara_data:
   caddy_data:
   caddy_config:

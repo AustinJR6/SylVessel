@@ -304,6 +304,50 @@ class ChatFlowTests(unittest.TestCase):
         self.assertEqual(note_metadata["topic_key"], "prep:birthday")
         self.assertEqual(note_metadata["memory_refs"], ["memory-1"])
 
+    def test_runtime_tool_specs_hide_memory_mutation_tools_for_plain_chat(self):
+        fake_manager = types.SimpleNamespace(
+            _is_explicit_correction=lambda text: False,
+            _is_completion_signal=lambda text: False,
+            list_open_loops=lambda **kwargs: [],
+        )
+        previous_manager = getattr(server.state, "memory_manager", None)
+        server.state.memory_manager = fake_manager
+        try:
+            server._set_runtime_memory_tool_context(
+                user_input="Tell me more about kite crypto.",
+                personality="sylana",
+                thread_id=51,
+                conversation_mode="default",
+                active_tools=["memories"],
+            )
+            specs = server._runtime_tool_specs(["memories"])
+        finally:
+            server._clear_runtime_memory_tool_context()
+            server.state.memory_manager = previous_manager
+
+        self.assertEqual([spec["name"] for spec in specs], [])
+
+    def test_retry_empty_model_response_uses_plaintext_recovery(self):
+        class _FakeModel:
+            def __init__(self):
+                self.calls = []
+
+            def generate(self, **kwargs):
+                self.calls.append(kwargs)
+                return "Recovered answer."
+
+        model = _FakeModel()
+        response = server._retry_empty_model_response(
+            model=model,
+            system_prompt="system",
+            messages=[{"role": "user", "content": "hello"}],
+            max_tokens=256,
+        )
+
+        self.assertEqual(response, "Recovered answer.")
+        self.assertEqual(model.calls[0]["active_tools"], [])
+        self.assertIn("produced no visible reply", model.calls[0]["messages"][-1]["content"])
+
 
 class ChatEndpointContinuityTests(unittest.IsolatedAsyncioTestCase):
     async def test_chat_endpoint_returns_409_for_invalid_explicit_thread(self):
@@ -391,6 +435,24 @@ class ChatEndpointContinuityTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(payload["dismissed"])
         self.assertEqual(payload["note"]["status"], "swallowed")
         set_status.assert_called_once_with("1", "swallowed")
+
+    async def test_update_proactive_note_endpoint_returns_updated_note(self):
+        updated_note = {"note_id": "1", "title": "Corrected birthday note"}
+        with patch.object(server, "_update_proactive_note", return_value=updated_note) as update_note:
+            response = await server.update_proactive_note_endpoint(
+                "1",
+                server.ProactiveNoteUpdateRequest(
+                    actor="mobile",
+                    title="Corrected birthday note",
+                    body="Gus is 1/13/2022 and Levi is 1/31/2024.",
+                    why_now="User corrected the dates before review.",
+                ),
+            )
+
+        payload = json.loads(response.body.decode("utf-8"))
+        self.assertTrue(payload["updated"])
+        self.assertEqual(payload["note"]["title"], "Corrected birthday note")
+        update_note.assert_called_once()
 
     async def test_approve_endpoint_dispatches_review_action(self):
         note = {"note_id": "1", "action_kind": "outreach_research", "metadata": {}}
