@@ -90,4 +90,10 @@ Production entrypoint: `server.py` (FastAPI + Claude API + Supabase memory)
 - [DISK_SPACE_SOLUTION.md](DISK_SPACE_SOLUTION.md) - Solutions for low disk space
 - [SECURITY_NOTICE.md](SECURITY_NOTICE.md) - Security information
 
+## Supabase Schema Sync
+
+- Run `python scripts/audit_supabase_schema.py` to compare the live Supabase schema against the active DDL expected by `server.py`, `memory/memory_manager.py`, and `memory/lysara_memory_manager.py`.
+- If you need to sync an existing Vessel database forward in Supabase SQL editor, use `sql/supabase_feature_sync.sql`.
+- Keep the SQL sync file updated whenever new backend features add tables, columns, or schema-qualified Lysara objects.
+
 **Created by Elias Ritt with Claude** ðŸš€
