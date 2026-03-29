@@ -116,6 +116,12 @@ class LysaraOpsClient:
     def get_market_snapshot(self, symbols: Optional[str] = None) -> Dict[str, Any]:
         return self._request("GET", "/api/v1/ops/market-snapshot", params={"symbols": symbols}, expected={200})
 
+    def refresh_feeds(self) -> Dict[str, Any]:
+        return self._request("POST", "/api/v1/ops/refresh-feeds", payload={}, expected={200})
+
+    def get_strategies(self) -> Dict[str, Any]:
+        return self._request("GET", "/api/v1/ops/strategies", expected={200})
+
     def get_sentiment_radar(self, symbols: Optional[str] = None) -> Dict[str, Any]:
         return self._request("GET", "/api/v1/ops/sentiment", params={"symbols": symbols}, expected={200})
 
@@ -130,6 +136,15 @@ class LysaraOpsClient:
 
     def get_override_status(self) -> Dict[str, Any]:
         return self._request("GET", "/api/v1/ops/override/status", expected={200})
+
+    def get_watchlist(self) -> Dict[str, Any]:
+        return self._request("GET", "/api/v1/ops/watchlist", expected={200})
+
+    def update_watchlist(self, watchlists: Dict[str, Any]) -> Dict[str, Any]:
+        return self._request("POST", "/api/v1/ops/watchlist", payload=watchlists, expected={200})
+
+    def queue_strategy_candidate(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return self._request("POST", "/api/v1/ops/strategy-candidates", payload=payload, expected={200})
 
     def activate_override(
         self,

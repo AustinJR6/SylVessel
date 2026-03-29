@@ -10,10 +10,38 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Optional
+from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlparse
+from urllib.request import Request, urlopen
 
 
 STATE_LOCK = threading.RLock()
+DEFAULT_CRYPTO_WATCHLIST = ["BTC-USD", "ETH-USD", "SOL-USD", "ADA-USD"]
+DEFAULT_STOCK_WATCHLIST = ["AAPL", "MSFT", "GOOG", "AMZN"]
+CRYPTO_SYMBOL_MAP = {
+    "BTC-USD": "BTCUSDT",
+    "ETH-USD": "ETHUSDT",
+    "SOL-USD": "SOLUSDT",
+    "ADA-USD": "ADAUSDT",
+}
+DEFAULT_STRATEGY_REGISTRY = {
+    "stocks": [
+        {
+            "strategy_name": "StockMomentumStrategy",
+            "symbols": ["AAPL", "MSFT"],
+            "enabled": True,
+            "params": {"type": "stock_momentum", "trade_symbols": ["AAPL", "MSFT"], "lookback": 20},
+        }
+    ],
+    "crypto": [
+        {
+            "strategy_name": "MomentumStrategy",
+            "symbols": ["BTC-USD", "ETH-USD", "SOL-USD"],
+            "enabled": True,
+            "params": {"type": "momentum", "trade_symbols": ["BTC-USD", "ETH-USD", "SOL-USD"], "lookback": 24},
+        }
+    ],
+}
 
 
 def _utc_now() -> datetime:
@@ -86,12 +114,15 @@ def _default_state(starting_balance: Optional[float] = None) -> Dict[str, Any]:
                 "stocks": {"connected": True, "detail": "mock_account_ok", "updated_at": now_iso},
                 "crypto": {"connected": True, "detail": "mock_account_ok", "updated_at": now_iso},
             },
-            "strategy_registry": {"stocks": [], "crypto": []},
+            "strategy_registry": deepcopy(DEFAULT_STRATEGY_REGISTRY),
             "symbol_controls": {
-                "stocks": {"AAPL": True, "MSFT": True},
-                "crypto": {"BTC-USD": True, "ETH-USD": True, "SOL-USD": True},
+                "stocks": {symbol: True for symbol in DEFAULT_STOCK_WATCHLIST},
+                "crypto": {symbol: True for symbol in DEFAULT_CRYPTO_WATCHLIST},
             },
-            "strategy_controls": {"stocks": {}, "crypto": {"MomentumStrategy": True}},
+            "strategy_controls": {
+                "stocks": {"StockMomentumStrategy": True},
+                "crypto": {"MomentumStrategy": True},
+            },
             "risk_managers": {"stocks": 1, "crypto": 1},
             "simulation_portfolio": {
                 "currency": "USD",
@@ -104,6 +135,7 @@ def _default_state(starting_balance: Optional[float] = None) -> Dict[str, Any]:
         },
         "portfolio": {
             "simulation_mode": True,
+            "mock_mode": True,
             "total_equity": starting,
             "simulation_portfolio": {
                 "currency": "USD",
@@ -118,21 +150,28 @@ def _default_state(starting_balance: Optional[float] = None) -> Dict[str, Any]:
                 "crypto": {"positions": []},
             },
         },
+        "watchlists": {
+            "stocks": list(DEFAULT_STOCK_WATCHLIST),
+            "crypto": list(DEFAULT_CRYPTO_WATCHLIST),
+        },
+        "strategy_candidates": [],
         "positions": {"items": []},
         "incidents": {"items": []},
         "market_snapshot": {
             "market": "mixed",
             "prices": {
-                "AAPL": {"price": 192.5, "change_pct_24h": 1.2, "trend_score": 1.0, "source": "mock_feed"},
-                "MSFT": {"price": 418.2, "change_pct_24h": 0.8, "trend_score": 0.4, "source": "mock_feed"},
-                "BTC-USD": {"price": 69000.0, "change_pct_24h": 1.6, "source": "mock_feed"},
-                "ETH-USD": {"price": 3520.0, "change_pct_24h": 1.1, "source": "mock_feed"},
-                "SOL-USD": {"price": 171.2, "change_pct_24h": 2.1, "source": "mock_feed"},
+                "AAPL": {"price": 192.5, "change_pct_24h": 1.2, "trend_score": 1.0, "source": "bootstrap_cache", "timestamp": now_iso},
+                "MSFT": {"price": 418.2, "change_pct_24h": 0.8, "trend_score": 0.4, "source": "bootstrap_cache", "timestamp": now_iso},
+                "BTC-USD": {"price": 69000.0, "change_pct_24h": 1.6, "source": "bootstrap_cache", "timestamp": now_iso},
+                "ETH-USD": {"price": 3520.0, "change_pct_24h": 1.1, "source": "bootstrap_cache", "timestamp": now_iso},
+                "SOL-USD": {"price": 171.2, "change_pct_24h": 2.1, "source": "bootstrap_cache", "timestamp": now_iso},
             },
             "feed_freshness": {
                 "stocks": {"alpaca_poll:AAPL": 2.0, "alpaca_poll:MSFT": 2.5},
                 "crypto": {"binance_public_poll:BTC-USD": 1.5, "binance_public_poll:ETH-USD": 1.8, "binance_public_poll:SOL-USD": 2.1},
             },
+            "updated_at": now_iso,
+            "feed_sources": {},
         },
         "sentiment": {
             "updated_at": now_iso,
@@ -266,6 +305,131 @@ def _load_state() -> Dict[str, Any]:
 STATE: Dict[str, Any] = _load_state()
 
 
+def _fetch_json(url: str, timeout: float = 8.0) -> Dict[str, Any] | list[Any] | None:
+    req = Request(url, headers={"User-Agent": "SylanaVessel/1.0"})
+    try:
+        with urlopen(req, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError, TimeoutError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _tracked_symbols(state: Dict[str, Any]) -> Dict[str, list[str]]:
+    watchlists = state.get("watchlists") or {}
+    tracked = {
+        "stocks": list(watchlists.get("stocks") or []),
+        "crypto": list(watchlists.get("crypto") or []),
+    }
+    registry = ((state.get("status") or {}).get("strategy_registry") or {})
+    controls = ((state.get("status") or {}).get("strategy_controls") or {})
+    for market in ("stocks", "crypto"):
+        enabled_map = controls.get(market) or {}
+        for item in registry.get(market) or []:
+            if not bool(enabled_map.get(str(item.get("strategy_name") or ""), item.get("enabled", True))):
+                continue
+            for symbol in item.get("symbols") or []:
+                clean = str(symbol or "").strip().upper()
+                if clean and clean not in tracked[market]:
+                    tracked[market].append(clean)
+    for row in ((state.get("positions") or {}).get("items") or []):
+        symbol = str(row.get("symbol") or "").strip().upper()
+        market = str(row.get("market") or ("crypto" if symbol.endswith("-USD") else "stocks")).strip().lower()
+        if symbol and market in tracked and symbol not in tracked[market]:
+            tracked[market].append(symbol)
+    return tracked
+
+
+def _refresh_stock_quotes(symbols: list[str]) -> Dict[str, Dict[str, Any]]:
+    requested = [str(symbol or "").strip().upper() for symbol in symbols if str(symbol or "").strip()]
+    if not requested:
+        return {}
+    payload = _fetch_json(
+        "https://query1.finance.yahoo.com/v7/finance/quote?symbols=" + ",".join(requested)
+    )
+    rows = (((payload or {}).get("quoteResponse") or {}).get("result") or []) if isinstance(payload, dict) else []
+    mapped: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        symbol = str(row.get("symbol") or "").strip().upper()
+        price = _safe_float(row.get("regularMarketPrice"), float("nan"))
+        if symbol and price == price and price > 0:
+            mapped[symbol] = {
+                "price": round(price, 6),
+                "bid": _safe_float(row.get("bid"), price),
+                "ask": _safe_float(row.get("ask"), price),
+                "change_pct_24h": _safe_float(row.get("regularMarketChangePercent"), 0.0),
+                "trend_score": round(_safe_float(row.get("regularMarketChangePercent"), 0.0) / 5.0, 4),
+                "source": "yahoo_quote",
+            }
+    return mapped
+
+
+def _refresh_crypto_quotes(symbols: list[str]) -> Dict[str, Dict[str, Any]]:
+    mapped: Dict[str, Dict[str, Any]] = {}
+    for symbol in symbols:
+        clean = str(symbol or "").strip().upper()
+        exchange_symbol = CRYPTO_SYMBOL_MAP.get(clean)
+        if not exchange_symbol:
+            continue
+        price_payload = _fetch_json(f"https://api.binance.com/api/v3/ticker/price?symbol={exchange_symbol}")
+        stats_payload = _fetch_json(f"https://api.binance.com/api/v3/ticker/24hr?symbol={exchange_symbol}")
+        price = _safe_float(((price_payload or {}) if isinstance(price_payload, dict) else {}).get("price"), float("nan"))
+        if price != price or price <= 0:
+            continue
+        change_pct = _safe_float(((stats_payload or {}) if isinstance(stats_payload, dict) else {}).get("priceChangePercent"), 0.0)
+        mapped[clean] = {
+            "price": round(price, 6),
+            "change_pct_24h": round(change_pct, 4),
+            "trend_score": round(change_pct / 5.0, 4),
+            "source": "binance_public",
+        }
+    return mapped
+
+
+def _refresh_live_market_snapshot(state: Dict[str, Any], *, force: bool = False) -> None:
+    snapshot = state.setdefault("market_snapshot", {})
+    prices = snapshot.setdefault("prices", {})
+    tracked = _tracked_symbols(state)
+    now = _utc_now()
+    now_iso = now.isoformat()
+    updated_at = _parse_iso(snapshot.get("updated_at") or now_iso)
+    if not force and (now - updated_at).total_seconds() < 12:
+        return
+
+    live_prices: Dict[str, Dict[str, Any]] = {}
+    live_prices.update(_refresh_stock_quotes(tracked.get("stocks") or []))
+    live_prices.update(_refresh_crypto_quotes(tracked.get("crypto") or []))
+    feed_sources: Dict[str, Dict[str, Any]] = {}
+    feed_freshness = {"stocks": {}, "crypto": {}}
+
+    for market, symbols in tracked.items():
+        for symbol in symbols:
+            payload = live_prices.get(symbol)
+            if payload:
+                payload["timestamp"] = now_iso
+                prices[symbol] = payload
+            symbol_payload = prices.get(symbol)
+            if not symbol_payload:
+                continue
+            timestamp = _parse_iso(symbol_payload.get("timestamp") or now_iso)
+            freshness = max(0.0, (now - timestamp).total_seconds())
+            provider_key = f"{str(symbol_payload.get('source') or 'cached').lower()}:{symbol}"
+            feed_freshness.setdefault(market, {})[provider_key] = round(freshness, 2)
+            feed_sources[symbol] = {
+                "provider": str(symbol_payload.get("source") or "cached"),
+                "timestamp": timestamp.isoformat(),
+                "stale": freshness > (45 if market == "crypto" else 120),
+            }
+
+    snapshot["market"] = "mixed"
+    snapshot["feed_freshness"] = feed_freshness
+    snapshot["updated_at"] = now_iso
+    snapshot["feed_sources"] = feed_sources
+    status = state.setdefault("status", {})
+    status["feed_freshness"] = deepcopy(feed_freshness)
+    status["feed_sources"] = deepcopy(feed_sources)
+    _persist_state(state)
+
+
 def _touch_status(state: Dict[str, Any]) -> None:
     now = _utc_now()
     now_iso = now.isoformat()
@@ -285,6 +449,7 @@ def _touch_status(state: Dict[str, Any]) -> None:
         broker.setdefault("detail", "mock_account_ok")
         status.setdefault("broker_health", {})[market] = broker
     state["started_at"] = status["started_at"]
+    _refresh_live_market_snapshot(state)
 
 
 def _resolve_price(symbol: str) -> float:
@@ -415,6 +580,116 @@ def _build_exposure_payload(state: Dict[str, Any], market: str = "crypto") -> Di
         "mock_mode": True,
         "updated_at": (state.get("status") or {}).get("updated_at") or _utc_now_iso(),
     }
+
+
+def _list_strategies(state: Dict[str, Any]) -> Dict[str, Any]:
+    status = state.get("status") or {}
+    registry = status.get("strategy_registry") or {}
+    controls = status.get("strategy_controls") or {}
+    items = []
+    for market in ("crypto", "stocks"):
+        for item in registry.get(market) or []:
+            strategy_name = str(item.get("strategy_name") or item.get("name") or "").strip()
+            if not strategy_name:
+                continue
+            params = dict(item.get("params") or {})
+            symbols = [str(symbol or "").strip().upper() for symbol in (item.get("symbols") or params.get("trade_symbols") or []) if str(symbol or "").strip()]
+            last_update = params.get("updated_at") or status.get("updated_at")
+            items.append(
+                {
+                    "strategy_key": strategy_name,
+                    "strategy_name": strategy_name,
+                    "market": market,
+                    "enabled": bool((controls.get(market) or {}).get(strategy_name, item.get("enabled", True))),
+                    "symbols": symbols,
+                    "params": params,
+                    "symbol_count": len(symbols),
+                    "last_update": last_update,
+                }
+            )
+    return {"items": items, "mock_mode": True, "updated_at": status.get("updated_at")}
+
+
+def _upsert_strategy_locked(payload: Dict[str, Any]) -> Dict[str, Any]:
+    status = STATE.setdefault("status", {})
+    registry = status.setdefault("strategy_registry", deepcopy(DEFAULT_STRATEGY_REGISTRY))
+    controls = status.setdefault("strategy_controls", {"stocks": {"StockMomentumStrategy": True}, "crypto": {"MomentumStrategy": True}})
+    market = str(payload.get("market") or "crypto").strip().lower()
+    strategy_name = str(payload.get("strategy_name") or payload.get("strategy_key") or "").strip() or "MomentumStrategy"
+    params = dict(payload.get("params") or {})
+    symbols = payload.get("symbols")
+    if symbols is None:
+        symbols = params.get("trade_symbols")
+    if isinstance(symbols, list):
+        clean_symbols = [str(symbol or "").strip().upper() for symbol in symbols if str(symbol or "").strip()]
+    else:
+        clean_symbols = []
+    rows = registry.setdefault(market, [])
+    existing = next((row for row in rows if str(row.get("strategy_name") or "").strip() == strategy_name), None)
+    enabled = bool(payload.get("enabled")) if payload.get("enabled") is not None else bool((existing or {}).get("enabled", True))
+    if existing is None:
+        existing = {"strategy_name": strategy_name, "symbols": clean_symbols, "enabled": enabled, "params": {}}
+        rows.append(existing)
+    if clean_symbols:
+        existing["symbols"] = clean_symbols
+    existing["enabled"] = enabled
+    merged_params = dict(existing.get("params") or {})
+    merged_params.update(params)
+    if clean_symbols:
+        merged_params["trade_symbols"] = clean_symbols
+    merged_params["updated_at"] = _utc_now_iso()
+    existing["params"] = merged_params
+    controls.setdefault(market, {})[strategy_name] = enabled
+    symbol_controls = status.setdefault("symbol_controls", {}).setdefault(market, {})
+    for symbol in clean_symbols:
+        symbol_controls[symbol] = True
+    _persist_state(STATE)
+    return {"status": "updated", "strategy": existing, "mock_mode": True}
+
+
+def _get_watchlists_payload(state: Dict[str, Any]) -> Dict[str, Any]:
+    payload = deepcopy(state.get("watchlists") or {"stocks": [], "crypto": []})
+    return {
+        "watchlists": payload,
+        "strategy_candidates": list(state.get("strategy_candidates") or []),
+        "mock_mode": True,
+        "updated_at": ((state.get("status") or {}).get("updated_at") or _utc_now_iso()),
+    }
+
+
+def _update_watchlists_locked(payload: Dict[str, Any]) -> Dict[str, Any]:
+    watchlists = STATE.setdefault("watchlists", {"stocks": [], "crypto": []})
+    for market in ("stocks", "crypto"):
+        if market in payload and isinstance(payload.get(market), list):
+            watchlists[market] = [str(symbol or "").strip().upper() for symbol in payload.get(market) or [] if str(symbol or "").strip()]
+    _persist_state(STATE)
+    return _get_watchlists_payload(STATE)
+
+
+def _queue_strategy_candidate_locked(payload: Dict[str, Any]) -> Dict[str, Any]:
+    symbol = str(payload.get("symbol") or "").strip().upper()
+    market = str(payload.get("market") or "crypto").strip().lower() or "crypto"
+    strategy_key = str(payload.get("strategy_key") or "").strip() or None
+    if not symbol:
+        return {"status": "rejected", "error": "symbol_required"}
+    candidates = STATE.setdefault("strategy_candidates", [])
+    existing = next((row for row in candidates if str(row.get("symbol") or "").upper() == symbol and str(row.get("market") or "").lower() == market and str(row.get("status") or "") == "pending"), None)
+    if existing:
+        return {"status": "queued", "item": existing, "mock_mode": True}
+    item = {
+        "id": f"candidate-{uuid.uuid4().hex[:10]}",
+        "symbol": symbol,
+        "market": market,
+        "strategy_key": strategy_key,
+        "status": "pending",
+        "summary": str(payload.get("summary") or "").strip(),
+        "analysis": payload.get("analysis") or {},
+        "created_at": _utc_now_iso(),
+    }
+    candidates.insert(0, item)
+    del candidates[100:]
+    _persist_state(STATE)
+    return {"status": "queued", "item": item, "mock_mode": True}
 
 
 def _execute_trade_intent_locked(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -604,8 +879,17 @@ class Handler(BaseHTTPRequestHandler):
                 return _json(self, 200, payload)
             if path == "/api/v1/ops/market-snapshot":
                 payload = deepcopy(STATE["market_snapshot"])
+                symbols = ((qs.get("symbols") or [""])[0]).split(",")
+                if any(str(symbol).strip() for symbol in symbols):
+                    payload["prices"] = {
+                        str(symbol).strip().upper(): row
+                        for symbol, row in (payload.get("prices") or {}).items()
+                        if str(symbol).strip().upper() in {str(item).strip().upper() for item in symbols if str(item).strip()}
+                    }
                 payload["mock_mode"] = True
                 return _json(self, 200, payload)
+            if path == "/api/v1/ops/strategies":
+                return _json(self, 200, _list_strategies(STATE))
             if path == "/api/v1/ops/sentiment":
                 symbols = ((qs.get("symbols") or [""])[0]).split(",")
                 payload = _filter_symbol_rows(deepcopy(STATE["sentiment"]), symbols)
@@ -642,6 +926,8 @@ class Handler(BaseHTTPRequestHandler):
                 limit = max(1, min(int((qs.get("limit") or [50])[0]), 200))
                 items = list(STATE.get("journal") or [])[:limit]
                 return _json(self, 200, {"items": items, "mock_mode": True})
+            if path == "/api/v1/ops/watchlist":
+                return _json(self, 200, _get_watchlists_payload(STATE))
             if path.startswith("/api/v1/ops/trades/"):
                 trade_id = path.rsplit("/", 1)[-1]
                 trade = deepcopy((STATE["trade_lookup"] or {}).get(trade_id))
@@ -689,7 +975,7 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/v1/ops/risk":
                 return _json(self, 200, {"status": "updated", "payload": payload, "mock_mode": True})
             if path == "/api/v1/ops/strategy":
-                return _json(self, 200, {"status": "updated", "payload": payload, "mock_mode": True})
+                return _json(self, 200, _upsert_strategy_locked(payload))
             if path == "/api/v1/ops/override":
                 now = _utc_now()
                 ttl_minutes = int(payload.get("ttl_minutes") or 15)
@@ -736,6 +1022,15 @@ class Handler(BaseHTTPRequestHandler):
                         actor=str(payload.get("actor") or "operator"),
                     ),
                 )
+            if path == "/api/v1/ops/watchlist":
+                return _json(self, 200, _update_watchlists_locked(payload))
+            if path == "/api/v1/ops/strategy-candidates":
+                return _json(self, 200, _queue_strategy_candidate_locked(payload))
+            if path == "/api/v1/ops/refresh-feeds":
+                _refresh_live_market_snapshot(STATE, force=True)
+                _update_portfolio_snapshot(STATE)
+                _persist_state(STATE)
+                return _json(self, 200, {"status": "refreshed", "snapshot": deepcopy(STATE.get("market_snapshot") or {}), "mock_mode": True})
             if path == "/__scenario/reset":
                 STATE.clear()
                 STATE.update(_default_state())
