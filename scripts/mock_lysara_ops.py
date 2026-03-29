@@ -24,6 +24,12 @@ CRYPTO_SYMBOL_MAP = {
     "SOL-USD": "SOLUSDT",
     "ADA-USD": "ADAUSDT",
 }
+COINGECKO_SYMBOL_MAP = {
+    "BTC-USD": "bitcoin",
+    "ETH-USD": "ethereum",
+    "SOL-USD": "solana",
+    "ADA-USD": "cardano",
+}
 DEFAULT_STRATEGY_REGISTRY = {
     "stocks": [
         {
@@ -287,6 +293,43 @@ def _persist_state(state: Dict[str, Any]) -> None:
     temp_path.replace(path)
 
 
+def _ensure_strategy_registry(state: Dict[str, Any]) -> bool:
+    status = state.setdefault("status", {})
+    registry = status.setdefault("strategy_registry", {})
+    controls = status.setdefault("strategy_controls", {"stocks": {}, "crypto": {}})
+    symbol_controls = status.setdefault("symbol_controls", {"stocks": {}, "crypto": {}})
+    changed = False
+
+    total_rows = 0
+    for market in ("stocks", "crypto"):
+        rows = registry.get(market)
+        if isinstance(rows, list):
+            total_rows += len(rows)
+    if total_rows == 0:
+        registry.clear()
+        registry.update(deepcopy(DEFAULT_STRATEGY_REGISTRY))
+        changed = True
+
+    for market, rows in deepcopy(registry).items():
+        if market not in ("stocks", "crypto") or not isinstance(rows, list):
+            continue
+        controls.setdefault(market, {})
+        symbol_controls.setdefault(market, {})
+        for row in rows:
+            strategy_name = str(row.get("strategy_name") or "").strip()
+            if not strategy_name:
+                continue
+            if strategy_name not in controls[market]:
+                controls[market][strategy_name] = bool(row.get("enabled", True))
+                changed = True
+            for symbol in row.get("symbols") or []:
+                clean = str(symbol or "").strip().upper()
+                if clean and clean not in symbol_controls[market]:
+                    symbol_controls[market][clean] = True
+                    changed = True
+    return changed
+
+
 def _load_state() -> Dict[str, Any]:
     path = _state_path()
     if path and path.exists():
@@ -294,10 +337,13 @@ def _load_state() -> Dict[str, Any]:
             loaded = json.loads(path.read_text(encoding="utf-8"))
             base = _default_state(starting_balance=_safe_float(((loaded.get("status") or {}).get("simulation_portfolio") or {}).get("starting_balance"), _env_starting_balance()))
             state = _merge(base, loaded)
+            if _ensure_strategy_registry(state):
+                _persist_state(state)
             return state
         except Exception:
             pass
     state = _default_state()
+    _ensure_strategy_registry(state)
     _persist_state(state)
     return state
 
@@ -341,24 +387,24 @@ def _tracked_symbols(state: Dict[str, Any]) -> Dict[str, list[str]]:
 
 def _refresh_stock_quotes(symbols: list[str]) -> Dict[str, Dict[str, Any]]:
     requested = [str(symbol or "").strip().upper() for symbol in symbols if str(symbol or "").strip()]
-    if not requested:
-        return {}
-    payload = _fetch_json(
-        "https://query1.finance.yahoo.com/v7/finance/quote?symbols=" + ",".join(requested)
-    )
-    rows = (((payload or {}).get("quoteResponse") or {}).get("result") or []) if isinstance(payload, dict) else []
     mapped: Dict[str, Dict[str, Any]] = {}
-    for row in rows:
-        symbol = str(row.get("symbol") or "").strip().upper()
-        price = _safe_float(row.get("regularMarketPrice"), float("nan"))
-        if symbol and price == price and price > 0:
+    for symbol in requested:
+        payload = _fetch_json(f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1m&range=1d")
+        result = (((payload or {}).get("chart") or {}).get("result") or [None])[0] if isinstance(payload, dict) else None
+        meta = (result or {}).get("meta") or {}
+        price = _safe_float(meta.get("regularMarketPrice"), float("nan"))
+        previous_close = _safe_float(meta.get("chartPreviousClose"), _safe_float(meta.get("previousClose"), price))
+        if price == price and price > 0:
+            change_pct = 0.0
+            if previous_close == previous_close and previous_close > 0:
+                change_pct = ((price - previous_close) / previous_close) * 100.0
             mapped[symbol] = {
                 "price": round(price, 6),
-                "bid": _safe_float(row.get("bid"), price),
-                "ask": _safe_float(row.get("ask"), price),
-                "change_pct_24h": _safe_float(row.get("regularMarketChangePercent"), 0.0),
-                "trend_score": round(_safe_float(row.get("regularMarketChangePercent"), 0.0) / 5.0, 4),
-                "source": "yahoo_quote",
+                "bid": _safe_float(meta.get("bid"), price),
+                "ask": _safe_float(meta.get("ask"), price),
+                "change_pct_24h": round(change_pct, 4),
+                "trend_score": round(change_pct / 5.0, 4),
+                "source": "yahoo_chart",
             }
     return mapped
 
@@ -367,21 +413,39 @@ def _refresh_crypto_quotes(symbols: list[str]) -> Dict[str, Dict[str, Any]]:
     mapped: Dict[str, Dict[str, Any]] = {}
     for symbol in symbols:
         clean = str(symbol or "").strip().upper()
-        exchange_symbol = CRYPTO_SYMBOL_MAP.get(clean)
-        if not exchange_symbol:
+        payload = _fetch_json(f"https://query1.finance.yahoo.com/v8/finance/chart/{clean}?interval=5m&range=1d")
+        result = (((payload or {}).get("chart") or {}).get("result") or [None])[0] if isinstance(payload, dict) else None
+        meta = (result or {}).get("meta") or {}
+        price = _safe_float(meta.get("regularMarketPrice"), float("nan"))
+        previous_close = _safe_float(meta.get("chartPreviousClose"), _safe_float(meta.get("previousClose"), price))
+        if price == price and price > 0:
+            change_pct = 0.0
+            if previous_close == previous_close and previous_close > 0:
+                change_pct = ((price - previous_close) / previous_close) * 100.0
+            mapped[clean] = {
+                "price": round(price, 6),
+                "change_pct_24h": round(change_pct, 4),
+                "trend_score": round(change_pct / 5.0, 4),
+                "source": "yahoo_chart",
+            }
             continue
-        price_payload = _fetch_json(f"https://api.binance.com/api/v3/ticker/price?symbol={exchange_symbol}")
-        stats_payload = _fetch_json(f"https://api.binance.com/api/v3/ticker/24hr?symbol={exchange_symbol}")
-        price = _safe_float(((price_payload or {}) if isinstance(price_payload, dict) else {}).get("price"), float("nan"))
-        if price != price or price <= 0:
+        coin_id = COINGECKO_SYMBOL_MAP.get(clean)
+        if not coin_id:
             continue
-        change_pct = _safe_float(((stats_payload or {}) if isinstance(stats_payload, dict) else {}).get("priceChangePercent"), 0.0)
-        mapped[clean] = {
-            "price": round(price, 6),
-            "change_pct_24h": round(change_pct, 4),
-            "trend_score": round(change_pct / 5.0, 4),
-            "source": "binance_public",
-        }
+        fallback = _fetch_json(
+            "https://api.coingecko.com/api/v3/simple/price"
+            f"?ids={coin_id}&vs_currencies=usd&include_24hr_change=true"
+        )
+        row = (fallback or {}).get(coin_id) if isinstance(fallback, dict) else None
+        fallback_price = _safe_float((row or {}).get("usd"), float("nan"))
+        if fallback_price == fallback_price and fallback_price > 0:
+            change_pct = _safe_float((row or {}).get("usd_24h_change"), 0.0)
+            mapped[clean] = {
+                "price": round(fallback_price, 6),
+                "change_pct_24h": round(change_pct, 4),
+                "trend_score": round(change_pct / 5.0, 4),
+                "source": "coingecko_simple",
+            }
     return mapped
 
 
@@ -434,6 +498,7 @@ def _touch_status(state: Dict[str, Any]) -> None:
     now = _utc_now()
     now_iso = now.isoformat()
     status = state.setdefault("status", {})
+    _ensure_strategy_registry(state)
     status["mock_mode"] = True
     started_at = _parse_iso(status.get("started_at") or state.get("started_at") or now_iso)
     status["started_at"] = started_at.isoformat()

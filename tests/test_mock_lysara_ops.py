@@ -1,5 +1,6 @@
 import unittest
 from copy import deepcopy
+from unittest.mock import patch
 
 from scripts import mock_lysara_ops
 
@@ -80,6 +81,54 @@ class MockLysaraOpsTests(unittest.TestCase):
         finally:
             mock_lysara_ops.STATE.clear()
             mock_lysara_ops.STATE.update(original_state)
+
+    def test_refresh_quotes_uses_yahoo_chart_payloads(self):
+        def fake_fetch(url: str, timeout: float = 8.0):
+            if "AAPL" in url:
+                return {
+                    "chart": {
+                        "result": [
+                            {
+                                "meta": {
+                                    "regularMarketPrice": 248.8,
+                                    "chartPreviousClose": 252.89,
+                                }
+                            }
+                        ]
+                    }
+                }
+            if "BTC-USD" in url:
+                return {
+                    "chart": {
+                        "result": [
+                            {
+                                "meta": {
+                                    "regularMarketPrice": 66565.495,
+                                    "chartPreviousClose": 67044.0,
+                                }
+                            }
+                        ]
+                    }
+                }
+            return None
+
+        with patch("scripts.mock_lysara_ops._fetch_json", side_effect=fake_fetch):
+            stocks = mock_lysara_ops._refresh_stock_quotes(["AAPL"])
+            crypto = mock_lysara_ops._refresh_crypto_quotes(["BTC-USD"])
+
+        self.assertEqual(stocks["AAPL"]["source"], "yahoo_chart")
+        self.assertAlmostEqual(stocks["AAPL"]["price"], 248.8)
+        self.assertEqual(crypto["BTC-USD"]["source"], "yahoo_chart")
+        self.assertAlmostEqual(crypto["BTC-USD"]["price"], 66565.495)
+
+    def test_load_state_reseeds_default_strategies_when_registry_empty(self):
+        state = deepcopy(mock_lysara_ops._default_state(starting_balance=1000.0))
+        state["status"]["strategy_registry"] = {"stocks": [], "crypto": []}
+        changed = mock_lysara_ops._ensure_strategy_registry(state)
+
+        self.assertTrue(changed)
+        self.assertGreater(len(state["status"]["strategy_registry"]["stocks"]), 0)
+        self.assertGreater(len(state["status"]["strategy_registry"]["crypto"]), 0)
 
 
 if __name__ == "__main__":
