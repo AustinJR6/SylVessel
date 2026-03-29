@@ -653,6 +653,69 @@ class RepairStore:
         finally:
             conn.close()
 
+    def list_open_github_action_incidents(self, *, limit: int = 50) -> List[Dict[str, Any]]:
+        conn = self.connect()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        try:
+            cur.execute(
+                """
+                SELECT incident_id, dedupe_key, repo, environment, source, severity, status,
+                       symptom_summary, reproduction_hints, root_cause_summary, metadata, pr_url,
+                       latest_run_id, first_seen_at, last_seen_at, resolved_at
+                FROM repair_incidents
+                WHERE source = 'github_actions'
+                  AND status IN ('detected', 'failed', 'investigating')
+                ORDER BY last_seen_at DESC
+                LIMIT %s
+                """,
+                (max(1, min(int(limit), 200)),),
+            )
+            rows = [self._serialize_incident(dict(row)) for row in cur.fetchall()]
+            conn.commit()
+            return rows
+        finally:
+            conn.close()
+
+    def resolve_incident(
+        self,
+        *,
+        incident_id: str,
+        status: str = "deployed",
+        actor: str = "maintenance-controller",
+        metadata: Optional[Dict[str, Any]] = None,
+        root_cause_summary: str = "",
+    ) -> None:
+        conn = self.connect()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                UPDATE repair_incidents
+                SET status = %s,
+                    root_cause_summary = COALESCE(NULLIF(%s, ''), root_cause_summary),
+                    metadata = metadata || %s::jsonb,
+                    last_seen_at = NOW(),
+                    resolved_at = NOW()
+                WHERE incident_id = %s::uuid
+                """,
+                (
+                    str(status or "deployed").strip() or "deployed",
+                    root_cause_summary,
+                    json.dumps(metadata or {}, ensure_ascii=True),
+                    incident_id,
+                ),
+            )
+            self._insert_event(
+                cur,
+                incident_id=incident_id,
+                event_kind="incident_auto_resolved",
+                actor=actor,
+                metadata={"status": status, **(metadata or {})},
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
     def set_run_status(self, *, run_id: str, status: str, extra_field_sql: str = "", params: Optional[List[Any]] = None) -> None:
         conn = self.connect()
         cur = conn.cursor()
@@ -796,6 +859,45 @@ class MaintenanceController:
     def process_requested_investigations(self) -> None:
         for incident in self.store.list_requested_investigations(limit=10):
             self.propose_fix(incident)
+
+    def sync_resolved_workflow_incidents(self) -> None:
+        cached_runs: Dict[tuple[str, str], List[Dict[str, Any]]] = {}
+        for incident in self.store.list_open_github_action_incidents(limit=50):
+            repo = str(incident.get("repo") or "").strip()
+            hints = incident.get("reproduction_hints") or {}
+            workflow_run = ((incident.get("metadata") or {}).get("workflow_run") or {})
+            branch = str(hints.get("head_branch") or workflow_run.get("head_branch") or "main").strip() or "main"
+            workflow_path = str(workflow_run.get("path") or "").strip()
+            failed_run_id = int(hints.get("run_id") or workflow_run.get("id") or 0)
+            cache_key = (repo, branch)
+            if cache_key not in cached_runs:
+                payload = self.github.list_workflow_runs(repo, branch=branch, per_page=50)
+                cached_runs[cache_key] = list(payload.get("workflow_runs") or [])
+            matching_success = None
+            for run in cached_runs[cache_key]:
+                if str(run.get("conclusion") or "").strip().lower() != "success":
+                    continue
+                if workflow_path and str(run.get("path") or "").strip() != workflow_path:
+                    continue
+                run_id = int(run.get("id") or 0)
+                if failed_run_id and run_id <= failed_run_id:
+                    continue
+                matching_success = run
+                break
+            if not matching_success:
+                continue
+            workflow_name = str(hints.get("workflow_name") or workflow_run.get("name") or workflow_path or "workflow").strip()
+            self.store.resolve_incident(
+                incident_id=str(incident.get("incident_id") or ""),
+                status="deployed",
+                metadata={
+                    "resolution_kind": "superseded_by_successful_workflow",
+                    "resolved_by_run_id": matching_success.get("id"),
+                    "resolved_by_html_url": matching_success.get("html_url"),
+                    "resolved_by_conclusion": matching_success.get("conclusion"),
+                },
+                root_cause_summary=f"{workflow_name} failure was superseded by a newer successful run.",
+            )
 
     def clone_repo(self, repo: str, workspace: Path) -> None:
         clone_url = f"https://x-access-token:{self.cfg.github_token}@github.com/{repo}.git"
@@ -968,6 +1070,7 @@ Hard rules:
             if self._should_auto_propose(incident):
                 self.propose_fix(incident)
         self.process_requested_investigations()
+        self.sync_resolved_workflow_incidents()
         self.sync_active_runs()
 
     def loop(self) -> None:

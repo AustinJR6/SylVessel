@@ -93,6 +93,7 @@ class MaintenanceControllerTests(unittest.TestCase):
         proposed = []
         controller.propose_fix = lambda incident: proposed.append(incident)
         controller.process_requested_investigations = lambda: None
+        controller.sync_resolved_workflow_incidents = lambda: None
         controller.sync_active_runs = lambda: None
 
         controller.run_once()
@@ -112,6 +113,45 @@ class MaintenanceControllerTests(unittest.TestCase):
         controller.process_requested_investigations()
 
         self.assertEqual(proposed, ["inc-1", "inc-2"])
+
+    def test_sync_resolved_workflow_incidents_marks_superseded_failures_deployed(self):
+        controller = self._build_controller()
+        incident = {
+            "incident_id": "inc-1",
+            "repo": "AustinJR6/SylVessel",
+            "reproduction_hints": {
+                "run_id": 100,
+                "head_branch": "main",
+                "workflow_name": "Deploy to DigitalOcean",
+            },
+            "metadata": {
+                "workflow_run": {
+                    "id": 100,
+                    "path": ".github/workflows/deploy.yml",
+                    "name": "Deploy to DigitalOcean",
+                }
+            },
+        }
+        controller.store.list_open_github_action_incidents = lambda limit=50: [incident]
+        resolved = []
+        controller.store.resolve_incident = lambda **kwargs: resolved.append(kwargs)
+        controller.github.list_workflow_runs = lambda repo, branch=None, per_page=50: {
+            "workflow_runs": [
+                {
+                    "id": 101,
+                    "path": ".github/workflows/deploy.yml",
+                    "conclusion": "success",
+                    "html_url": "https://github.com/AustinJR6/SylVessel/actions/runs/101",
+                }
+            ]
+        }
+
+        controller.sync_resolved_workflow_incidents()
+
+        self.assertEqual(len(resolved), 1)
+        self.assertEqual(resolved[0]["incident_id"], "inc-1")
+        self.assertEqual(resolved[0]["status"], "deployed")
+        self.assertIn("superseded", resolved[0]["root_cause_summary"])
 
 
 if __name__ == "__main__":
