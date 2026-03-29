@@ -45,6 +45,7 @@ services:
     environment:
       - PORT=8080
       - LYSARA_OPS_BASE_URL=http://lysara:18791
+      - LYSARA_SIMULATION_MODE=false
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
