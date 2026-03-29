@@ -9168,6 +9168,8 @@ def _get_recent_thread_turn_history(thread_id: Optional[int], max_turns: int = R
         if role == "user":
             bucket["user_input"] = f"{bucket['user_input']}\n{content}".strip() if bucket["user_input"] else content
         elif role == "assistant":
+            if _is_low_value_assistant_turn(content):
+                continue
             bucket["sylana_response"] = f"{bucket['sylana_response']}\n{content}".strip() if bucket["sylana_response"] else content
 
     filtered = [turn for turn in turns if (turn.get("user_input") or turn.get("sylana_response"))]
@@ -10248,6 +10250,18 @@ def _truncate_recent_history_message(text: str, char_limit: int = RECENT_HISTORY
     return compact[: max(40, char_limit - 3)].rstrip() + "..."
 
 
+def _normalize_history_text(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).strip().lower()
+
+
+def _is_low_value_assistant_turn(text: str) -> bool:
+    normalized = _normalize_history_text(text)
+    return normalized in {
+        "i'm here with you. say that again for me.",
+        "im here with you. say that again for me.",
+    }
+
+
 def _budget_recent_history_messages(
     recent_history: Optional[List[Dict[str, Any]]],
     token_budget: int = RECENT_HISTORY_BUDGET_TOKENS,
@@ -10263,6 +10277,8 @@ def _budget_recent_history_messages(
     for turn in reversed(recent_history[-max_turns:]):
         assistant = _truncate_recent_history_message(turn.get("sylana_response") or "")
         user = _truncate_recent_history_message(turn.get("user_input") or "")
+        if assistant and _is_low_value_assistant_turn(assistant):
+            assistant = ""
         pair: List[Dict[str, str]] = []
         if assistant:
             pair.append({"role": "assistant", "content": assistant})

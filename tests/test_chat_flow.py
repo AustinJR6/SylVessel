@@ -167,12 +167,23 @@ class ChatFlowTests(unittest.TestCase):
         self.assertTrue(all(len(item["content"]) <= server.RECENT_HISTORY_MESSAGE_CHAR_LIMIT for item in messages))
         self.assertTrue(all(item["content"].endswith("...") for item in messages))
 
+    def test_budget_recent_history_messages_skips_low_value_fallback_turns(self):
+        recent_history = [
+            {"user_input": "we were talking about kite", "sylana_response": "KITE is the token we were comparing."},
+            {"user_input": "what changed?", "sylana_response": "I'm here with you. Say that again for me."},
+        ]
+
+        messages = server._budget_recent_history_messages(recent_history, token_budget=500, max_turns=4)
+
+        self.assertEqual(messages[-1], {"role": "user", "content": "what changed?"})
+        self.assertFalse(any("say that again" in item["content"].lower() for item in messages))
+
     def test_get_recent_thread_turn_history_prefers_persisted_chat_messages(self):
         chat_messages = [
             {"id": 1, "role": "user", "content": "we were talking about kite crypto", "turn": 7, "created_at": "2026-03-29T03:49:01"},
             {"id": 2, "role": "assistant", "content": "KITE looks like the token, not the coding tool", "turn": 7, "created_at": "2026-03-29T03:49:02"},
             {"id": 3, "role": "user", "content": "are competitors closing the gap", "turn": 8, "created_at": "2026-03-29T03:51:31"},
-            {"id": 4, "role": "assistant", "content": "say that again for me", "turn": 8, "created_at": "2026-03-29T03:51:32"},
+            {"id": 4, "role": "assistant", "content": "I'm here with you. Say that again for me.", "turn": 8, "created_at": "2026-03-29T03:51:32"},
         ]
 
         with patch.object(server, "get_chat_messages", return_value=chat_messages):
@@ -182,6 +193,7 @@ class ChatFlowTests(unittest.TestCase):
         self.assertEqual(history[0]["user_input"], "we were talking about kite crypto")
         self.assertIn("token", history[0]["sylana_response"])
         self.assertEqual(history[1]["user_input"], "are competitors closing the gap")
+        self.assertEqual(history[1]["sylana_response"], "")
 
     def test_load_recent_history_for_turn_prefers_thread_history_over_memory_history(self):
         fake_manager = types.SimpleNamespace(get_conversation_history=lambda **kwargs: (_ for _ in ()).throw(AssertionError("memory history should not be used")))
