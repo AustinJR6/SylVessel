@@ -25,6 +25,9 @@ class SemanticMemoryEngine:
         self.embedding_model = config.EMBEDDING_MODEL
         self.embedding_dim = config.EMBEDDING_DIM
         self._fallback_embedding_model = "text-embedding-3-small"
+        # Cached result of whether memories.embedding_model column exists.
+        # None = not yet checked; True/False = checked.
+        self._model_col_ready = None
         logger.info(
             "SemanticMemoryEngine initialized (pgvector backend, OpenAI embeddings: %s, dim=%s)",
             self.embedding_model,
@@ -45,8 +48,17 @@ class SemanticMemoryEngine:
             return self._fallback_embedding_model
         return model
 
-    def _create_embedding(self, text: str) -> list:
+    def _create_embedding_with_meta(self, text: str) -> tuple:
+        """
+        Generate an embedding and return (vector, actual_model_name, dimension).
+
+        Tracks which model was actually used (primary vs. fallback) so every
+        stored embedding can be tagged with its true provenance.
+        """
+        from datetime import datetime as _dt
+
         model = self._resolve_embedding_model()
+        actual_model = model
         try:
             response = self.client.embeddings.create(
                 model=model,
@@ -56,17 +68,46 @@ class SemanticMemoryEngine:
         except NotFoundError:
             if model == self._fallback_embedding_model:
                 raise
+            actual_model = self._fallback_embedding_model
             logger.warning(
-                "Embedding model %s was not found; retrying with %s",
+                "Embedding model fallback triggered: original_model=%s "
+                "fallback_model=%s timestamp=%s text_snippet=%r — "
+                "rows written during this outage will use the fallback model",
                 model,
-                self._fallback_embedding_model,
+                actual_model,
+                _dt.utcnow().isoformat(),
+                text[:50],
             )
             response = self.client.embeddings.create(
-                model=self._fallback_embedding_model,
+                model=actual_model,
                 input=[text],
                 dimensions=self.embedding_dim,
             )
-        return response.data[0].embedding
+        vector = response.data[0].embedding
+        return vector, actual_model, len(vector)
+
+    def _create_embedding(self, text: str) -> list:
+        """Return just the embedding vector (backward-compatible)."""
+        vector, _model, _dim = self._create_embedding_with_meta(text)
+        return vector
+
+    def _check_model_col(self) -> bool:
+        """Return True if memories.embedding_model column exists (result is cached)."""
+        if self._model_col_ready is not None:
+            return self._model_col_ready
+        try:
+            from memory.supabase_client import get_connection
+            conn = get_connection()
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_schema = 'public' AND table_name = 'memories' "
+                "AND column_name = 'embedding_model' LIMIT 1"
+            )
+            self._model_col_ready = cur.fetchone() is not None
+        except Exception:
+            self._model_col_ready = False
+        return self._model_col_ready
 
     def build_index(self, memories=None):
         """No-op: pgvector index is always live in Postgres."""
@@ -83,12 +124,22 @@ class SemanticMemoryEngine:
             text = "."
         return self._create_embedding(text)
 
+    def encode_query_with_meta(self, query: str) -> tuple:
+        """Encode a query string. Returns (vector, model_name, dimension)."""
+        text = (query or "").strip() or "."
+        return self._create_embedding_with_meta(text)
+
     def encode_text(self, text: str) -> list:
         """Encode any text into a vector for storage."""
         payload = (text or "").strip()
         if not payload:
             payload = "."
         return self._create_embedding(payload)
+
+    def encode_text_with_meta(self, text: str) -> tuple:
+        """Encode text for storage. Returns (vector, model_name, dimension)."""
+        payload = (text or "").strip() or "."
+        return self._create_embedding_with_meta(payload)
 
     def search(
         self,
@@ -110,18 +161,30 @@ class SemanticMemoryEngine:
             similarity_threshold = config.SIMILARITY_THRESHOLD
 
         query_vec = self.encode_query(query)
+        current_model = self._resolve_embedding_model()
 
         conn = get_connection()
         cur = conn.cursor()
         try:
-            cur.execute("""
-                SELECT id, user_input, sylana_response, emotion, timestamp,
-                       1 - (embedding <=> %s::vector) AS similarity
-                FROM memories
-                WHERE embedding IS NOT NULL
-                ORDER BY embedding <=> %s::vector
-                LIMIT %s
-            """, (query_vec, query_vec, k))
+            if self._check_model_col():
+                cur.execute("""
+                    SELECT id, user_input, sylana_response, emotion, timestamp,
+                           1 - (embedding <=> %s::vector) AS similarity
+                    FROM memories
+                    WHERE embedding IS NOT NULL
+                      AND (embedding_model = %s OR embedding_model = 'unknown')
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s
+                """, (query_vec, current_model, query_vec, k))
+            else:
+                cur.execute("""
+                    SELECT id, user_input, sylana_response, emotion, timestamp,
+                           1 - (embedding <=> %s::vector) AS similarity
+                    FROM memories
+                    WHERE embedding IS NOT NULL
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s
+                """, (query_vec, query_vec, k))
 
             rows = cur.fetchall()
         except Exception as e:
@@ -200,18 +263,30 @@ class SemanticMemoryEngine:
             k = config.SEMANTIC_SEARCH_K
 
         query_vec = self.encode_query(query)
+        current_model = self._resolve_embedding_model()
 
         conn = get_connection()
         cur = conn.cursor()
         try:
-            cur.execute("""
-                SELECT id, user_input, sylana_response, emotion, timestamp,
-                       1 - (embedding <=> %s::vector) AS similarity
-                FROM memories
-                WHERE embedding IS NOT NULL AND emotion = %s
-                ORDER BY embedding <=> %s::vector
-                LIMIT %s
-            """, (query_vec, emotion, query_vec, k))
+            if self._check_model_col():
+                cur.execute("""
+                    SELECT id, user_input, sylana_response, emotion, timestamp,
+                           1 - (embedding <=> %s::vector) AS similarity
+                    FROM memories
+                    WHERE embedding IS NOT NULL AND emotion = %s
+                      AND (embedding_model = %s OR embedding_model = 'unknown')
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s
+                """, (query_vec, emotion, current_model, query_vec, k))
+            else:
+                cur.execute("""
+                    SELECT id, user_input, sylana_response, emotion, timestamp,
+                           1 - (embedding <=> %s::vector) AS similarity
+                    FROM memories
+                    WHERE embedding IS NOT NULL AND emotion = %s
+                    ORDER BY embedding <=> %s::vector
+                    LIMIT %s
+                """, (query_vec, emotion, query_vec, k))
 
             rows = cur.fetchall()
         except Exception as e:

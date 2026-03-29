@@ -2452,3 +2452,30 @@ class LysaraMemoryManager:
                 }
 
         return bundle
+
+    def prune_stale_data(self) -> dict:
+        """Prune Lysara tables per retention policy."""
+        retention_days = {
+            "trade_decision_log": 180,
+            "signal_history": 30,
+            "market_event_memory": 90,
+            "regime_history": 365,
+        }
+        results = {}
+        for table, days in retention_days.items():
+            try:
+                full_table = f"lysara.{table}"
+                with pooled_cursor() as cur:
+                    cur.execute(
+                        f"DELETE FROM {full_table} WHERE created_at < NOW() - INTERVAL %s RETURNING id",
+                        (f"{days} days",)
+                    )
+                    rows = cur.fetchall()
+                    count = len(rows) if rows else 0
+                results[table] = count
+                if count > 0:
+                    logger.info(f"Pruned {count} rows from {full_table} (>{days}d old)")
+            except Exception as e:
+                logger.warning(f"Prune failed for lysara.{table}: {e}")
+                results[table] = -1
+        return results

@@ -54,6 +54,9 @@ class Config:
         self.BACKEND_URL = os.getenv("BACKEND_URL", "").strip()
         self.RESEND_WEBHOOK_SECRET = _clean_secret_env("RESEND_WEBHOOK_SECRET")
         self.MEMORY_ENCRYPTION_KEY = _clean_secret_env("MEMORY_ENCRYPTION_KEY")
+        # Token required to call admin-only endpoints (e.g. POST /api/admin/reembed).
+        # If unset, admin endpoints are unrestricted (suitable for local dev only).
+        self.ADMIN_TOKEN = _clean_secret_env("ADMIN_TOKEN")
         self.CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514")
         self.OPENROUTER_BASE_URL = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").strip()
         self.OPENROUTER_SPICY_MODEL = os.getenv(

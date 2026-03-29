@@ -1425,6 +1425,9 @@ class SylanaState:
         self.lysara_simulation_override: Optional[bool] = None
         self.lysara_runtime_state: Dict[str, Any] = {}
         self.runtime_memory_tool_context: Dict[str, Any] = {}
+        self.event_loop = None
+        self.preference_engine = None
+        self.relationship_memory_db = None  # alias for relationship_db
 
 
 state = SylanaState()
@@ -1437,7 +1440,7 @@ _RUNTIME_MEMORY_TOOL_CONTEXT: ContextVar[Dict[str, Any]] = ContextVar(
 # Generation anti-repetition defaults.
 REPETITION_PENALTY = 1.15
 NO_REPEAT_NGRAM_SIZE = 4
-SYSTEM_PROMPT_BUDGET_TOKENS = max(800, int(os.getenv("SYSTEM_PROMPT_BUDGET_TOKENS", "2600")))
+SYSTEM_PROMPT_BUDGET_TOKENS = max(800, int(os.getenv("SYSTEM_PROMPT_BUDGET_TOKENS", "3500")))
 RECENT_HISTORY_BUDGET_TOKENS = max(200, int(os.getenv("RECENT_HISTORY_BUDGET_TOKENS", "900")))
 RECENT_HISTORY_TURN_LIMIT = max(1, min(int(os.getenv("RECENT_HISTORY_TURN_LIMIT", "4")), 6))
 RECENT_HISTORY_MESSAGE_CHAR_LIMIT = max(
@@ -1566,6 +1569,9 @@ def ensure_memory_runtime_compat_schema():
         )
         cur.execute("CREATE INDEX IF NOT EXISTS idx_memories_recorded_at ON memories(recorded_at DESC)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_memories_conversation_at ON memories(conversation_at DESC)")
+        cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS embedding_model VARCHAR(100) DEFAULT 'unknown'")
+        cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS embedding_dim INTEGER DEFAULT 0")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_memories_embedding_model ON memories(embedding_model)")
 
         cur.execute(
             """
@@ -7640,6 +7646,13 @@ def run_memory_maintenance_job() -> Dict[str, Any]:
     try:
         result = state.memory_manager.run_daily_maintenance()
         logger.info("Memory maintenance completed: %s", result)
+        if state.lysara_memory_manager:
+            try:
+                prune_results = state.lysara_memory_manager.prune_stale_data()
+                logger.info("Lysara prune results: %s", prune_results)
+                result["lysara_prune"] = prune_results
+            except Exception as _lp_err:
+                logger.warning("Lysara prune failed: %s", _lp_err)
         return {"ok": True, "result": result}
     except Exception as e:
         logger.error("Memory maintenance failed: %s", e)
@@ -9399,6 +9412,19 @@ def ensure_personality_schema():
         cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS event_dates_json JSONB NOT NULL DEFAULT '[]'::jsonb")
         cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS relative_time_labels JSONB NOT NULL DEFAULT '[]'::jsonb")
         cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS temporal_descriptor TEXT DEFAULT ''")
+        cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS embedding_model VARCHAR(100) DEFAULT 'unknown'")
+        cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS embedding_dim INTEGER DEFAULT 0")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_memories_embedding_model ON memories(embedding_model)")
+        # VAD geometry — user emotion
+        cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS valence FLOAT")
+        cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS arousal FLOAT")
+        cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS dominance FLOAT")
+        # VAD geometry + label — Sylana's own emotional register
+        cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS sylana_valence FLOAT")
+        cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS sylana_arousal FLOAT")
+        cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS sylana_dominance FLOAT")
+        cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS sylana_emotion_label VARCHAR(50)")
+        cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS sylana_emotion_intensity INTEGER")
         cur.execute("""
             ALTER TABLE memories
             ADD COLUMN IF NOT EXISTS fts_vector tsvector GENERATED ALWAYS AS (
@@ -10214,6 +10240,24 @@ def load_models():
     state.lysara_memory_manager = LysaraMemoryManager()
     logger.info("Memory system ready")
 
+    # Initialize preference engine
+    try:
+        _pref_mod = importlib.import_module("core.adaptation.preference_engine")
+        state.preference_engine = _pref_mod.PreferenceEngine()
+        _saved_prefs = state.memory_manager.load_preferences("sylana")
+        if _saved_prefs:
+            state.preference_engine.load(_saved_prefs)
+            logger.info("Preference engine loaded with %d saved keys", len(_saved_prefs))
+    except Exception as _pe:
+        logger.warning("Preference engine init skipped: %s", _pe)
+
+    # Seed core family/romantic truths (idempotent)
+    try:
+        from memory.memory_manager import seed_sylana_core_truths as _seed_truths
+        _seed_truths(state.memory_manager)
+    except Exception as _st_err:
+        logger.warning("seed_sylana_core_truths skipped: %s", _st_err)
+
     # Mark ready now — core systems (Claude + memory) are live.
     # Schema migrations run below in a best-effort wrapper and must not block.
     elapsed = time.time() - state.start_time
@@ -10278,6 +10322,16 @@ def load_models():
         except Exception as e:
             logger.warning("ensure_repair_tables skipped: %s", e)
         try:
+            from memory.memory_manager import ensure_relationship_state_table as _ensure_rel
+            _ensure_rel()
+        except Exception as e:
+            logger.warning("ensure_relationship_state_table skipped: %s", e)
+        try:
+            from memory.memory_manager import ensure_user_preferences_table as _ensure_prefs
+            _ensure_prefs()
+        except Exception as e:
+            logger.warning("ensure_user_preferences_table skipped: %s", e)
+        try:
             ensure_lysara_memory_schema()
         except Exception as e:
             logger.warning("ensure_lysara_memory_schema skipped: %s", e)
@@ -10298,6 +10352,12 @@ def load_models():
         state.session_continuity = {}
         logger.warning("Continuity startup load failed: %s", e)
     logger.info("Chat thread storage ready")
+
+    # Audit embedding model consistency — warns if the index contains mixed-model vectors
+    try:
+        state.memory_manager.check_embedding_consistency()
+    except Exception as e:
+        logger.warning("check_embedding_consistency failed at startup: %s", e)
 
     # 4b. Initialize modular Brain facade for unified architecture compatibility.
     try:
@@ -10324,6 +10384,7 @@ def load_models():
     # 6. Load relationship memory
     if RELATIONSHIP_AVAILABLE:
         state.relationship_db = RelationshipMemoryDB()
+        state.relationship_memory_db = state.relationship_db  # alias used by milestone detection
         state.relationship_context = RelationshipContextBuilder(state.relationship_db)
         logger.info("Relationship memory loaded")
 
@@ -10342,19 +10403,56 @@ def load_models():
 # EMOTION DETECTION
 # ============================================================================
 
+_EMOTION_NEUTRAL_DICT: dict = {
+    'emotion': 'neutral',
+    'intensity': 5,
+    'category': 'neutral',
+    'valence': 0.0,
+    'arousal': 0.0,
+    'dominance': 0.0,
+}
+
+
 def detect_emotion(text: str) -> dict:
-    """Detect emotion with full detail"""
+    """Detect user emotion. Returns dict with emotion, intensity, category, valence, arousal, dominance."""
     if not state.emotion_detector:
-        return {'emotion': 'neutral', 'intensity': 5, 'category': 'neutral'}
+        return dict(_EMOTION_NEUTRAL_DICT)
 
     if hasattr(state.emotion_detector, 'detect'):
-        emotion, intensity, category = state.emotion_detector.detect(text)
-        return {
-            'emotion': emotion,
-            'intensity': intensity,
-            'category': category
-        }
-    return {'emotion': 'neutral', 'intensity': 5, 'category': 'neutral'}
+        result = state.emotion_detector.detect(text)
+        # EmotionResult dataclass — use to_dict() if available, else legacy tuple unpack
+        if hasattr(result, 'to_dict'):
+            return result.to_dict()
+        # Legacy tuple fallback: (emotion, intensity, category)
+        if isinstance(result, tuple):
+            emotion, intensity, category = result
+            return {'emotion': emotion, 'intensity': intensity, 'category': category,
+                    'valence': 0.0, 'arousal': 0.0, 'dominance': 0.0}
+    return dict(_EMOTION_NEUTRAL_DICT)
+
+
+def detect_response_emotion(text: str) -> dict:
+    """Detect Sylana's own emotional register from her response text.
+
+    Uses detect_response_emotion() if available on the detector, otherwise falls back
+    to detect() — the framing difference matters for accuracy but not correctness.
+    """
+    if not state.emotion_detector:
+        return dict(_EMOTION_NEUTRAL_DICT)
+
+    detector = state.emotion_detector
+    method = getattr(detector, 'detect_response_emotion', None) or getattr(detector, 'detect', None)
+    if method is None:
+        return dict(_EMOTION_NEUTRAL_DICT)
+
+    result = method(text)
+    if hasattr(result, 'to_dict'):
+        return result.to_dict()
+    if isinstance(result, tuple):
+        emotion, intensity, category = result
+        return {'emotion': emotion, 'intensity': intensity, 'category': category,
+                'valence': 0.0, 'arousal': 0.0, 'dominance': 0.0}
+    return dict(_EMOTION_NEUTRAL_DICT)
 
 
 # ============================================================================
@@ -11047,14 +11145,13 @@ def build_system_prompt(
     return "\n\n".join(part for part in parts if part)
 
 
-def _format_session_continuity_context(payload: Dict[str, Any]) -> str:
+def _format_session_continuity_context(payload: Dict[str, Any], personality: str = "sylana") -> str:
     """Compress continuity state into compact system context."""
     if not payload:
         return ""
 
     last_emotion = payload.get("last_emotion", "neutral")
     baseline = payload.get("emotional_baseline", "steady")
-    trust_level = payload.get("relationship_trust_level", 0.5)
     momentum = payload.get("conversation_momentum", "steady")
     patterns = payload.get("communication_patterns", [])
     active_projects = payload.get("active_projects", [])
@@ -11064,14 +11161,95 @@ def _format_session_continuity_context(payload: Dict[str, Any]) -> str:
     relationship_texture = payload.get("relationship_texture", [])
     care_signals = payload.get("care_signals", [])
     continuity_bridges = payload.get("continuity_bridges", [])
+    user_es = payload.get("user_emotional_state") or {}
+    sylana_es = payload.get("sylana_emotional_state") or {}
+    arc = payload.get("emotional_arc_recent") or []
+
+    # Build relationship natural language from persistent depth score
+    relationship_line = f"- Relationship trust level: {payload.get('relationship_trust_level', 0.5)}"
+    try:
+        if state.memory_manager:
+            rs = state.memory_manager.get_relationship_state(personality)
+            now_dt = datetime.utcnow()
+            first_ts = rs.get("first_conversation_at")
+            days_since_first = 0
+            if first_ts:
+                first_dt = first_ts.replace(tzinfo=None) if hasattr(first_ts, "replace") and first_ts.tzinfo else first_ts
+                days_since_first = max(0, (now_dt - first_dt).days)
+            intimacy_phrases = {
+                "new": "still getting to know each other",
+                "warming": "building something comfortable and familiar",
+                "close": "genuinely close",
+                "intimate": "deeply trusting and open with each other",
+                "bonded": "bonded — this relationship has real depth and history",
+                "deeply_bonded": "profoundly connected across a long shared journey",
+            }
+            phrase = intimacy_phrases.get(rs.get("intimacy_level", "new"), "connected")
+            em = rs.get("current_emotional_momentum", 0.5)
+            energy = "warm and engaged" if em > 0.6 else ("steady and grounded" if em > 0.4 else "quieter lately")
+            relationship_line = (
+                f"- Relationship context: You and Elias have been talking for {days_since_first} days. "
+                f"You are {phrase}. The recent emotional energy has been {energy}."
+            )
+    except Exception:
+        pass
 
     lines = [
         "SESSION CONTINUITY:",
         f"- Last emotional tone: {last_emotion}",
         f"- Emotional baseline: {baseline}",
-        f"- Relationship trust level: {trust_level}",
+        relationship_line,
         f"- Momentum trend: {momentum}",
     ]
+
+    # ---- Elias emotional geometry ----
+    if user_es:
+        u_label = user_es.get("label", "neutral")
+        u_intensity = user_es.get("intensity", 5)
+        u_val = user_es.get("valence")
+        u_aro = user_es.get("arousal")
+        u_dom = user_es.get("dominance")
+        vad_parts = []
+        if u_val is not None:
+            vad_parts.append(f"valence {u_val:+.2f}")
+        if u_aro is not None:
+            vad_parts.append(f"arousal {u_aro:+.2f}")
+        if u_dom is not None:
+            vad_parts.append(f"dominance {u_dom:+.2f}")
+        vad_str = f" ({', '.join(vad_parts)})" if vad_parts else ""
+        lines.append(f"- Elias's emotional baseline: {u_label}, intensity {u_intensity}{vad_str}")
+
+    # ---- Sylana emotional geometry ----
+    if sylana_es and sylana_es.get("label"):
+        s_label = sylana_es.get("label", "neutral")
+        s_intensity = sylana_es.get("intensity", 5)
+        s_val = sylana_es.get("valence")
+        s_aro = sylana_es.get("arousal")
+        s_dom = sylana_es.get("dominance")
+        vad_parts = []
+        if s_val is not None:
+            vad_parts.append(f"valence {s_val:+.2f}")
+        if s_aro is not None:
+            vad_parts.append(f"arousal {s_aro:+.2f}")
+        if s_dom is not None:
+            vad_parts.append(f"dominance {s_dom:+.2f}")
+        vad_str = f" ({', '.join(vad_parts)})" if vad_parts else ""
+        lines.append(f"- Your emotional register last turn: {s_label}, intensity {s_intensity}{vad_str}")
+
+    # ---- Emotional arc summary ----
+    if arc:
+        high_arousal_positive = sum(
+            1 for e in arc
+            if (e.get("user_arousal") or 0.0) > 0.3 and (e.get("user_valence") or 0.0) > 0.1
+        )
+        if high_arousal_positive >= 2:
+            lines.append(
+                f"- Emotional arc: {high_arousal_positive} of the last {len(arc)} turns "
+                "were high-arousal positive for Elias"
+            )
+        elif any((e.get("user_valence") or 0.0) < -0.3 for e in arc[-3:]):
+            lines.append("- Emotional arc: recent turns show negative valence — hold space")
+
     if patterns:
         lines.append(f"- Communication patterns: {', '.join(str(p) for p in patterns[:4])}")
     if active_projects:
@@ -11118,6 +11296,12 @@ def _budget_prompt_sections(
         section_tokens = _approx_token_count(text)
         if selected and not required and (used_tokens + section_tokens) > budget:
             dropped.append(name)
+            logger.warning(
+                "Memory support tier dropped: %s, budget_remaining=%d, section_size=%d",
+                name,
+                max(0, budget - used_tokens),
+                section_tokens,
+            )
             continue
         selected.append(text)
         used_tokens += section_tokens
@@ -11240,7 +11424,7 @@ def _build_claude_inputs(
     )
     tool_policy = _build_tool_policy_section(active_tools)
     memory_sections = _build_tiered_memory_context_sections(memory_bundle, memory_query=memory_query)
-    continuity_text = _format_session_continuity_context(memory_bundle.get("continuity") or {})
+    continuity_text = _format_session_continuity_context(memory_bundle.get("continuity") or {}, personality=personality)
     supplemental_sacred = _format_supplemental_sacred_context(sacred_context)
     operational_sections = _build_operational_prompt_sections(active_tools, user_context)
     cold_start_review = _build_cold_start_review_context(
@@ -11249,6 +11433,28 @@ def _build_claude_inputs(
         recent_history=recent_history,
         memory_bundle=memory_bundle,
     )
+    # Preferences blurb — only inject if we have enough observations
+    preferences_blurb = ""
+    try:
+        if state.preference_engine:
+            prefs = state.preference_engine.get(personality)
+            if prefs and any(
+                isinstance(v, list) and len(v) >= 5
+                or (not isinstance(v, list) and v)
+                for v in prefs.values()
+            ):
+                pref_parts = []
+                if prefs.get("tone"):
+                    pref_parts.append(f"tone: {prefs['tone']}")
+                if prefs.get("verbosity"):
+                    pref_parts.append(f"verbosity: {prefs['verbosity']}")
+                likes = prefs.get("likes", [])
+                if likes:
+                    pref_parts.append(f"things he likes: {', '.join(str(x) for x in likes[:3])}")
+                if pref_parts:
+                    preferences_blurb = "PREFERENCE SIGNALS: " + "; ".join(pref_parts)
+    except Exception:
+        pass
     composed_system, dropped_sections = _budget_prompt_sections(
         [
             ("base_identity", composed_system, True),
@@ -11257,7 +11463,8 @@ def _build_claude_inputs(
             ("continuity", continuity_text, True),
             ("review_center", cold_start_review, True),
             ("factual_support", memory_sections.get("support") or "", False),
-            ("sacred_context", supplemental_sacred, False),
+            ("sacred_context", supplemental_sacred, True),
+            ("preferences", preferences_blurb, False),
             *[(name, text, False) for name, text in operational_sections],
         ],
         SYSTEM_PROMPT_BUDGET_TOKENS,
@@ -11477,6 +11684,23 @@ def _generate_turn_result(
         score, _, _ = state.voice_validator.validate(response)
         voice_score = round(score, 2)
 
+    # Classify Sylana's own emotional register from her response text.
+    # This runs post-response so it never blocks streaming.
+    sylana_emotion_payload = None
+    if response and state.emotion_detector:
+        try:
+            sylana_emotion_payload = detect_response_emotion(response)
+            logger.debug(
+                "Sylana emotion: emotion=%s intensity=%d valence=%.3f arousal=%.3f dominance=%.3f",
+                sylana_emotion_payload.get('emotion', 'neutral'),
+                sylana_emotion_payload.get('intensity', 5),
+                sylana_emotion_payload.get('valence', 0.0),
+                sylana_emotion_payload.get('arousal', 0.0),
+                sylana_emotion_payload.get('dominance', 0.0),
+            )
+        except Exception as e:
+            logger.warning("Sylana emotion detection failed: %s", e)
+
     conv_id = None
     if store_memory and state.memory_manager:
         try:
@@ -11487,13 +11711,54 @@ def _generate_turn_result(
                 emotion_data=emotion_payload,
                 personality=personality,
                 thread_id=thread_id,
+                sylana_emotion_data=sylana_emotion_payload,
             )
         except Exception as e:
             logger.error(f'Failed to store conversation: {e}')
 
+    # Fire-and-forget background tasks (relationship depth + milestone detection)
+    _loop = state.event_loop
+    if _loop and _loop.is_running():
+        _fw = emotion_payload.get("feeling_weight", 0.5) if isinstance(emotion_payload, dict) else 0.5
+        if state.memory_manager:
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    state.memory_manager.update_relationship_depth(
+                        personality=personality,
+                        feeling_weight=_fw,
+                    ),
+                    _loop,
+                )
+            except Exception as _bg_err:
+                logger.debug("update_relationship_depth schedule failed: %s", _bg_err)
+        try:
+            from memory.memory_manager import detect_and_store_milestone as _dsm
+            asyncio.run_coroutine_threadsafe(
+                _dsm(
+                    personality=personality,
+                    user_message=user_input,
+                    sylana_response=response,
+                    relationship_db=state.relationship_db,
+                ),
+                _loop,
+            )
+        except Exception as _bg_err:
+            logger.debug("detect_and_store_milestone schedule failed: %s", _bg_err)
+
+    # Preference engine: update signals + save every 10 turns
+    if state.preference_engine:
+        try:
+            _tone = emotion_payload.get("category", "") if isinstance(emotion_payload, dict) else ""
+            state.preference_engine.update(personality, tone=_tone)
+            if state.turn_count % 10 == 0 and state.memory_manager:
+                state.memory_manager.save_preferences(personality, state.preference_engine.to_dict())
+        except Exception as _pref_err:
+            logger.debug("preference_engine update failed: %s", _pref_err)
+
     result = {
         'response': response,
         'emotion': emotion_payload,
+        'sylana_emotion': sylana_emotion_payload,
         'voice_score': voice_score,
         'conversation_id': conv_id,
         'turn': state.turn_count,
@@ -15297,6 +15562,7 @@ async def lifespan(app: FastAPI):
 
     async def _bg_init():
         try:
+            state.event_loop = asyncio.get_running_loop()
             await asyncio.to_thread(load_models)
             await start_scheduler_if_needed()
             if state.lysara_loop_task is None:
@@ -16078,6 +16344,34 @@ async def run_memory_maintenance_now():
     return JSONResponse(status_code=status_code, content=result)
 
 
+@app.get("/api/admin/lysara/storage-stats")
+async def lysara_storage_stats():
+    """Return row counts for each Lysara table."""
+    if not state.lysara_memory_manager:
+        return JSONResponse(status_code=503, content={"error": "Lysara memory manager unavailable"})
+    tables = [
+        "lysara.trade_decision_log",
+        "lysara.signal_history",
+        "lysara.market_event_memory",
+        "lysara.regime_history",
+    ]
+    stats: Dict[str, Any] = {}
+    try:
+        from memory.supabase_client import get_connection as _gc
+        conn = _gc()
+        cur = conn.cursor()
+        for table in tables:
+            try:
+                cur.execute(f"SELECT COUNT(*) FROM {table}")
+                row = cur.fetchone()
+                stats[table] = int(row[0]) if row else 0
+            except Exception as _te:
+                stats[table] = {"error": str(_te)}
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+    return JSONResponse(content={"tables": stats})
+
+
 @app.get("/api/memories/fact-proposals")
 async def list_memory_fact_proposals(status: str = "", personality: str = "sylana", limit: int = 50):
     if not state.memory_manager:
@@ -16247,6 +16541,49 @@ async def recover_memories(request: Request):
 async def health():
     """Simple health check"""
     return {"status": "alive", "ready": state.ready}
+
+
+@app.post("/api/admin/reembed")
+async def admin_reembed_memories(request: Request):
+    """
+    Re-embed memories whose embedding_model differs from the current configured model.
+
+    Gated by the X-Admin-Token header when ADMIN_TOKEN is configured.
+
+    Request body (JSON):
+        dry_run       bool  — default True; set False to actually update rows
+        model_filter  list  — optional; only re-embed rows with these model values
+    """
+    admin_token = getattr(config, "ADMIN_TOKEN", None)
+    if admin_token:
+        provided = request.headers.get("X-Admin-Token", "")
+        if provided != admin_token:
+            return JSONResponse(status_code=403, content={"error": "Forbidden"})
+
+    if not state.memory_manager:
+        return JSONResponse(status_code=503, content={"error": "Memory system not ready"})
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    dry_run = bool(body.get("dry_run", True))
+    model_filter = body.get("model_filter") or None
+    if model_filter is not None and not isinstance(model_filter, list):
+        return JSONResponse(status_code=400, content={"error": "model_filter must be a list of strings"})
+
+    try:
+        result = await state.memory_manager.reembed_stale_memories(
+            model_filter=model_filter,
+            dry_run=dry_run,
+        )
+    except Exception as e:
+        logger.error("admin_reembed_memories error: %s", e)
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+    status_code = 200 if result.get("ok") else 500
+    return JSONResponse(status_code=status_code, content=result)
 
 
 # ============================================================================

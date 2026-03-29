@@ -78,13 +78,13 @@ class MemoryConsolidator:
                 mtype = items[0]["memory_type"]
                 text = f"[META-MEMORY {key}] {summary}"
                 try:
-                    emb = self.semantic_engine.encode_text(text)
+                    emb, emb_model, emb_dim = self.semantic_engine.encode_text_with_meta(text)
                     cur.execute(
                         """
                         INSERT INTO memories (
                             user_input, sylana_response, timestamp, emotion, embedding, personality, privacy_level,
-                            memory_type, significance_score
-                        ) VALUES (%s, %s, %s, %s, %s, %s, 'private', %s, %s)
+                            memory_type, significance_score, embedding_model, embedding_dim
+                        ) VALUES (%s, %s, %s, %s, %s, %s, 'private', %s, %s, %s, %s)
                         """,
                         (
                             f"Consolidated memory cluster ({key})",
@@ -95,6 +95,8 @@ class MemoryConsolidator:
                             persona,
                             mtype,
                             0.95,
+                            emb_model,
+                            emb_dim,
                         ),
                     )
                     created += 1

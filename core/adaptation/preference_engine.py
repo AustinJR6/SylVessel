@@ -22,3 +22,12 @@ class PreferenceEngine:
 
     def get(self, identity: str) -> Dict[str, Any]:
         return dict(self._prefs.get(identity, {}))
+
+    def load(self, preferences_dict: dict) -> None:
+        """Restore state from a previously saved dict."""
+        if isinstance(preferences_dict, dict):
+            self._prefs.update(preferences_dict)
+
+    def to_dict(self) -> dict:
+        """Serialize current state for persistence."""
+        return dict(self._prefs)
