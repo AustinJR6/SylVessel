@@ -232,6 +232,192 @@ CREATE INDEX IF NOT EXISTS idx_vessel_dreams_date
     ON vessel_dreams(personality, dream_date DESC);
 
 -- ============================================================================
+-- Public schema: proactive runtime + maintenance review/repair sync
+-- ============================================================================
+
+ALTER TABLE work_sessions ADD COLUMN IF NOT EXISTS session_mode TEXT NOT NULL DEFAULT 'main';
+ALTER TABLE work_sessions ADD COLUMN IF NOT EXISTS trigger_source TEXT NOT NULL DEFAULT 'user';
+ALTER TABLE work_sessions ADD COLUMN IF NOT EXISTS parent_session_id UUID REFERENCES work_sessions(session_id) ON DELETE SET NULL;
+ALTER TABLE work_sessions ADD COLUMN IF NOT EXISTS announcement_target TEXT;
+
+ALTER TABLE schedule_configs ADD COLUMN IF NOT EXISTS job_kind TEXT NOT NULL DEFAULT 'prospect_research';
+ALTER TABLE schedule_configs ADD COLUMN IF NOT EXISTS execution_mode TEXT NOT NULL DEFAULT 'isolated';
+ALTER TABLE schedule_configs ADD COLUMN IF NOT EXISTS target_entity TEXT NOT NULL DEFAULT 'claude';
+ALTER TABLE schedule_configs ADD COLUMN IF NOT EXISTS prompt TEXT;
+ALTER TABLE schedule_configs ADD COLUMN IF NOT EXISTS announce_policy TEXT NOT NULL DEFAULT 'important_only';
+
+CREATE TABLE IF NOT EXISTS proactive_notes (
+    note_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    source TEXT NOT NULL,
+    source_id TEXT,
+    session_id UUID REFERENCES work_sessions(session_id) ON DELETE SET NULL,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    severity TEXT NOT NULL DEFAULT 'info',
+    status TEXT NOT NULL DEFAULT 'pending',
+    dedupe_key TEXT,
+    announce_policy TEXT NOT NULL DEFAULT 'important_only',
+    requires_approval BOOLEAN NOT NULL DEFAULT FALSE,
+    approval_status TEXT NOT NULL DEFAULT 'not_required',
+    approved_by TEXT,
+    approved_at TIMESTAMPTZ,
+    approval_reason TEXT,
+    execution_status TEXT NOT NULL DEFAULT 'not_executed',
+    executed_at TIMESTAMPTZ,
+    stale_reason TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    visible_after TIMESTAMPTZ,
+    expires_at TIMESTAMPTZ,
+    processed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS runtime_hooks (
+    hook_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    event_name TEXT NOT NULL,
+    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+    target_entity TEXT NOT NULL DEFAULT 'claude',
+    session_mode TEXT NOT NULL DEFAULT 'isolated',
+    action_kind TEXT NOT NULL DEFAULT 'enqueue_note',
+    action_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS autonomy_preferences (
+    preference_key TEXT PRIMARY KEY,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS proactive_note_events (
+    event_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    note_id UUID REFERENCES proactive_notes(note_id) ON DELETE CASCADE,
+    event_kind TEXT NOT NULL,
+    actor TEXT NOT NULL DEFAULT 'system',
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE proactive_notes ADD COLUMN IF NOT EXISTS requires_approval BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE proactive_notes ADD COLUMN IF NOT EXISTS approval_status TEXT NOT NULL DEFAULT 'not_required';
+ALTER TABLE proactive_notes ADD COLUMN IF NOT EXISTS approved_by TEXT;
+ALTER TABLE proactive_notes ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ;
+ALTER TABLE proactive_notes ADD COLUMN IF NOT EXISTS approval_reason TEXT;
+ALTER TABLE proactive_notes ADD COLUMN IF NOT EXISTS execution_status TEXT NOT NULL DEFAULT 'not_executed';
+ALTER TABLE proactive_notes ADD COLUMN IF NOT EXISTS executed_at TIMESTAMPTZ;
+ALTER TABLE proactive_notes ADD COLUMN IF NOT EXISTS stale_reason TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_proactive_notes_status_visible ON proactive_notes(status, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_proactive_notes_dedupe_pending
+    ON proactive_notes(dedupe_key)
+    WHERE dedupe_key IS NOT NULL AND status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_runtime_hooks_event_enabled ON runtime_hooks(event_name, enabled);
+CREATE INDEX IF NOT EXISTS idx_proactive_note_events_note_created
+    ON proactive_note_events(note_id, created_at DESC);
+
+INSERT INTO autonomy_preferences (preference_key, payload)
+VALUES (
+    'sylana',
+    '{
+      "delivery_mode": "rare_push",
+      "allowed_domains": {"internal": true, "outreach": true, "lysara": true},
+      "quiet_hours": {"enabled": false, "start": "22:00", "end": "08:00", "timezone": "America/Chicago"},
+      "daily_autonomous_cap": 3,
+      "high_confidence_care_push_enabled": true
+    }'::jsonb
+)
+ON CONFLICT (preference_key) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS repair_incidents (
+    incident_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    dedupe_key TEXT NOT NULL UNIQUE,
+    repo TEXT NOT NULL,
+    environment TEXT NOT NULL DEFAULT 'production',
+    source TEXT NOT NULL,
+    severity TEXT NOT NULL DEFAULT 'warning',
+    status TEXT NOT NULL DEFAULT 'detected',
+    symptom_summary TEXT NOT NULL,
+    reproduction_hints JSONB NOT NULL DEFAULT '{}'::jsonb,
+    root_cause_summary TEXT,
+    latest_run_id UUID,
+    pr_url TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    resolved_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS repair_runs (
+    run_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    incident_id UUID NOT NULL REFERENCES repair_incidents(incident_id) ON DELETE CASCADE,
+    repo TEXT NOT NULL,
+    environment TEXT NOT NULL DEFAULT 'production',
+    branch_name TEXT,
+    base_branch TEXT NOT NULL DEFAULT 'main',
+    workspace_path TEXT,
+    status TEXT NOT NULL DEFAULT 'investigating',
+    root_cause_summary TEXT,
+    patch_summary TEXT,
+    verification_summary TEXT,
+    risk_level TEXT NOT NULL DEFAULT 'medium',
+    pr_number INTEGER,
+    pr_url TEXT,
+    note_id UUID REFERENCES proactive_notes(note_id) ON DELETE SET NULL,
+    artifact_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    proposed_by TEXT NOT NULL DEFAULT 'maintenance-controller',
+    approved_by TEXT,
+    approved_at TIMESTAMPTZ,
+    merged_at TIMESTAMPTZ,
+    deployed_at TIMESTAMPTZ,
+    rejected_at TIMESTAMPTZ,
+    failure_reason TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS repair_events (
+    event_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    incident_id UUID REFERENCES repair_incidents(incident_id) ON DELETE CASCADE,
+    run_id UUID REFERENCES repair_runs(run_id) ON DELETE CASCADE,
+    event_kind TEXT NOT NULL,
+    actor TEXT NOT NULL DEFAULT 'system',
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE repair_incidents ADD COLUMN IF NOT EXISTS latest_run_id UUID;
+ALTER TABLE repair_incidents ADD COLUMN IF NOT EXISTS root_cause_summary TEXT;
+ALTER TABLE repair_incidents ADD COLUMN IF NOT EXISTS pr_url TEXT;
+ALTER TABLE repair_incidents ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE repair_incidents ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ;
+
+ALTER TABLE repair_runs ADD COLUMN IF NOT EXISTS branch_name TEXT;
+ALTER TABLE repair_runs ADD COLUMN IF NOT EXISTS base_branch TEXT NOT NULL DEFAULT 'main';
+ALTER TABLE repair_runs ADD COLUMN IF NOT EXISTS workspace_path TEXT;
+ALTER TABLE repair_runs ADD COLUMN IF NOT EXISTS note_id UUID REFERENCES proactive_notes(note_id) ON DELETE SET NULL;
+ALTER TABLE repair_runs ADD COLUMN IF NOT EXISTS artifact_payload JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE repair_runs ADD COLUMN IF NOT EXISTS proposed_by TEXT NOT NULL DEFAULT 'maintenance-controller';
+ALTER TABLE repair_runs ADD COLUMN IF NOT EXISTS approved_by TEXT;
+ALTER TABLE repair_runs ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ;
+ALTER TABLE repair_runs ADD COLUMN IF NOT EXISTS merged_at TIMESTAMPTZ;
+ALTER TABLE repair_runs ADD COLUMN IF NOT EXISTS deployed_at TIMESTAMPTZ;
+ALTER TABLE repair_runs ADD COLUMN IF NOT EXISTS rejected_at TIMESTAMPTZ;
+ALTER TABLE repair_runs ADD COLUMN IF NOT EXISTS failure_reason TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_repair_incidents_status_seen
+    ON repair_incidents(status, last_seen_at DESC);
+CREATE INDEX IF NOT EXISTS idx_repair_incidents_repo_status
+    ON repair_incidents(repo, status, last_seen_at DESC);
+CREATE INDEX IF NOT EXISTS idx_repair_runs_incident_created
+    ON repair_runs(incident_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_repair_runs_status_created
+    ON repair_runs(status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_repair_events_incident_created
+    ON repair_events(incident_id, created_at DESC);
+
+-- ============================================================================
 -- Lysara schema
 -- ============================================================================
 

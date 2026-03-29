@@ -1,0 +1,19 @@
+[Unit]
+Description=Sylana Maintenance Controller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=deploy
+WorkingDirectory=/opt/SylVesselMaintenance
+EnvironmentFile=/opt/SylVesselMaintenance/.env
+ExecStart=/opt/SylVesselMaintenance/.venv/bin/python -m maintenance_controller.controller loop
+Restart=always
+RestartSec=10
+TimeoutStopSec=20
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

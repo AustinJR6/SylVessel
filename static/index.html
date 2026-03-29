@@ -901,6 +901,7 @@
             summary: { quiet_notes: 0, approvals: 0, prepared_work: 0, total: 0 },
             sections: { quiet_notes: [], approvals: [], prepared_work: [] },
         };
+        let repairIncidents = [];
 
         function normalizeActiveTools(tools) {
             if (!Array.isArray(tools) || tools.length === 0) return [...defaultActiveTools];
@@ -959,18 +960,66 @@
                 : `Sylana has ${count} review item${count === 1 ? '' : 's'} waiting in the inbox.`;
         }
 
+        function visibleRepairIncidents() {
+            return (Array.isArray(repairIncidents) ? repairIncidents : []).filter((incident) => {
+                const status = String(incident && incident.status || '').toLowerCase();
+                const hasPr = Boolean(incident && incident.pr_url);
+                return !hasPr && ['detected', 'investigating', 'failed'].includes(status);
+            });
+        }
+
+        function renderRepairIncidentCards(incidents) {
+            if (!Array.isArray(incidents) || !incidents.length) return '';
+            const cards = incidents.map((incident) => {
+                const severity = String(incident.severity || 'warning');
+                const status = String(incident.status || 'detected');
+                const hints = incident.reproduction_hints || {};
+                const workflowUrl = typeof hints.html_url === 'string' && hints.html_url ? hints.html_url : '';
+                const rootCause = incident.root_cause_summary
+                    ? `<div class="note-card-why"><strong>Root cause:</strong> ${escapeHtml(String(incident.root_cause_summary))}</div>`
+                    : '';
+                const investigateDisabled = status === 'investigating' ? ' disabled' : '';
+                return `
+                    <div class="note-card">
+                        <div class="note-card-title">${escapeHtml(incident.symptom_summary || 'Repair incident')}</div>
+                        <div class="note-card-meta">
+                            <span class="note-chip">${escapeHtml(severity)}</span>
+                            <span class="note-chip">${escapeHtml(status)}</span>
+                            <span class="note-chip">${escapeHtml(formatRelativeTime(incident.last_seen_at || incident.first_seen_at))}</span>
+                        </div>
+                        ${rootCause}
+                        <div class="note-card-actions">
+                            <button class="note-action primary" onclick="investigateRepairIncident('${encodeURIComponent(String(incident.incident_id || ''))}')"${investigateDisabled}>Investigate</button>
+                            ${workflowUrl ? `<button class="note-action" onclick="openRouteTarget('${encodeURIComponent(String(workflowUrl || ''))}')">Open Workflow</button>` : ''}
+                        </div>
+                    </div>
+                `;
+            }).join('');
+            return `
+                <div class="inbox-group">
+                    <div class="inbox-group-title">Repair Incidents</div>
+                    ${cards}
+                </div>
+            `;
+        }
+
         function renderInbox() {
             if (!inboxList || !inboxCount) return;
             const summary = reviewQueue.summary || {};
             const sectionsMap = reviewQueue.sections || {};
-            inboxCount.textContent = `${summary.total || 0} review item${(summary.total || 0) === 1 ? '' : 's'}`;
+            const incidents = visibleRepairIncidents();
+            inboxCount.textContent = `${summary.total || 0} review item${(summary.total || 0) === 1 ? '' : 's'}${incidents.length ? ` · ${incidents.length} incident${incidents.length === 1 ? '' : 's'}` : ''}`;
             updateQuietBanner();
-            if (!summary.total) {
+            if (!summary.total && !incidents.length) {
                 inboxList.innerHTML = '<div class="inbox-empty">No review items right now. Quiet notes, approvals, and prepared work will appear here instead of interrupting chat.</div>';
                 return;
             }
 
             const sections = [];
+            const incidentMarkup = renderRepairIncidentCards(incidents);
+            if (incidentMarkup) {
+                sections.push(incidentMarkup);
+            }
             const orderedSections = [
                 ['quiet_notes', 'Quiet'],
                 ['approvals', 'Approvals'],
@@ -983,6 +1032,11 @@
                     const relatedText = note.thread_id ? `Thread ${note.thread_id}` : 'General continuity';
                     const actionText = note.action_kind && note.action_kind !== 'none' ? `<span class="note-chip">${escapeHtml(String(note.action_kind).replace(/_/g, ' '))}</span>` : '';
                     const whyNow = note.why_now ? `<div class="note-card-why"><strong>Why now:</strong> ${escapeHtml(note.why_now)}</div>` : '';
+                    const repairMeta = note.metadata || {};
+                    const repairLink = typeof repairMeta.pr_url === 'string' && repairMeta.pr_url ? repairMeta.pr_url : (typeof note.route_target === 'string' && /^https?:/i.test(note.route_target) ? note.route_target : '');
+                    const riskLevel = repairMeta.risk_level ? `<span class="note-chip">${escapeHtml(String(repairMeta.risk_level))} risk</span>` : '';
+                    const verification = repairMeta.verification_summary ? `<div class="note-card-why"><strong>Verification:</strong> ${escapeHtml(String(repairMeta.verification_summary))}</div>` : '';
+                    const rootCause = repairMeta.root_cause_summary ? `<div class="note-card-why"><strong>Root cause:</strong> ${escapeHtml(String(repairMeta.root_cause_summary))}</div>` : '';
                     let actions = `
                         <button class="note-action primary" onclick="acknowledgeNote('${String(note.note_id || '')}')">Acknowledge</button>
                         <button class="note-action" onclick="dismissNote('${String(note.note_id || '')}')">Dismiss</button>
@@ -1005,13 +1059,17 @@
                                 <span class="note-chip">${escapeHtml(formatNoteKind(note.note_kind))}</span>
                                 <span class="note-chip">${escapeHtml(relatedText)}</span>
                                 <span class="note-chip">${escapeHtml(formatRelativeTime(note.created_at))}</span>
+                                ${riskLevel}
                                 ${actionText}
                             </div>
                             ${whyNow}
+                            ${rootCause}
+                            ${verification}
                             <div class="note-card-body">${escapeHtml(note.body || '')}</div>
                             <div class="note-card-actions">
                                 ${actions}
                                 ${note.thread_id ? `<button class="note-action" onclick="openRelatedNote(${Number(note.thread_id)})">Open Related</button>` : ''}
+                                ${repairLink ? `<button class="note-action" onclick="openRouteTarget('${encodeURIComponent(String(repairLink || ''))}')">Open PR</button>` : ''}
                             </div>
                         </div>
                     `;
@@ -1032,14 +1090,22 @@
                 if (currentThreadId) {
                     url += `&thread_id=${encodeURIComponent(currentThreadId)}`;
                 }
-                const res = await fetch(url);
-                reviewQueue = await res.json();
+                const queueRes = await fetch(url);
+                reviewQueue = await queueRes.json();
             } catch (e) {
                 console.error('Failed to load review queue:', e);
                 reviewQueue = {
                     summary: { quiet_notes: 0, approvals: 0, prepared_work: 0, total: 0 },
                     sections: { quiet_notes: [], approvals: [], prepared_work: [] },
                 };
+            }
+            try {
+                const incidentRes = await fetch('/repairs/incidents?limit=12');
+                const incidentPayload = await incidentRes.json();
+                repairIncidents = Array.isArray(incidentPayload.incidents) ? incidentPayload.incidents : [];
+            } catch (e) {
+                console.error('Failed to load repair incidents:', e);
+                repairIncidents = [];
             }
             renderInbox();
         }
@@ -1092,9 +1158,28 @@
             await refreshInbox();
         }
 
+        async function investigateRepairIncident(encodedIncidentId) {
+            const incidentId = decodeURIComponent(String(encodedIncidentId || ''));
+            if (!incidentId) return;
+            try {
+                await fetch(`/repairs/incidents/${encodeURIComponent(incidentId)}/investigate`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ actor: 'web', reason: 'investigate requested from review center' })
+                });
+            } catch (e) {
+                console.error('Failed to request repair investigation:', e);
+            }
+            await refreshInbox();
+        }
+
         function openRouteTarget(encodedTarget) {
             const target = decodeURIComponent(String(encodedTarget || ''));
             if (!target) return;
+            if (/^https?:/i.test(target)) {
+                window.open(target, '_blank', 'noopener,noreferrer');
+                return;
+            }
             if (target.startsWith('/(tabs)/outreach/session/')) {
                 const sessionId = target.split('/').pop();
                 if (sessionId) {
@@ -1593,6 +1678,9 @@
                 if (data.memory) {
                     rows.push(['Total Conversations', data.memory.total_conversations]);
                     rows.push(['Core Memories', data.memory.total_core_memories]);
+                }
+                if (data.repairs) {
+                    rows.push(['Open Repair Incidents', data.repairs.open_incidents]);
                 }
                 if (data.relationship) {
                     rows.push(['Milestones', data.relationship.milestones]);

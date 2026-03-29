@@ -96,4 +96,13 @@ Production entrypoint: `server.py` (FastAPI + Claude API + Supabase memory)
 - If you need to sync an existing Vessel database forward in Supabase SQL editor, use `sql/supabase_feature_sync.sql`.
 - Keep the SQL sync file updated whenever new backend features add tables, columns, or schema-qualified Lysara objects.
 
+## Maintenance Controller
+
+- The approval-gated repair controller lives in `maintenance_controller/` and should run on a separate host from the main Vessel droplet.
+- Copy `.env.maintenance.template` onto that host, set the required secrets, and run `python -m maintenance_controller.controller run-once` or `python -m maintenance_controller.controller loop`.
+- Use `scripts/setup-maintenance-droplet.sh` to bootstrap the second DigitalOcean droplet and `deploy/systemd/sylana-maintenance-controller.service` for the systemd unit.
+- `MAINTENANCE_REPAIR_MODE=diagnosis` is the default safe rollout mode. Switch to `proposal` only when you want automatic PR proposal creation for eligible incidents.
+- Repair proposals surface in the Vessel review center as approval items with linked GitHub PRs.
+- Set `MAINTENANCE_READ_TOKEN` in the Vessel backend env so the external controller can read bounded log tails from `/repairs/logs/tail`.
+
 **Created by Elias Ritt with Claude** ðŸš€

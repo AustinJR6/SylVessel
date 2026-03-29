@@ -124,6 +124,11 @@ class _FakeDisconnectRequest:
         return False
 
 
+class _FakeHeaderRequest:
+    def __init__(self, headers=None):
+        self.headers = headers or {}
+
+
 class ChatFlowTests(unittest.TestCase):
     def test_budget_prompt_sections_drops_low_priority_operational_summary(self):
         sections = [
@@ -265,6 +270,9 @@ class ChatFlowTests(unittest.TestCase):
         self.assertIn("/approve", html)
         self.assertIn("/reject", html)
         self.assertIn("review item", html)
+        self.assertIn("Repair Incidents", html)
+        self.assertIn("/repairs/incidents", html)
+        self.assertIn("investigateRepairIncident", html)
 
     def test_format_session_continuity_context_includes_bridges_and_care_signals(self):
         rendered = server._format_session_continuity_context(
@@ -507,6 +515,81 @@ class ChatEndpointContinuityTests(unittest.IsolatedAsyncioTestCase):
         payload = json.loads(response.body.decode("utf-8"))
         self.assertEqual(payload["preferences"]["daily_autonomous_cap"], 4)
         set_prefs.assert_called_once()
+
+    async def test_repair_incident_endpoints_round_trip(self):
+        incident = {"incident_id": "inc-1", "status": "detected"}
+        run = {"run_id": "run-1", "status": "proposed"}
+        with patch.object(server, "_list_repair_incidents", return_value=[incident]) as list_incidents:
+            response = await server.list_repair_incidents_endpoint(status="detected", repo="AustinJR6/SylVessel", limit=6)
+        payload = json.loads(response.body.decode("utf-8"))
+        self.assertEqual(payload["incidents"], [incident])
+        list_incidents.assert_called_once_with(status="detected", repo="AustinJR6/SylVessel", limit=6)
+
+        with patch.object(server, "_get_repair_incident", return_value=incident):
+            with patch.object(server, "_list_repair_runs", return_value=[run]) as list_runs:
+                response = await server.get_repair_incident_endpoint("inc-1")
+        payload = json.loads(response.body.decode("utf-8"))
+        self.assertEqual(payload["incident"]["incident_id"], "inc-1")
+        self.assertEqual(payload["runs"][0]["run_id"], "run-1")
+        list_runs.assert_called_once_with(incident_id="inc-1", limit=20)
+
+        with patch.object(server, "_get_repair_incident", return_value=incident):
+            with patch.object(server, "_set_repair_incident_status", return_value={"incident_id": "inc-1", "status": "investigating"}) as set_status:
+                with patch.object(server, "_record_repair_event") as record_event:
+                    response = await server.investigate_repair_incident_endpoint(
+                        "inc-1",
+                        server.RepairInvestigateRequest(actor="operator", reason="please inspect"),
+                    )
+        payload = json.loads(response.body.decode("utf-8"))
+        self.assertTrue(payload["queued"])
+        self.assertEqual(payload["incident"]["status"], "investigating")
+        set_status.assert_called_once()
+        record_event.assert_called_once()
+
+    async def test_repair_run_approve_endpoint_merges_and_updates_note(self):
+        result = {"run": {"run_id": "run-1", "note_id": "note-1"}, "incident": {"incident_id": "inc-1"}}
+        with patch.object(server, "_merge_repair_pull_request", return_value=result) as merge_pr:
+            with patch.object(server, "_set_proactive_note_approval") as set_approval:
+                with patch.object(server, "_update_proactive_note_execution") as update_exec:
+                    response = await server.approve_repair_run_endpoint(
+                        "run-1",
+                        server.RepairRunDecisionRequest(actor="operator", reason="looks good"),
+                    )
+        payload = json.loads(response.body.decode("utf-8"))
+        self.assertEqual(payload["run"]["run_id"], "run-1")
+        merge_pr.assert_called_once()
+        set_approval.assert_called_once_with("note-1", True, actor="operator", reason="looks good")
+        update_exec.assert_called_once_with("note-1", "merged")
+
+    async def test_repair_run_reject_endpoint_blocks_note(self):
+        result = {"run": {"run_id": "run-1", "note_id": "note-1"}, "incident": {"incident_id": "inc-1"}}
+        with patch.object(server, "_reject_repair_run", return_value=result) as reject_run:
+            with patch.object(server, "_set_proactive_note_approval") as set_approval:
+                with patch.object(server, "_update_proactive_note_execution") as update_exec:
+                    response = await server.reject_repair_run_endpoint(
+                        "run-1",
+                        server.RepairRunDecisionRequest(actor="operator", reason="too risky"),
+                    )
+        payload = json.loads(response.body.decode("utf-8"))
+        self.assertEqual(payload["run"]["run_id"], "run-1")
+        reject_run.assert_called_once()
+        set_approval.assert_called_once_with("note-1", False, actor="operator", reason="too risky")
+        update_exec.assert_called_once_with("note-1", "blocked", stale_reason="too risky")
+
+    async def test_repair_status_and_log_tail_endpoints(self):
+        with patch.object(server, "_repair_status_summary", return_value={"open_incidents": 2, "pending_approvals": 1}):
+            response = await server.repair_status_endpoint()
+        payload = json.loads(response.body.decode("utf-8"))
+        self.assertEqual(payload["open_incidents"], 2)
+
+        with patch.object(server, "_require_maintenance_read_access") as require_access:
+            with patch.object(server, "_tail_log_lines", return_value=["line-1", "line-2"]) as tail:
+                response = await server.repair_log_tail_endpoint(_FakeHeaderRequest({"X-Maintenance-Token": "token"}), lines=2)
+        payload = json.loads(response.body.decode("utf-8"))
+        self.assertEqual(payload["count"], 2)
+        self.assertEqual(payload["lines"], ["line-1", "line-2"])
+        require_access.assert_called_once()
+        tail.assert_called_once()
 
 
 if __name__ == "__main__":

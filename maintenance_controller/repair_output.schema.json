@@ -1,0 +1,29 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "root_cause_summary",
+    "patch_summary",
+    "verification_summary",
+    "risk_level",
+    "diagnosis_only",
+    "changed_files",
+    "tests_run"
+  ],
+  "properties": {
+    "root_cause_summary": { "type": "string" },
+    "patch_summary": { "type": "string" },
+    "verification_summary": { "type": "string" },
+    "risk_level": { "type": "string", "enum": ["low", "medium", "high"] },
+    "diagnosis_only": { "type": "boolean" },
+    "changed_files": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "tests_run": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "notes": { "type": "string" }
+  }
+}

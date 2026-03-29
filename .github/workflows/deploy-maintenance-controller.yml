@@ -1,0 +1,49 @@
+name: Deploy Maintenance Controller
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "maintenance_controller/**"
+      - "requirements.maintenance.txt"
+      - ".env.maintenance.template"
+      - "deploy/systemd/sylana-maintenance-controller.service"
+      - "scripts/setup-maintenance-droplet.sh"
+      - "server.py"
+      - ".github/workflows/deploy-maintenance-controller.yml"
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    if: ${{ vars.MAINTENANCE_DEPLOY_ENABLED == 'true' }}
+    name: SSH deploy to maintenance droplet
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.MAINTENANCE_DO_HOST }}
+          username: ${{ secrets.MAINTENANCE_DO_USERNAME }}
+          key: ${{ secrets.MAINTENANCE_DO_SSH_KEY }}
+          port: 22
+          script: |
+            set -e
+            cd /opt/SylVesselMaintenance
+
+            echo ">>> Pulling latest controller code..."
+            git pull origin main
+
+            echo ">>> Refreshing maintenance virtualenv..."
+            python3 -m venv .venv
+            . .venv/bin/activate
+            pip install --upgrade pip
+            pip install -r requirements.maintenance.txt
+
+            echo ">>> Verifying Codex CLI..."
+            codex exec --help >/dev/null
+
+            echo ">>> Restarting maintenance controller service..."
+            sudo systemctl daemon-reload
+            sudo systemctl restart sylana-maintenance-controller
+            sudo systemctl --no-pager --full status sylana-maintenance-controller

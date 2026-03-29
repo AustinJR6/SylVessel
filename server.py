@@ -146,7 +146,7 @@ ALLOWED_JOB_KINDS = {"prospect_research", "prompt_session"}
 ALLOWED_ANNOUNCE_POLICIES = {"always", "important_only", "never"}
 ALLOWED_HOOK_ACTION_KINDS = {"enqueue_note", "create_session"}
 PROACTIVE_SURFACE_KINDS = {"quiet_note", "approval", "prepared_work"}
-PROACTIVE_ACTION_KINDS = {"none", "prompt_session", "outreach_research", "lysara_trade_intent", "lysara_control"}
+PROACTIVE_ACTION_KINDS = {"none", "prompt_session", "outreach_research", "lysara_trade_intent", "lysara_control", "repair_pr"}
 AUTONOMY_DELIVERY_POLICIES = {"inbox_only", "rare_push", "always"}
 AUTONOMY_ALLOWED_DOMAINS = {"internal", "outreach", "lysara"}
 HOOK_EVENT_STARTUP = "startup"
@@ -178,6 +178,9 @@ DEFAULT_AUTONOMY_PREFERENCES = {
     "daily_autonomous_cap": AUTONOMOUS_SESSION_DAILY_LIMIT,
     "high_confidence_care_push_enabled": False,
 }
+REPAIR_INCIDENT_STATUSES = {"detected", "investigating", "proposed", "approved", "merged", "deployed", "rejected", "failed"}
+REPAIR_RUN_STATUSES = {"investigating", "diagnosed", "proposed", "approved", "merged", "deployed", "rejected", "failed"}
+REPAIR_RISK_LEVELS = {"low", "medium", "high"}
 
 
 def _get_openai_client() -> OpenAI:
@@ -798,6 +801,70 @@ class GitHubClient:
             f"/repos/{repo}/issues",
             payload={"title": title, "body": body, "labels": labels},
             expected={201},
+        )
+
+    def list_workflow_runs(
+        self,
+        repo: str,
+        *,
+        branch: Optional[str] = None,
+        status: Optional[str] = None,
+        event: Optional[str] = None,
+        per_page: int = 20,
+    ) -> Dict[str, Any]:
+        params = []
+        if branch:
+            params.append(f"branch={quote(branch, safe='')}")
+        if status:
+            params.append(f"status={quote(status, safe='')}")
+        if event:
+            params.append(f"event={quote(event, safe='')}")
+        params.append(f"per_page={max(1, min(int(per_page), 100))}")
+        query = "&".join(params)
+        return self._request("GET", f"/repos/{repo}/actions/runs", query=query, expected={200})
+
+    def get_workflow_run(self, repo: str, run_id: int) -> Dict[str, Any]:
+        return self._request("GET", f"/repos/{repo}/actions/runs/{int(run_id)}", expected={200})
+
+    def list_workflow_jobs(self, repo: str, run_id: int) -> Dict[str, Any]:
+        return self._request("GET", f"/repos/{repo}/actions/runs/{int(run_id)}/jobs", expected={200})
+
+    def get_pull_request(self, repo: str, number: int) -> Dict[str, Any]:
+        return self._request("GET", f"/repos/{repo}/pulls/{int(number)}", expected={200})
+
+    def merge_pull_request(
+        self,
+        repo: str,
+        number: int,
+        *,
+        commit_title: Optional[str] = None,
+        merge_method: str = "squash",
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"merge_method": merge_method}
+        if commit_title:
+            payload["commit_title"] = commit_title
+        return self._request(
+            "PUT",
+            f"/repos/{repo}/pulls/{int(number)}/merge",
+            payload=payload,
+            expected={200, 201},
+        )
+
+    def create_repository_dispatch(
+        self,
+        repo: str,
+        *,
+        event_type: str,
+        client_payload: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/repos/{repo}/dispatches",
+            payload={
+                "event_type": str(event_type or "").strip(),
+                "client_payload": client_payload or {},
+            },
+            expected={204},
         )
 
 
@@ -4313,6 +4380,106 @@ def ensure_proactive_runtime_tables():
         logger.warning("Proactive runtime migration skipped: %s", e)
 
 
+def ensure_repair_tables():
+    """Create repair incident/run tables for approval-gated maintenance workflows."""
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto")
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS repair_incidents (
+                incident_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                dedupe_key TEXT NOT NULL UNIQUE,
+                repo TEXT NOT NULL,
+                environment TEXT NOT NULL DEFAULT 'production',
+                source TEXT NOT NULL,
+                severity TEXT NOT NULL DEFAULT 'warning',
+                status TEXT NOT NULL DEFAULT 'detected',
+                symptom_summary TEXT NOT NULL,
+                reproduction_hints JSONB NOT NULL DEFAULT '{}'::jsonb,
+                root_cause_summary TEXT,
+                latest_run_id UUID,
+                pr_url TEXT,
+                metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                first_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                resolved_at TIMESTAMPTZ
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS repair_runs (
+                run_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                incident_id UUID NOT NULL REFERENCES repair_incidents(incident_id) ON DELETE CASCADE,
+                repo TEXT NOT NULL,
+                environment TEXT NOT NULL DEFAULT 'production',
+                branch_name TEXT,
+                base_branch TEXT NOT NULL DEFAULT 'main',
+                workspace_path TEXT,
+                status TEXT NOT NULL DEFAULT 'investigating',
+                root_cause_summary TEXT,
+                patch_summary TEXT,
+                verification_summary TEXT,
+                risk_level TEXT NOT NULL DEFAULT 'medium',
+                pr_number INTEGER,
+                pr_url TEXT,
+                note_id UUID REFERENCES proactive_notes(note_id) ON DELETE SET NULL,
+                artifact_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+                proposed_by TEXT NOT NULL DEFAULT 'maintenance-controller',
+                approved_by TEXT,
+                approved_at TIMESTAMPTZ,
+                merged_at TIMESTAMPTZ,
+                deployed_at TIMESTAMPTZ,
+                rejected_at TIMESTAMPTZ,
+                failure_reason TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS repair_events (
+                event_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                incident_id UUID REFERENCES repair_incidents(incident_id) ON DELETE CASCADE,
+                run_id UUID REFERENCES repair_runs(run_id) ON DELETE CASCADE,
+                event_kind TEXT NOT NULL,
+                actor TEXT NOT NULL DEFAULT 'system',
+                metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+        cur.execute("ALTER TABLE repair_incidents ADD COLUMN IF NOT EXISTS latest_run_id UUID")
+        cur.execute("ALTER TABLE repair_incidents ADD COLUMN IF NOT EXISTS root_cause_summary TEXT")
+        cur.execute("ALTER TABLE repair_incidents ADD COLUMN IF NOT EXISTS pr_url TEXT")
+        cur.execute("ALTER TABLE repair_incidents ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb")
+        cur.execute("ALTER TABLE repair_incidents ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ")
+        cur.execute("ALTER TABLE repair_runs ADD COLUMN IF NOT EXISTS branch_name TEXT")
+        cur.execute("ALTER TABLE repair_runs ADD COLUMN IF NOT EXISTS base_branch TEXT NOT NULL DEFAULT 'main'")
+        cur.execute("ALTER TABLE repair_runs ADD COLUMN IF NOT EXISTS workspace_path TEXT")
+        cur.execute("ALTER TABLE repair_runs ADD COLUMN IF NOT EXISTS note_id UUID REFERENCES proactive_notes(note_id) ON DELETE SET NULL")
+        cur.execute("ALTER TABLE repair_runs ADD COLUMN IF NOT EXISTS artifact_payload JSONB NOT NULL DEFAULT '{}'::jsonb")
+        cur.execute("ALTER TABLE repair_runs ADD COLUMN IF NOT EXISTS proposed_by TEXT NOT NULL DEFAULT 'maintenance-controller'")
+        cur.execute("ALTER TABLE repair_runs ADD COLUMN IF NOT EXISTS approved_by TEXT")
+        cur.execute("ALTER TABLE repair_runs ADD COLUMN IF NOT EXISTS approved_at TIMESTAMPTZ")
+        cur.execute("ALTER TABLE repair_runs ADD COLUMN IF NOT EXISTS merged_at TIMESTAMPTZ")
+        cur.execute("ALTER TABLE repair_runs ADD COLUMN IF NOT EXISTS deployed_at TIMESTAMPTZ")
+        cur.execute("ALTER TABLE repair_runs ADD COLUMN IF NOT EXISTS rejected_at TIMESTAMPTZ")
+        cur.execute("ALTER TABLE repair_runs ADD COLUMN IF NOT EXISTS failure_reason TEXT")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_repair_incidents_status_seen ON repair_incidents(status, last_seen_at DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_repair_incidents_repo_status ON repair_incidents(repo, status, last_seen_at DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_repair_runs_incident_created ON repair_runs(incident_id, created_at DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_repair_runs_status_created ON repair_runs(status, created_at DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_repair_events_incident_created ON repair_events(incident_id, created_at DESC)")
+        conn.commit()
+    except Exception as e:
+        _safe_rollback(conn, "ensure_repair_tables")
+        logger.warning("Repair runtime migration skipped: %s", e)
+
+
 def ensure_lysara_memory_schema():
     if not state.lysara_memory_manager:
         return {"ok": False, "error": "lysara_memory_manager_unavailable"}
@@ -4425,6 +4592,406 @@ def _normalize_autonomy_preferences(payload: Optional[Dict[str, Any]] = None) ->
         payload.get("high_confidence_care_push_enabled", merged["high_confidence_care_push_enabled"])
     )
     return merged
+
+
+def _normalize_repair_incident_status(value: Any, default: str = "detected") -> str:
+    status = str(value or default).strip().lower()
+    return status if status in REPAIR_INCIDENT_STATUSES else default
+
+
+def _normalize_repair_run_status(value: Any, default: str = "investigating") -> str:
+    status = str(value or default).strip().lower()
+    return status if status in REPAIR_RUN_STATUSES else default
+
+
+def _normalize_repair_risk_level(value: Any, default: str = "medium") -> str:
+    risk_level = str(value or default).strip().lower()
+    return risk_level if risk_level in REPAIR_RISK_LEVELS else default
+
+
+def _maintenance_read_token() -> str:
+    return str(os.getenv("MAINTENANCE_READ_TOKEN") or os.getenv("MAINTENANCE_CONTROLLER_TOKEN") or "").strip()
+
+
+def _require_maintenance_read_access(request: Request) -> None:
+    expected = _maintenance_read_token()
+    if not expected:
+        raise HTTPException(status_code=503, detail="Maintenance read token is not configured")
+    provided = str(request.headers.get("X-Maintenance-Token") or request.headers.get("Authorization") or "").strip()
+    if provided.lower().startswith("bearer "):
+        provided = provided[7:].strip()
+    if provided != expected:
+        raise HTTPException(status_code=403, detail="Invalid maintenance read token")
+
+
+def _serialize_repair_incident_row(row: Any) -> Dict[str, Any]:
+    metadata = row[10] or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    return {
+        "incident_id": str(row[0]),
+        "dedupe_key": row[1],
+        "repo": row[2],
+        "environment": row[3],
+        "source": row[4],
+        "severity": row[5],
+        "status": _normalize_repair_incident_status(row[6]),
+        "symptom_summary": row[7],
+        "reproduction_hints": row[8] or {},
+        "root_cause_summary": row[9] or "",
+        "metadata": metadata,
+        "pr_url": row[11] or "",
+        "latest_run_id": str(row[12]) if row[12] else None,
+        "first_seen_at": row[13].isoformat() if row[13] else None,
+        "last_seen_at": row[14].isoformat() if row[14] else None,
+        "resolved_at": row[15].isoformat() if row[15] else None,
+    }
+
+
+def _serialize_repair_run_row(row: Any) -> Dict[str, Any]:
+    artifact_payload = row[14] or {}
+    if not isinstance(artifact_payload, dict):
+        artifact_payload = {}
+    return {
+        "run_id": str(row[0]),
+        "incident_id": str(row[1]),
+        "repo": row[2],
+        "environment": row[3],
+        "branch_name": row[4] or "",
+        "base_branch": row[5] or "main",
+        "workspace_path": row[6] or "",
+        "status": _normalize_repair_run_status(row[7]),
+        "root_cause_summary": row[8] or "",
+        "patch_summary": row[9] or "",
+        "verification_summary": row[10] or "",
+        "risk_level": _normalize_repair_risk_level(row[11]),
+        "pr_number": int(row[12]) if row[12] is not None else None,
+        "pr_url": row[13] or "",
+        "artifact_payload": artifact_payload,
+        "note_id": str(row[15]) if row[15] else None,
+        "proposed_by": row[16] or "maintenance-controller",
+        "approved_by": row[17] or "",
+        "approved_at": row[18].isoformat() if row[18] else None,
+        "merged_at": row[19].isoformat() if row[19] else None,
+        "deployed_at": row[20].isoformat() if row[20] else None,
+        "rejected_at": row[21].isoformat() if row[21] else None,
+        "failure_reason": row[22] or "",
+        "created_at": row[23].isoformat() if row[23] else None,
+        "updated_at": row[24].isoformat() if row[24] else None,
+    }
+
+
+def _record_repair_event(
+    *,
+    incident_id: Optional[str] = None,
+    run_id: Optional[str] = None,
+    event_kind: str,
+    actor: str = "system",
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            INSERT INTO repair_events (incident_id, run_id, event_kind, actor, metadata)
+            VALUES (%s::uuid, %s::uuid, %s, %s, %s::jsonb)
+            """,
+            (
+                incident_id,
+                run_id,
+                str(event_kind or "").strip() or "unknown",
+                str(actor or "system").strip() or "system",
+                json.dumps(metadata or {}, ensure_ascii=True),
+            ),
+        )
+        conn.commit()
+    except Exception as exc:
+        _safe_rollback(conn, "_record_repair_event")
+        logger.debug("Failed to record repair event: %s", exc)
+
+
+def _list_repair_incidents(*, status: str = "", repo: str = "", limit: int = 50) -> List[Dict[str, Any]]:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        where: List[str] = []
+        params: List[Any] = []
+        if status:
+            where.append("status = %s")
+            params.append(_normalize_repair_incident_status(status, default=status))
+        if repo:
+            where.append("repo = %s")
+            params.append(repo)
+        where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+        params.append(max(1, min(int(limit or 50), 200)))
+        cur.execute(
+            f"""
+            SELECT incident_id, dedupe_key, repo, environment, source, severity, status, symptom_summary,
+                   reproduction_hints, root_cause_summary, metadata, pr_url, latest_run_id,
+                   first_seen_at, last_seen_at, resolved_at
+            FROM repair_incidents
+            {where_sql}
+            ORDER BY last_seen_at DESC
+            LIMIT %s
+            """,
+            tuple(params),
+        )
+        return [_serialize_repair_incident_row(row) for row in cur.fetchall()]
+    except Exception as exc:
+        logger.warning("Failed to list repair incidents: %s", exc)
+        return []
+
+
+def _get_repair_incident(incident_id: str) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT incident_id, dedupe_key, repo, environment, source, severity, status, symptom_summary,
+                   reproduction_hints, root_cause_summary, metadata, pr_url, latest_run_id,
+                   first_seen_at, last_seen_at, resolved_at
+            FROM repair_incidents
+            WHERE incident_id = %s::uuid
+            """,
+            (incident_id,),
+        )
+        row = cur.fetchone()
+        return _serialize_repair_incident_row(row) if row else None
+    except Exception as exc:
+        logger.warning("Failed to fetch repair incident %s: %s", incident_id, exc)
+        return None
+
+
+def _list_repair_runs(*, incident_id: str, limit: int = 10) -> List[Dict[str, Any]]:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT run_id, incident_id, repo, environment, branch_name, base_branch, workspace_path, status,
+                   root_cause_summary, patch_summary, verification_summary, risk_level, pr_number, pr_url,
+                   artifact_payload, note_id, proposed_by, approved_by, approved_at, merged_at, deployed_at,
+                   rejected_at, failure_reason, created_at, updated_at
+            FROM repair_runs
+            WHERE incident_id = %s::uuid
+            ORDER BY created_at DESC
+            LIMIT %s
+            """,
+            (incident_id, max(1, min(int(limit or 10), 50))),
+        )
+        return [_serialize_repair_run_row(row) for row in cur.fetchall()]
+    except Exception as exc:
+        logger.warning("Failed to list repair runs for %s: %s", incident_id, exc)
+        return []
+
+
+def _get_repair_run(run_id: str) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT run_id, incident_id, repo, environment, branch_name, base_branch, workspace_path, status,
+                   root_cause_summary, patch_summary, verification_summary, risk_level, pr_number, pr_url,
+                   artifact_payload, note_id, proposed_by, approved_by, approved_at, merged_at, deployed_at,
+                   rejected_at, failure_reason, created_at, updated_at
+            FROM repair_runs
+            WHERE run_id = %s::uuid
+            """,
+            (run_id,),
+        )
+        row = cur.fetchone()
+        return _serialize_repair_run_row(row) if row else None
+    except Exception as exc:
+        logger.warning("Failed to fetch repair run %s: %s", run_id, exc)
+        return None
+
+
+def _set_repair_incident_status(
+    incident_id: str,
+    status: str,
+    *,
+    actor: str = "system",
+    root_cause_summary: Optional[str] = None,
+    pr_url: Optional[str] = None,
+    latest_run_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        normalized_status = _normalize_repair_incident_status(status)
+        resolved_at = "NOW()" if normalized_status in {"deployed", "rejected", "failed"} else "NULL"
+        cur.execute(
+            f"""
+            UPDATE repair_incidents
+            SET status = %s,
+                root_cause_summary = COALESCE(%s, root_cause_summary),
+                pr_url = COALESCE(%s, pr_url),
+                latest_run_id = COALESCE(%s::uuid, latest_run_id),
+                last_seen_at = NOW(),
+                resolved_at = {resolved_at}
+            WHERE incident_id = %s::uuid
+            RETURNING incident_id, dedupe_key, repo, environment, source, severity, status, symptom_summary,
+                      reproduction_hints, root_cause_summary, metadata, pr_url, latest_run_id,
+                      first_seen_at, last_seen_at, resolved_at
+            """,
+            (normalized_status, root_cause_summary, pr_url, latest_run_id, incident_id),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        incident = _serialize_repair_incident_row(row) if row else None
+        if incident:
+            _record_repair_event(
+                incident_id=incident_id,
+                event_kind=f"incident_{normalized_status}",
+                actor=actor,
+                metadata={"status": normalized_status, "pr_url": incident.get("pr_url"), "latest_run_id": incident.get("latest_run_id")},
+            )
+        return incident
+    except Exception as exc:
+        _safe_rollback(conn, "_set_repair_incident_status")
+        logger.warning("Failed to update repair incident %s: %s", incident_id, exc)
+        return None
+
+
+def _set_repair_run_status(
+    run_id: str,
+    status: str,
+    *,
+    actor: str = "system",
+    failure_reason: Optional[str] = None,
+    approved_by: Optional[str] = None,
+    pr_url: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        normalized_status = _normalize_repair_run_status(status)
+        approved_at = "NOW()" if normalized_status == "approved" else "approved_at"
+        merged_at = "NOW()" if normalized_status == "merged" else "merged_at"
+        deployed_at = "NOW()" if normalized_status == "deployed" else "deployed_at"
+        rejected_at = "NOW()" if normalized_status == "rejected" else "rejected_at"
+        cur.execute(
+            f"""
+            UPDATE repair_runs
+            SET status = %s,
+                approved_by = COALESCE(%s, approved_by),
+                approved_at = {approved_at},
+                merged_at = {merged_at},
+                deployed_at = {deployed_at},
+                rejected_at = {rejected_at},
+                failure_reason = COALESCE(%s, failure_reason),
+                pr_url = COALESCE(%s, pr_url),
+                updated_at = NOW()
+            WHERE run_id = %s::uuid
+            RETURNING run_id, incident_id, repo, environment, branch_name, base_branch, workspace_path, status,
+                      root_cause_summary, patch_summary, verification_summary, risk_level, pr_number, pr_url,
+                      artifact_payload, note_id, proposed_by, approved_by, approved_at, merged_at, deployed_at,
+                      rejected_at, failure_reason, created_at, updated_at
+            """,
+            (normalized_status, approved_by, failure_reason, pr_url, run_id),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        repair_run = _serialize_repair_run_row(row) if row else None
+        if repair_run:
+            _record_repair_event(
+                incident_id=repair_run.get("incident_id"),
+                run_id=run_id,
+                event_kind=f"run_{normalized_status}",
+                actor=actor,
+                metadata={"status": normalized_status, "failure_reason": repair_run.get("failure_reason"), "pr_url": repair_run.get("pr_url")},
+            )
+        return repair_run
+    except Exception as exc:
+        _safe_rollback(conn, "_set_repair_run_status")
+        logger.warning("Failed to update repair run %s: %s", run_id, exc)
+        return None
+
+
+def _repair_status_summary() -> Dict[str, Any]:
+    incidents = _list_repair_incidents(limit=10)
+    open_incidents = [item for item in incidents if item.get("status") not in {"deployed", "rejected"}]
+    counts: Dict[str, int] = {status: 0 for status in sorted(REPAIR_INCIDENT_STATUSES)}
+    for item in incidents:
+        counts[_normalize_repair_incident_status(item.get("status"))] += 1
+    return {
+        "open_incidents": len(open_incidents),
+        "counts": counts,
+        "recent": incidents[:5],
+    }
+
+
+def _tail_log_lines(path: Path, lines: int = 120) -> List[str]:
+    try:
+        if not path.exists():
+            return []
+        content = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        return content[-max(1, min(int(lines or 120), 500)) :]
+    except Exception as exc:
+        logger.debug("Failed to tail log file %s: %s", path, exc)
+        return []
+
+
+def _merge_repair_pull_request(run_id: str, *, actor: str, reason: str = "") -> Dict[str, Any]:
+    repair_run = _get_repair_run(run_id)
+    if not repair_run:
+        raise HTTPException(status_code=404, detail="Repair run not found")
+    repo = str(repair_run.get("repo") or "").strip()
+    pr_number = repair_run.get("pr_number")
+    if not repo or pr_number is None:
+        raise HTTPException(status_code=400, detail="Repair run is missing PR metadata")
+    client = _get_github_client()
+    merge_result = client.merge_pull_request(
+        repo,
+        int(pr_number),
+        commit_title=f"repair: {repair_run.get('branch_name') or run_id}",
+        merge_method="squash",
+    )
+    updated_run = _set_repair_run_status(
+        run_id,
+        "merged",
+        actor=actor,
+        approved_by=actor,
+        pr_url=str(repair_run.get("pr_url") or ""),
+    ) or repair_run
+    incident = _set_repair_incident_status(
+        str(repair_run.get("incident_id") or ""),
+        "merged",
+        actor=actor,
+        root_cause_summary=updated_run.get("root_cause_summary"),
+        pr_url=str(updated_run.get("pr_url") or ""),
+        latest_run_id=run_id,
+    )
+    return {
+        "status": "merged",
+        "run": updated_run,
+        "incident": incident,
+        "merge_result": merge_result,
+        "reason": reason,
+    }
+
+
+def _reject_repair_run(run_id: str, *, actor: str, reason: str = "") -> Dict[str, Any]:
+    repair_run = _set_repair_run_status(run_id, "rejected", actor=actor, failure_reason=reason) or _get_repair_run(run_id)
+    if not repair_run:
+        raise HTTPException(status_code=404, detail="Repair run not found")
+    incident = _set_repair_incident_status(
+        str(repair_run.get("incident_id") or ""),
+        "rejected",
+        actor=actor,
+        root_cause_summary=repair_run.get("root_cause_summary"),
+        pr_url=str(repair_run.get("pr_url") or ""),
+        latest_run_id=run_id,
+    )
+    return {
+        "status": "rejected",
+        "run": repair_run,
+        "incident": incident,
+        "reason": reason,
+    }
 
 
 def _serialize_proactive_note_row(row: Any) -> Dict[str, Any]:
@@ -8574,6 +9141,17 @@ def _dispatch_proactive_note_action(note: Dict[str, Any], actor: str, reason: st
         result = _run_lysara_control_action(note, actor)
         _update_proactive_note_execution(str(note.get("note_id") or ""), "executed")
         return result
+    if action_kind == "repair_pr":
+        payload = dict(note.get("action_payload") or {})
+        run_id = str(payload.get("repair_run_id") or note.get("repair_run_id") or "").strip()
+        if not run_id:
+            raise HTTPException(status_code=400, detail="Repair approval note is missing repair_run_id")
+        result = _merge_repair_pull_request(run_id, actor=actor, reason=reason)
+        _update_proactive_note_execution(str(note.get("note_id") or ""), "merged")
+        return {
+            "action_kind": "repair_pr",
+            **result,
+        }
     raise HTTPException(status_code=400, detail="Unsupported proactive action")
 
 
@@ -9695,6 +10273,10 @@ def load_models():
             ensure_proactive_runtime_tables()
         except Exception as e:
             logger.warning("ensure_proactive_runtime_tables skipped: %s", e)
+        try:
+            ensure_repair_tables()
+        except Exception as e:
+            logger.warning("ensure_repair_tables skipped: %s", e)
         try:
             ensure_lysara_memory_schema()
         except Exception as e:
@@ -11275,6 +11857,16 @@ class AutonomyPreferencesRequest(BaseModel):
     high_confidence_care_push_enabled: Optional[bool] = None
 
 
+class RepairInvestigateRequest(BaseModel):
+    actor: str = "operator"
+    reason: str = ""
+
+
+class RepairRunDecisionRequest(BaseModel):
+    actor: str = "operator"
+    reason: str = ""
+
+
 class LysaraTradeCloseRequest(BaseModel):
     trade_id: str
     market: Optional[str] = None
@@ -11428,6 +12020,7 @@ presence_router = APIRouter(prefix="/presence", tags=["presence"])
 tracking_router = APIRouter(tags=["tracking"])
 lysara_router = APIRouter(prefix="/api/lysara", tags=["lysara"])
 preferences_router = APIRouter(prefix="/preferences", tags=["preferences"])
+repair_router = APIRouter(prefix="/repairs", tags=["repairs"])
 
 
 def _normalized_entity(value: str) -> str:
@@ -12143,6 +12736,16 @@ async def update_proactive_note_approval(note_id: str, payload: ProactiveNoteApp
         )
         refreshed = _get_proactive_note(note_id) or note
         return JSONResponse(content={"note": refreshed, "execution": execution})
+    if _normalize_action_kind(existing.get("action_kind")) == "repair_pr":
+        payload_map = dict(existing.get("action_payload") or {})
+        run_id = str(payload_map.get("repair_run_id") or existing.get("repair_run_id") or "").strip()
+        execution = _reject_repair_run(
+            run_id,
+            actor=(payload.actor or "operator").strip() or "operator",
+            reason=(payload.reason or "").strip(),
+        ) if run_id else {"status": "rejected"}
+        refreshed = _get_proactive_note(note_id) or note
+        return JSONResponse(content={"note": refreshed, "execution": execution})
     return JSONResponse(content={"note": note})
 
 
@@ -12189,6 +12792,90 @@ async def update_autonomy_preferences_endpoint(payload: AutonomyPreferencesReque
         **payload.model_dump(exclude_none=True),
     }
     return JSONResponse(content={"preferences": _set_autonomy_preferences(merged)})
+
+
+@repair_router.get("/incidents")
+async def list_repair_incidents_endpoint(status: str = "", repo: str = "", limit: int = 50):
+    return JSONResponse(content={"incidents": _list_repair_incidents(status=status, repo=repo, limit=limit)})
+
+
+@repair_router.get("/incidents/{incident_id}")
+async def get_repair_incident_endpoint(incident_id: str):
+    incident = _get_repair_incident(incident_id)
+    if not incident:
+        raise HTTPException(status_code=404, detail="Repair incident not found")
+    return JSONResponse(content={"incident": incident, "runs": _list_repair_runs(incident_id=incident_id, limit=20)})
+
+
+@repair_router.post("/incidents/{incident_id}/investigate")
+async def investigate_repair_incident_endpoint(incident_id: str, payload: RepairInvestigateRequest):
+    incident = _get_repair_incident(incident_id)
+    if not incident:
+        raise HTTPException(status_code=404, detail="Repair incident not found")
+    updated = _set_repair_incident_status(
+        incident_id,
+        "investigating",
+        actor=(payload.actor or "operator").strip() or "operator",
+        root_cause_summary=incident.get("root_cause_summary") or None,
+        pr_url=incident.get("pr_url") or None,
+        latest_run_id=incident.get("latest_run_id") or None,
+    )
+    _record_repair_event(
+        incident_id=incident_id,
+        event_kind="investigate_requested",
+        actor=(payload.actor or "operator").strip() or "operator",
+        metadata={"reason": (payload.reason or "").strip()},
+    )
+    return JSONResponse(content={"incident": updated or incident, "queued": True})
+
+
+@repair_router.post("/runs/{run_id}/approve")
+async def approve_repair_run_endpoint(run_id: str, payload: Optional[RepairRunDecisionRequest] = None):
+    body = payload or RepairRunDecisionRequest()
+    result = _merge_repair_pull_request(
+        run_id,
+        actor=(body.actor or "operator").strip() or "operator",
+        reason=(body.reason or "").strip(),
+    )
+    note_id = (result.get("run") or {}).get("note_id")
+    if note_id:
+        _set_proactive_note_approval(note_id, True, actor=(body.actor or "operator").strip() or "operator", reason=(body.reason or "").strip())
+        _update_proactive_note_execution(note_id, "merged")
+    return JSONResponse(content=result)
+
+
+@repair_router.post("/runs/{run_id}/reject")
+async def reject_repair_run_endpoint(run_id: str, payload: Optional[RepairRunDecisionRequest] = None):
+    body = payload or RepairRunDecisionRequest()
+    result = _reject_repair_run(
+        run_id,
+        actor=(body.actor or "operator").strip() or "operator",
+        reason=(body.reason or "").strip(),
+    )
+    note_id = (result.get("run") or {}).get("note_id")
+    if note_id:
+        _set_proactive_note_approval(note_id, False, actor=(body.actor or "operator").strip() or "operator", reason=(body.reason or "").strip())
+        _update_proactive_note_execution(note_id, "blocked", stale_reason=(body.reason or "").strip() or "repair_rejected")
+    return JSONResponse(content=result)
+
+
+@repair_router.get("/status")
+async def repair_status_endpoint():
+    return JSONResponse(content=_repair_status_summary())
+
+
+@repair_router.get("/logs/tail")
+async def repair_log_tail_endpoint(request: Request, lines: int = 120):
+    _require_maintenance_read_access(request)
+    path = Path(config.LOG_FILE)
+    tail_lines = _tail_log_lines(path, lines=lines)
+    return JSONResponse(
+        content={
+            "path": str(path),
+            "lines": tail_lines,
+            "count": len(tail_lines),
+        }
+    )
 
 
 @sessions_router.get("/proactive/hooks")
@@ -14650,6 +15337,7 @@ app.include_router(presence_router)
 app.include_router(tracking_router)
 app.include_router(lysara_router)
 app.include_router(preferences_router)
+app.include_router(repair_router)
 
 # Cross-origin support for mobile/web clients hitting deployed API domains.
 app.add_middleware(
@@ -15168,6 +15856,7 @@ async def status():
     if state.memory_manager:
         info["memory"] = state.memory_manager.get_stats()
     info["proactive"] = _proactive_status_summary()
+    info["repairs"] = _repair_status_summary()
     info["autonomy_preferences"] = _get_autonomy_preferences()
 
     # Relationship stats
