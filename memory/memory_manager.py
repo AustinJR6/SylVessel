@@ -233,6 +233,7 @@ class MemoryManager:
         self.semantic_engine = None
         self.db_path = db_path  # Backward-compat only (Supabase is authoritative).
         self.identity_profiles = self._load_identity_profiles()
+        self._table_columns_cache: Dict[str, set[str]] = {}
 
         # Initialize components
         self._verify_connection()
@@ -254,6 +255,53 @@ class MemoryManager:
     def _initialize_semantic_engine(self):
         """Initialize semantic search engine"""
         self.semantic_engine = SemanticMemoryEngine()
+
+    def _get_table_columns(self, table_name: str, conn=None, cur=None) -> set[str]:
+        table = (table_name or "").strip().lower()
+        if not table:
+            return set()
+        cached = self._table_columns_cache.get(table)
+        if cached is not None:
+            return cached
+
+        own_cursor = conn is None or cur is None
+        local_conn = conn or get_connection()
+        local_cur = cur or local_conn.cursor()
+        try:
+            local_cur.execute(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = %s
+                """,
+                (table,),
+            )
+            columns = {str(row[0]).strip().lower() for row in local_cur.fetchall() if row and row[0]}
+            self._table_columns_cache[table] = columns
+            return columns
+        except Exception as e:
+            logger.debug("Failed to inspect columns for %s: %s", table, e)
+            return set()
+        finally:
+            if own_cursor:
+                try:
+                    local_cur.close()
+                except Exception:
+                    pass
+                close_connection(local_conn)
+
+    def _memory_column_expr(self, available_columns: set[str], column_name: str, fallback_sql: str) -> str:
+        if (column_name or "").strip().lower() in available_columns:
+            return column_name
+        return f"{fallback_sql} AS {column_name}"
+
+    def _memory_order_expr(self, available_columns: set[str]) -> str:
+        columns = {str(item).strip().lower() for item in (available_columns or set())}
+        if {"conversation_at", "recorded_at"}.issubset(columns):
+            return "COALESCE(conversation_at, recorded_at, NOW())"
+        if "created_at" in columns:
+            return "COALESCE(created_at, to_timestamp(timestamp), NOW())"
+        return "COALESCE(to_timestamp(timestamp), NOW())"
 
     def rebuild_index(self):
         """No-op: pgvector handles indexing automatically."""
@@ -1080,15 +1128,24 @@ class MemoryManager:
         )
 
         try:
-            cur.execute("""
-                INSERT INTO memories
-                (user_input, sylana_response, timestamp, emotion, embedding, personality, privacy_level, thread_id,
-                 memory_type, feeling_weight, energy_shift, comfort_level, significance_score, secure_payload,
-                 recorded_at, conversation_at, user_local_date, user_local_time, timezone_name, turn_index,
-                 event_dates_json, relative_time_labels, temporal_descriptor)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING id
-            """, (
+            memory_columns = self._get_table_columns("memories", conn=conn, cur=cur)
+            insert_columns = [
+                "user_input",
+                "sylana_response",
+                "timestamp",
+                "emotion",
+                "embedding",
+                "personality",
+                "privacy_level",
+                "thread_id",
+                "memory_type",
+                "feeling_weight",
+                "energy_shift",
+                "comfort_level",
+                "significance_score",
+                "secure_payload",
+            ]
+            insert_values: List[Any] = [
                 user_input,
                 sylana_response,
                 datetime.now().timestamp(),
@@ -1103,16 +1160,35 @@ class MemoryManager:
                 comfort_level,
                 significance_score,
                 secure_payload,
-                temporal_context["recorded_at"],
-                temporal_context["conversation_at"],
-                temporal_context["user_local_date"],
-                temporal_context["user_local_time"],
-                temporal_context["timezone_name"],
-                temporal_context["turn_index"],
-                json.dumps(temporal_context["event_dates_json"], ensure_ascii=True),
-                json.dumps(temporal_context["relative_time_labels"], ensure_ascii=True),
-                temporal_context["temporal_descriptor"],
-            ))
+            ]
+
+            optional_temporal_values = {
+                "recorded_at": temporal_context["recorded_at"],
+                "conversation_at": temporal_context["conversation_at"],
+                "user_local_date": temporal_context["user_local_date"],
+                "user_local_time": temporal_context["user_local_time"],
+                "timezone_name": temporal_context["timezone_name"],
+                "turn_index": temporal_context["turn_index"],
+                "event_dates_json": json.dumps(temporal_context["event_dates_json"], ensure_ascii=True),
+                "relative_time_labels": json.dumps(temporal_context["relative_time_labels"], ensure_ascii=True),
+                "temporal_descriptor": temporal_context["temporal_descriptor"],
+            }
+            for column_name, value in optional_temporal_values.items():
+                if column_name in memory_columns:
+                    insert_columns.append(column_name)
+                    insert_values.append(value)
+
+            placeholders = ", ".join(["%s"] * len(insert_columns))
+            column_sql = ", ".join(insert_columns)
+            cur.execute(
+                f"""
+                INSERT INTO memories
+                ({column_sql})
+                VALUES ({placeholders})
+                RETURNING id
+                """,
+                tuple(insert_values),
+            )
             memory_id = cur.fetchone()[0]
             conn.commit()
         except Exception as e:
@@ -2130,6 +2206,7 @@ class MemoryManager:
         summaries: List[Dict[str, Any]] = []
         entities: List[Dict[str, Any]] = []
         recent_episodes: List[Dict[str, Any]] = []
+        memory_columns = self._get_table_columns("memories", conn=conn, cur=cur)
 
         try:
             cur.execute(
@@ -2212,13 +2289,18 @@ class MemoryManager:
             logger.debug("Failed reading thread entities: %s", e)
 
         try:
+            order_expr = self._memory_order_expr(memory_columns)
+            conversation_at_expr = self._memory_column_expr(memory_columns, "conversation_at", "NULL::timestamptz")
+            temporal_descriptor_expr = self._memory_column_expr(memory_columns, "temporal_descriptor", "''::text")
             cur.execute(
-                """
-                SELECT id, user_input, sylana_response, emotion, timestamp, conversation_at, temporal_descriptor
+                f"""
+                SELECT id, user_input, sylana_response, emotion, timestamp,
+                       {conversation_at_expr},
+                       {temporal_descriptor_expr}
                 FROM memories
                 WHERE thread_id = %s
                   AND COALESCE(personality, 'sylana') = %s
-                ORDER BY COALESCE(conversation_at, recorded_at, NOW()) DESC, id DESC
+                ORDER BY {order_expr} DESC, id DESC
                 LIMIT %s
                 """,
                 (int(thread_id), identity, max(1, min(int(limit), 20))),
@@ -2871,18 +2953,39 @@ class MemoryManager:
 
         conn = get_connection()
         cur = conn.cursor()
+        memory_columns = self._get_table_columns("memories", conn=conn, cur=cur)
+        recorded_at_expr = self._memory_column_expr(memory_columns, "recorded_at", "NULL::timestamptz")
+        conversation_at_expr = self._memory_column_expr(memory_columns, "conversation_at", "NULL::timestamptz")
+        user_local_date_expr = self._memory_column_expr(memory_columns, "user_local_date", "''::text")
+        user_local_time_expr = self._memory_column_expr(memory_columns, "user_local_time", "''::text")
+        timezone_name_expr = self._memory_column_expr(memory_columns, "timezone_name", "''::text")
+        turn_index_expr = self._memory_column_expr(memory_columns, "turn_index", "0")
+        event_dates_expr = self._memory_column_expr(memory_columns, "event_dates_json", "'[]'::jsonb")
+        relative_labels_expr = self._memory_column_expr(memory_columns, "relative_time_labels", "'[]'::jsonb")
+        temporal_descriptor_expr = self._memory_column_expr(memory_columns, "temporal_descriptor", "''::text")
         for conv in conversations:
             mem_id = conv.get('id')
             if not mem_id:
                 continue
             try:
-                cur.execute("""
+                cur.execute(
+                    f"""
                     SELECT conversation_title, weight, timestamp, conversation_id, intensity, topic,
                            memory_type, feeling_weight, energy_shift, comfort_level, significance_score, secure_payload,
-                           access_count, thread_id, recorded_at, conversation_at, user_local_date, user_local_time,
-                           timezone_name, turn_index, event_dates_json, relative_time_labels, temporal_descriptor
+                           access_count, thread_id,
+                           {recorded_at_expr},
+                           {conversation_at_expr},
+                           {user_local_date_expr},
+                           {user_local_time_expr},
+                           {timezone_name_expr},
+                           {turn_index_expr},
+                           {event_dates_expr},
+                           {relative_labels_expr},
+                           {temporal_descriptor_expr}
                     FROM memories WHERE id = %s
-                """, (mem_id,))
+                    """,
+                    (mem_id,),
+                )
                 row = cur.fetchone()
                 if row:
                     conv['conversation_title'] = row[0] or ''
@@ -3288,16 +3391,22 @@ class MemoryManager:
 
         conn = get_connection()
         cur = conn.cursor()
+        memory_columns = self._get_table_columns("memories", conn=conn, cur=cur)
+        order_expr = self._memory_order_expr(memory_columns)
+        conversation_at_expr = self._memory_column_expr(memory_columns, "conversation_at", "NULL::timestamptz")
+        temporal_descriptor_expr = self._memory_column_expr(memory_columns, "temporal_descriptor", "''::text")
         try:
             rows = []
             if thread_id:
                 cur.execute(
-                    """
-                    SELECT id, user_input, sylana_response, emotion, timestamp, thread_id, conversation_at, temporal_descriptor
+                    f"""
+                    SELECT id, user_input, sylana_response, emotion, timestamp, thread_id,
+                           {conversation_at_expr},
+                           {temporal_descriptor_expr}
                     FROM memories
                     WHERE thread_id = %s
                       AND (%s IS NULL OR COALESCE(personality, 'sylana') = %s)
-                    ORDER BY COALESCE(conversation_at, recorded_at, NOW()) DESC, id DESC
+                    ORDER BY {order_expr} DESC, id DESC
                     LIMIT %s
                     """,
                     (int(thread_id), personality, personality, limit),
@@ -3313,11 +3422,13 @@ class MemoryManager:
                 params.append(remaining if remaining > 0 else limit)
                 cur.execute(
                     f"""
-                    SELECT id, user_input, sylana_response, emotion, timestamp, thread_id, conversation_at, temporal_descriptor
+                    SELECT id, user_input, sylana_response, emotion, timestamp, thread_id,
+                           {conversation_at_expr},
+                           {temporal_descriptor_expr}
                     FROM memories
                     WHERE (%s IS NULL OR COALESCE(personality, 'sylana') = %s)
                       {extra_where}
-                    ORDER BY COALESCE(conversation_at, recorded_at, NOW()) DESC, id DESC
+                    ORDER BY {order_expr} DESC, id DESC
                     LIMIT %s
                     """,
                     tuple(params),

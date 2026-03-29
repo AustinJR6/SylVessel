@@ -167,6 +167,34 @@ class ChatFlowTests(unittest.TestCase):
         self.assertTrue(all(len(item["content"]) <= server.RECENT_HISTORY_MESSAGE_CHAR_LIMIT for item in messages))
         self.assertTrue(all(item["content"].endswith("...") for item in messages))
 
+    def test_get_recent_thread_turn_history_prefers_persisted_chat_messages(self):
+        chat_messages = [
+            {"id": 1, "role": "user", "content": "we were talking about kite crypto", "turn": 7, "created_at": "2026-03-29T03:49:01"},
+            {"id": 2, "role": "assistant", "content": "KITE looks like the token, not the coding tool", "turn": 7, "created_at": "2026-03-29T03:49:02"},
+            {"id": 3, "role": "user", "content": "are competitors closing the gap", "turn": 8, "created_at": "2026-03-29T03:51:31"},
+            {"id": 4, "role": "assistant", "content": "say that again for me", "turn": 8, "created_at": "2026-03-29T03:51:32"},
+        ]
+
+        with patch.object(server, "get_chat_messages", return_value=chat_messages):
+            history = server._get_recent_thread_turn_history(51, max_turns=2)
+
+        self.assertEqual(len(history), 2)
+        self.assertEqual(history[0]["user_input"], "we were talking about kite crypto")
+        self.assertIn("token", history[0]["sylana_response"])
+        self.assertEqual(history[1]["user_input"], "are competitors closing the gap")
+
+    def test_load_recent_history_for_turn_prefers_thread_history_over_memory_history(self):
+        fake_manager = types.SimpleNamespace(get_conversation_history=lambda **kwargs: (_ for _ in ()).throw(AssertionError("memory history should not be used")))
+        previous_manager = getattr(server.state, "memory_manager", None)
+        server.state.memory_manager = fake_manager
+        try:
+            with patch.object(server, "_get_recent_thread_turn_history", return_value=[{"user_input": "kite", "sylana_response": "token"}]):
+                history = server._load_recent_history_for_turn(thread_id=51, personality="sylana", memories_active=True)
+        finally:
+            server.state.memory_manager = previous_manager
+
+        self.assertEqual(history, [{"user_input": "kite", "sylana_response": "token"}])
+
     def test_resolve_chat_request_context_creates_new_thread_when_missing(self):
         with patch.object(server, "create_chat_thread", return_value={"id": 77}) as create_thread:
             with patch.object(server, "_set_thread_tools") as set_thread_tools:

@@ -64,6 +64,9 @@ class _FakeConnection:
         self.committed = False
         self.rolled_back = False
 
+    def cursor(self):
+        raise NotImplementedError
+
     def commit(self):
         self.committed = True
 
@@ -85,6 +88,38 @@ class _FakeContinuityCursor:
 
     def close(self):
         return None
+
+
+class _StaticCursor:
+    def __init__(self, fetchone_values=None, fetchall_values=None):
+        self.fetchone_values = list(fetchone_values or [])
+        self.fetchall_values = list(fetchall_values or [])
+        self.executed_sql = []
+
+    def execute(self, sql, params=None):
+        self.executed_sql.append(" ".join(str(sql).split()))
+
+    def fetchone(self):
+        if self.fetchone_values:
+            return self.fetchone_values.pop(0)
+        return None
+
+    def fetchall(self):
+        if self.fetchall_values:
+            return self.fetchall_values.pop(0)
+        return []
+
+    def close(self):
+        return None
+
+
+class _CursorConnection(_FakeConnection):
+    def __init__(self, cursor):
+        super().__init__()
+        self._cursor = cursor
+
+    def cursor(self):
+        return self._cursor
 
 
 class MemoryContinuityTests(unittest.TestCase):
@@ -231,6 +266,67 @@ class MemoryContinuityTests(unittest.TestCase):
 
         self.assertIn("tired", briefs["care_brief"])
         self.assertIn("Birthday planning", briefs["follow_through_brief"])
+
+    def test_get_conversation_history_falls_back_to_legacy_memories_ordering(self):
+        cursor = _StaticCursor(
+            fetchall_values=[
+                [
+                    (11, "We were talking about kite crypto", "Still tracking the token thesis.", "curious", 1774756141.0, 51, None, ""),
+                ]
+            ]
+        )
+        conn = _CursorConnection(cursor)
+
+        with patch.object(self.manager, "_get_table_columns", return_value={"id", "user_input", "sylana_response", "emotion", "timestamp", "thread_id", "created_at", "personality"}):
+            with patch.object(memory_manager, "get_connection", return_value=conn):
+                history = self.manager.get_conversation_history(limit=1, personality="sylana", thread_id=51)
+
+        self.assertEqual(history[0]["user_input"], "We were talking about kite crypto")
+        self.assertIn("created_at", cursor.executed_sql[0])
+        self.assertIn("to_timestamp(timestamp)", cursor.executed_sql[0])
+
+    def test_store_conversation_omits_missing_temporal_columns_for_legacy_schema(self):
+        cursor = _StaticCursor(fetchone_values=[(88,)])
+        conn = _CursorConnection(cursor)
+        self.manager.semantic_engine = types.SimpleNamespace(encode_text=lambda text: [0.0])
+
+        temporal_context = {
+            "recorded_at": "2026-03-29T03:49:01+00:00",
+            "conversation_at": "2026-03-29T03:49:01+00:00",
+            "user_local_date": "2026-03-28",
+            "user_local_time": "22:49",
+            "timezone_name": "America/Chicago",
+            "turn_index": 7,
+            "event_dates_json": [],
+            "relative_time_labels": ["today"],
+            "temporal_descriptor": "tonight",
+        }
+
+        with patch.object(memory_manager, "get_connection", return_value=conn):
+            with patch.object(self.manager, "_get_table_columns", return_value={"user_input", "sylana_response", "timestamp", "emotion", "embedding", "personality", "privacy_level", "thread_id", "memory_type", "feeling_weight", "energy_shift", "comfort_level", "significance_score", "secure_payload"}):
+                with patch.object(self.manager, "_classify_memory_type", return_value="contextual"):
+                    with patch.object(self.manager, "_compute_feeling_weight", return_value=0.5):
+                        with patch.object(self.manager, "_compute_energy_shift", return_value=0.0):
+                            with patch.object(self.manager, "_compute_comfort_level", return_value=0.5):
+                                with patch.object(self.manager, "_compute_significance_score", return_value=0.6):
+                                    with patch.object(self.manager, "_infer_turn_index", return_value=7):
+                                        with patch.object(self.manager, "_build_temporal_context", return_value=temporal_context):
+                                            with patch.object(self.manager, "_encrypt_payload", return_value=b"payload"):
+                                                with patch.object(self.manager, "_refresh_recent_memory_layers", return_value={}):
+                                                    with patch.object(self.manager, "_update_session_continuity_state", return_value={}):
+                                                        memory_id = self.manager.store_conversation(
+                                                            user_input="kite crypto looks interesting",
+                                                            sylana_response="Let's stay on the token thesis.",
+                                                            emotion="curious",
+                                                            emotion_data={"category": "curious"},
+                                                            personality="sylana",
+                                                            thread_id=51,
+                                                        )
+
+        self.assertEqual(memory_id, 88)
+        insert_sql = next(sql for sql in cursor.executed_sql if "INSERT INTO memories" in sql)
+        self.assertNotIn("recorded_at", insert_sql)
+        self.assertNotIn("conversation_at", insert_sql)
 
 
 if __name__ == "__main__":

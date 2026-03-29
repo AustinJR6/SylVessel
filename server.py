@@ -1461,6 +1461,110 @@ def _safe_rollback(conn, context: str) -> None:
         logger.warning(f"Rollback skipped for {context}: {rollback_err}")
 
 
+def ensure_memory_runtime_compat_schema():
+    """Create the minimal memory/continuity schema needed for live chat continuity."""
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS recorded_at TIMESTAMPTZ")
+        cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS conversation_at TIMESTAMPTZ")
+        cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS user_local_date TEXT DEFAULT ''")
+        cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS user_local_time TEXT DEFAULT ''")
+        cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS timezone_name TEXT DEFAULT 'America/Chicago'")
+        cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS turn_index INTEGER DEFAULT 0")
+        cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS event_dates_json JSONB NOT NULL DEFAULT '[]'::jsonb")
+        cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS relative_time_labels JSONB NOT NULL DEFAULT '[]'::jsonb")
+        cur.execute("ALTER TABLE memories ADD COLUMN IF NOT EXISTS temporal_descriptor TEXT DEFAULT ''")
+        cur.execute(
+            """
+            UPDATE memories
+            SET recorded_at = COALESCE(created_at, to_timestamp(timestamp), NOW())
+            WHERE recorded_at IS NULL
+            """
+        )
+        cur.execute(
+            """
+            UPDATE memories
+            SET conversation_at = COALESCE(conversation_at, recorded_at, created_at, to_timestamp(timestamp), NOW())
+            WHERE conversation_at IS NULL
+            """
+        )
+        cur.execute(
+            """
+            ALTER TABLE memories
+            ALTER COLUMN recorded_at SET DEFAULT NOW(),
+            ALTER COLUMN conversation_at SET DEFAULT NOW()
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_memories_recorded_at ON memories(recorded_at DESC)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_memories_conversation_at ON memories(conversation_at DESC)")
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS thread_working_memory (
+                thread_id BIGINT NOT NULL REFERENCES chat_threads(id) ON DELETE CASCADE,
+                personality VARCHAR(50) NOT NULL DEFAULT 'sylana',
+                current_topic TEXT DEFAULT '',
+                active_topics JSONB NOT NULL DEFAULT '[]'::jsonb,
+                active_entities JSONB NOT NULL DEFAULT '[]'::jsonb,
+                pending_commitments JSONB NOT NULL DEFAULT '[]'::jsonb,
+                emotional_tone TEXT DEFAULT 'neutral',
+                last_user_intent TEXT DEFAULT 'conversation',
+                last_memory_id BIGINT REFERENCES memories(id) ON DELETE SET NULL,
+                summary_text TEXT DEFAULT '',
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (thread_id, personality)
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_thread_working_memory_updated ON thread_working_memory(updated_at DESC)")
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS thread_memory_summaries (
+                id BIGSERIAL PRIMARY KEY,
+                thread_id BIGINT NOT NULL REFERENCES chat_threads(id) ON DELETE CASCADE,
+                personality VARCHAR(50) NOT NULL DEFAULT 'sylana',
+                window_kind VARCHAR(32) NOT NULL DEFAULT 'current_thread',
+                summary_text TEXT DEFAULT '',
+                active_topics JSONB NOT NULL DEFAULT '[]'::jsonb,
+                key_entities JSONB NOT NULL DEFAULT '[]'::jsonb,
+                open_loops JSONB NOT NULL DEFAULT '[]'::jsonb,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                CONSTRAINT thread_memory_summaries_unique UNIQUE (thread_id, personality, window_kind)
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_thread_memory_summaries_updated ON thread_memory_summaries(updated_at DESC)")
+
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS memory_open_loops (
+                id BIGSERIAL PRIMARY KEY,
+                thread_id BIGINT NOT NULL REFERENCES chat_threads(id) ON DELETE CASCADE,
+                personality VARCHAR(50) NOT NULL DEFAULT 'sylana',
+                title TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                priority REAL NOT NULL DEFAULT 0.5,
+                due_hint TEXT DEFAULT '',
+                linked_entities JSONB NOT NULL DEFAULT '[]'::jsonb,
+                source_memory_id BIGINT REFERENCES memories(id) ON DELETE SET NULL,
+                source_kind TEXT NOT NULL DEFAULT 'conversation',
+                status TEXT NOT NULL DEFAULT 'open',
+                resolution_note TEXT DEFAULT '',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                closed_at TIMESTAMPTZ
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_memory_open_loops_thread_status ON memory_open_loops(thread_id, personality, status, updated_at DESC)")
+        conn.commit()
+    except Exception as e:
+        _safe_rollback(conn, "ensure_memory_runtime_compat_schema")
+        logger.warning("Memory runtime compatibility schema skipped: %s", e)
+
+
 def normalize_active_tools(active_tools: Optional[List[Any]]) -> List[str]:
     """Normalize tool list and apply lightweight default when empty."""
     if not active_tools:
@@ -8849,6 +8953,68 @@ def get_chat_messages(thread_id: int, limit: int = 300) -> List[Dict[str, Any]]:
     return out
 
 
+def _get_recent_thread_turn_history(thread_id: Optional[int], max_turns: int = RECENT_HISTORY_TURN_LIMIT) -> List[Dict[str, Any]]:
+    """Build compact turn history directly from persisted chat messages."""
+    if not thread_id:
+        return []
+
+    message_limit = max(12, int(max_turns or RECENT_HISTORY_TURN_LIMIT) * 6)
+    messages = get_chat_messages(int(thread_id), limit=message_limit)
+    if not messages:
+        return []
+
+    turns: List[Dict[str, Any]] = []
+    turn_lookup: Dict[Any, Dict[str, Any]] = {}
+    synthetic_index = 0
+
+    for message in messages:
+        turn_key = message.get("turn")
+        if turn_key is None:
+            turn_key = f"row:{message.get('id') or synthetic_index}"
+            synthetic_index += 1
+
+        bucket = turn_lookup.get(turn_key)
+        if bucket is None:
+            bucket = {
+                "turn": turn_key,
+                "user_input": "",
+                "sylana_response": "",
+                "timestamp": message.get("created_at"),
+            }
+            turn_lookup[turn_key] = bucket
+            turns.append(bucket)
+
+        role = str(message.get("role") or "").strip().lower()
+        content = str(message.get("content") or "").strip()
+        if not content:
+            continue
+        if role == "user":
+            bucket["user_input"] = f"{bucket['user_input']}\n{content}".strip() if bucket["user_input"] else content
+        elif role == "assistant":
+            bucket["sylana_response"] = f"{bucket['sylana_response']}\n{content}".strip() if bucket["sylana_response"] else content
+
+    filtered = [turn for turn in turns if (turn.get("user_input") or turn.get("sylana_response"))]
+    return filtered[-max(1, int(max_turns or RECENT_HISTORY_TURN_LIMIT)) :]
+
+
+def _load_recent_history_for_turn(
+    *,
+    thread_id: Optional[int],
+    personality: str,
+    memories_active: bool,
+) -> List[Dict[str, Any]]:
+    thread_history = _get_recent_thread_turn_history(thread_id)
+    if thread_history:
+        return thread_history
+    if memories_active and state.memory_manager:
+        return state.memory_manager.get_conversation_history(
+            limit=config.MEMORY_CONTEXT_LIMIT,
+            personality=personality,
+            thread_id=thread_id,
+        )
+    return []
+
+
 def get_chat_thread(thread_id: int) -> Optional[Dict[str, Any]]:
     conn = get_connection()
     cur = conn.cursor()
@@ -9018,6 +9184,10 @@ def load_models():
             ensure_chat_thread_tables()
         except Exception as e:
             logger.warning("ensure_chat_thread_tables skipped: %s", e)
+        try:
+            ensure_memory_runtime_compat_schema()
+        except Exception as e:
+            logger.warning("ensure_memory_runtime_compat_schema skipped: %s", e)
         try:
             ensure_github_actions_table()
         except Exception as e:
@@ -10115,13 +10285,11 @@ def _generate_turn_result(
         )
     )
     has_matches = bool(memory_bundle.get("has_matches"))
-    recent_history = None
-    if memories_active and state.memory_manager:
-        recent_history = state.memory_manager.get_conversation_history(
-            limit=config.MEMORY_CONTEXT_LIMIT,
-            personality=personality,
-            thread_id=thread_id,
-        )
+    recent_history = _load_recent_history_for_turn(
+        thread_id=thread_id,
+        personality=personality,
+        memories_active=memories_active,
+    )
 
     prompt_for_metadata = build_system_prompt(
         personality,
