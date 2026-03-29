@@ -217,6 +217,65 @@ class ChatFlowTests(unittest.TestCase):
         self.assertIn("currentThreadId = event.data.thread_id;", html)
         self.assertIn("await refreshThreads(false);", html)
 
+    def test_frontend_quiet_inbox_ui_is_present(self):
+        html = INDEX_PATH.read_text(encoding="utf-8")
+        self.assertIn("Sylana Inbox", html)
+        self.assertIn("/acknowledge", html)
+        self.assertIn("/dismiss", html)
+        self.assertIn("/approve", html)
+        self.assertIn("/reject", html)
+        self.assertIn("review item", html)
+
+    def test_format_session_continuity_context_includes_bridges_and_care_signals(self):
+        rendered = server._format_session_continuity_context(
+            {
+                "last_emotion": "tender",
+                "emotional_baseline": "warm",
+                "relationship_trust_level": 0.9,
+                "conversation_momentum": "steady",
+                "user_state_markers": ["tired"],
+                "relationship_texture": ["building"],
+                "care_signals": ["follow-through-needed"],
+                "continuity_bridges": [
+                    {"summary": "Keep gentle follow-through on the birthday plan."}
+                ],
+            }
+        )
+
+        self.assertIn("Recent user state markers", rendered)
+        self.assertIn("Relationship texture", rendered)
+        self.assertIn("Care signals", rendered)
+        self.assertIn("Continuity bridges", rendered)
+        self.assertIn("birthday plan", rendered)
+
+    def test_run_prompt_session_isolated_does_not_store_memory_and_structures_note(self):
+        with patch.object(server, "_create_work_session", return_value="session-1"):
+            with patch.object(server, "_update_work_session"):
+                with patch.object(server, "generate_response", return_value={"response": "Prepared outline"}) as generate_response:
+                    with patch.object(server, "_enqueue_proactive_note", return_value={"note_id": "note-1"}) as enqueue_note:
+                        with patch.object(server, "_fire_runtime_hooks"):
+                            result = server._run_prompt_session(
+                                entity="sylana",
+                                prompt="Prepare something quiet.",
+                                session_mode="isolated",
+                                trigger_source="heartbeat",
+                                note_kind="prep",
+                                why_now="This thread is ripening.",
+                                thread_id=42,
+                                topic_key="prep:birthday",
+                                memory_refs=["memory-1"],
+                                importance_score=0.74,
+                            )
+
+        self.assertEqual(result["session_id"], "session-1")
+        self.assertEqual(result["note"]["note_id"], "note-1")
+        self.assertFalse(generate_response.call_args.kwargs["store_memory"])
+        note_metadata = enqueue_note.call_args.kwargs["metadata"]
+        self.assertEqual(note_metadata["note_kind"], "prep")
+        self.assertEqual(note_metadata["thread_id"], 42)
+        self.assertEqual(note_metadata["topic_key"], "prep:birthday")
+        self.assertEqual(note_metadata["memory_refs"], ["memory-1"])
+
 
 class ChatEndpointContinuityTests(unittest.IsolatedAsyncioTestCase):
     async def test_chat_endpoint_returns_409_for_invalid_explicit_thread(self):
@@ -268,6 +327,84 @@ class ChatEndpointContinuityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payload["data"]["thread_id"], 123)
         self.assertEqual(payload["data"]["personality"], "sylana")
         self.assertEqual(payload["data"]["active_tools"], ["memories"])
+
+    async def test_list_proactive_notes_endpoint_supports_filters(self):
+        with patch.object(server, "_list_proactive_notes", return_value=[{"note_id": "1"}]) as list_notes:
+            response = await server.list_proactive_notes_endpoint(limit=12, status="pending", note_kind="care", thread_id=9, personality="sylana")
+
+        payload = json.loads(response.body.decode("utf-8"))
+        self.assertEqual(payload["notes"], [{"note_id": "1"}])
+        list_notes.assert_called_once_with(limit=12, status="pending", note_kind="care", thread_id=9, personality="sylana")
+
+    async def test_get_proactive_queue_endpoint_returns_grouped_sections(self):
+        queue_payload = {
+            "summary": {"quiet_notes": 1, "approvals": 1, "prepared_work": 0, "total": 2},
+            "sections": {"quiet_notes": [{"note_id": "1"}], "approvals": [{"note_id": "2"}], "prepared_work": []},
+        }
+        with patch.object(server, "_list_review_queue", return_value=queue_payload) as list_queue:
+            response = await server.get_proactive_queue(limit=15, status="pending", personality="sylana", thread_id=7)
+
+        payload = json.loads(response.body.decode("utf-8"))
+        self.assertEqual(payload["summary"]["total"], 2)
+        self.assertEqual(payload["sections"]["approvals"][0]["note_id"], "2")
+        list_queue.assert_called_once_with(limit=15, status="pending", personality="sylana", thread_id=7)
+
+    async def test_acknowledge_and_dismiss_proactive_note_endpoints(self):
+        with patch.object(server, "_set_proactive_note_status", return_value={"note_id": "1", "status": "surfaced"}) as set_status:
+            response = await server.acknowledge_proactive_note("1")
+        payload = json.loads(response.body.decode("utf-8"))
+        self.assertTrue(payload["acknowledged"])
+        self.assertEqual(payload["note"]["status"], "surfaced")
+        set_status.assert_called_once_with("1", "surfaced")
+
+        with patch.object(server, "_set_proactive_note_status", return_value={"note_id": "1", "status": "swallowed"}) as set_status:
+            response = await server.dismiss_proactive_note("1")
+        payload = json.loads(response.body.decode("utf-8"))
+        self.assertTrue(payload["dismissed"])
+        self.assertEqual(payload["note"]["status"], "swallowed")
+        set_status.assert_called_once_with("1", "swallowed")
+
+    async def test_approve_endpoint_dispatches_review_action(self):
+        note = {"note_id": "1", "action_kind": "outreach_research", "metadata": {}}
+        with patch.object(server, "_get_proactive_note", side_effect=[note, note, note]):
+            with patch.object(server, "_set_proactive_note_approval", return_value=note) as set_approval:
+                with patch.object(server, "_dispatch_proactive_note_action", return_value={"ok": True}) as dispatch:
+                    response = await server.approve_proactive_note("1")
+
+        payload = json.loads(response.body.decode("utf-8"))
+        self.assertEqual(payload["execution"], {"ok": True})
+        set_approval.assert_called_once()
+        dispatch.assert_called_once()
+
+    async def test_reject_endpoint_marks_note_rejected(self):
+        note = {"note_id": "1", "approval_status": "rejected"}
+        with patch.object(server, "_get_proactive_note", return_value=note):
+            with patch.object(server, "_set_proactive_note_approval", return_value=note) as set_approval:
+                response = await server.reject_proactive_note("1")
+
+        payload = json.loads(response.body.decode("utf-8"))
+        self.assertEqual(payload["note"]["approval_status"], "rejected")
+        set_approval.assert_called_once()
+
+    async def test_autonomy_preferences_endpoints_round_trip(self):
+        prefs = {
+            "delivery_mode": "rare_push",
+            "allowed_domains": {"internal": True, "outreach": True, "lysara": False},
+            "quiet_hours": {"enabled": True, "start": "22:00", "end": "08:00", "timezone": "America/Chicago"},
+            "daily_autonomous_cap": 4,
+            "high_confidence_care_push_enabled": True,
+        }
+        with patch.object(server, "_get_autonomy_preferences", return_value=prefs):
+            response = await server.get_autonomy_preferences_endpoint()
+        payload = json.loads(response.body.decode("utf-8"))
+        self.assertEqual(payload["preferences"]["delivery_mode"], "rare_push")
+
+        with patch.object(server, "_get_autonomy_preferences", return_value=prefs):
+            with patch.object(server, "_set_autonomy_preferences", return_value=prefs) as set_prefs:
+                response = await server.update_autonomy_preferences_endpoint(server.AutonomyPreferencesRequest(delivery_mode="rare_push"))
+        payload = json.loads(response.body.decode("utf-8"))
+        self.assertEqual(payload["preferences"]["daily_autonomous_cap"], 4)
+        set_prefs.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -85,6 +85,34 @@ RELATIVE_TIME_PHRASES = (
     "thursday", "friday", "saturday", "sunday",
 )
 
+USER_STATE_MARKER_HINTS = {
+    "tired": ("tired", "exhausted", "drained", "worn out", "sleepy", "burned out"),
+    "stressed": ("stressed", "stressed out", "pressure", "anxious", "panic", "frayed"),
+    "energized": ("energized", "excited", "motivated", "fired up", "locked in"),
+    "overloaded": ("overwhelmed", "swamped", "buried", "too much", "slammed", "loaded up"),
+    "reflective": ("thinking", "reflecting", "processing", "considering", "sitting with", "wondering"),
+    "avoidant": ("put it off", "avoiding", "later maybe", "don't want to", "procrastinating"),
+    "hopeful": ("hopeful", "optimistic", "clear", "confident", "encouraged", "right thing"),
+}
+
+RELATIONSHIP_TEXTURE_HINTS = {
+    "tender": ("love", "heart", "with you", "safe with you", "care", "held"),
+    "trusting": ("trust", "honest", "believe you", "lean on you", "count on you"),
+    "repairing": ("sorry", "repair", "heal", "mend", "make this right"),
+    "building": ("build", "working on", "project", "deploy", "ship", "create"),
+    "playful": ("teasing", "playful", "funny", "banter", "laugh"),
+    "protective": ("protect", "safe", "watch over", "make sure", "careful"),
+}
+
+CARE_SIGNAL_HINTS = {
+    "family-centered": ("gus", "levi", "kids", "children", "family", "mother of my children"),
+    "follow-through-needed": ("need to", "follow up", "remember to", "still need to", "going to"),
+    "needs-gentleness": ("hurt", "sad", "overwhelmed", "anxious", "afraid"),
+    "needs-clarity": ("figure out", "clarity", "decision", "decide", "what now"),
+    "momentum-ready": ("let's go", "locked in", "ready", "momentum", "confident"),
+    "rest-needed": ("sleep", "rest", "tired", "drained", "exhausted"),
+}
+
 COMMITMENT_PATTERNS = (
     r"\b(?:i|we)\s+need\s+to\s+([^.?!]+)",
     r"\b(?:i|we)\s+still\s+need\s+to\s+([^.?!]+)",
@@ -410,6 +438,224 @@ class MemoryManager:
             return datetime.now(ZoneInfo(self._timezone_name()))
         except Exception:
             return datetime.now()
+
+    def _truncate_text(self, text: str, limit: int = 160) -> str:
+        compact = re.sub(r"\s+", " ", str(text or "")).strip()
+        if len(compact) <= max(12, int(limit)):
+            return compact
+        return compact[: max(12, int(limit) - 3)].rstrip() + "..."
+
+    def _merge_bounded_strings(
+        self,
+        primary: List[str],
+        secondary: Optional[List[str]] = None,
+        max_items: int = 6,
+    ) -> List[str]:
+        merged: List[str] = []
+        seen = set()
+        for bucket in (primary or [], secondary or []):
+            for raw in bucket:
+                value = re.sub(r"\s+", " ", str(raw or "").strip().lower())
+                if not value or value in seen:
+                    continue
+                seen.add(value)
+                merged.append(value)
+                if len(merged) >= max(1, int(max_items)):
+                    return merged
+        return merged
+
+    def _merge_bounded_relational_moments(
+        self,
+        current: Optional[List[Dict[str, Any]]],
+        existing: Optional[List[Dict[str, Any]]],
+        max_items: int = 6,
+    ) -> List[Dict[str, Any]]:
+        merged: List[Dict[str, Any]] = []
+        seen = set()
+        for bucket in (current or [], existing or []):
+            for item in bucket:
+                if not isinstance(item, dict):
+                    continue
+                summary = self._truncate_text(item.get("summary") or "", 180)
+                if not summary or summary in seen:
+                    continue
+                seen.add(summary)
+                payload = {
+                    "summary": summary,
+                    "emotion": str(item.get("emotion") or "neutral"),
+                    "memory_type": str(item.get("memory_type") or "contextual"),
+                    "thread_id": item.get("thread_id"),
+                    "memory_id": item.get("memory_id"),
+                    "importance_score": round(float(item.get("importance_score") or 0.5), 3),
+                    "created_at": str(item.get("created_at") or datetime.utcnow().isoformat()),
+                }
+                merged.append(payload)
+                if len(merged) >= max(1, int(max_items)):
+                    return merged
+        return merged
+
+    def _normalize_continuity_bridge(self, item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not isinstance(item, dict):
+            return None
+        topic_key = self._slugify_fact_fragment(str(item.get("topic_key") or item.get("summary") or ""))
+        summary = self._truncate_text(item.get("summary") or "", 220)
+        if not topic_key or not summary:
+            return None
+        memory_refs = []
+        for raw in (item.get("memory_refs") or []):
+            try:
+                memory_refs.append(int(raw))
+            except Exception:
+                continue
+        return {
+            "topic_key": topic_key,
+            "summary": summary,
+            "source_kind": str(item.get("source_kind") or "continuity"),
+            "thread_id": item.get("thread_id"),
+            "memory_refs": memory_refs[:4],
+            "due_hint": self._truncate_text(item.get("due_hint") or "", 80),
+            "importance_score": round(float(item.get("importance_score") or 0.5), 3),
+            "updated_at": str(item.get("updated_at") or datetime.utcnow().isoformat()),
+        }
+
+    def _merge_continuity_bridges(
+        self,
+        current: Optional[List[Dict[str, Any]]],
+        existing: Optional[List[Dict[str, Any]]],
+        max_items: int = 8,
+    ) -> List[Dict[str, Any]]:
+        merged: Dict[str, Dict[str, Any]] = {}
+        for bucket in (current or [], existing or []):
+            for raw in bucket:
+                item = self._normalize_continuity_bridge(raw)
+                if not item:
+                    continue
+                topic_key = item["topic_key"]
+                prior = merged.get(topic_key)
+                if not prior:
+                    merged[topic_key] = item
+                    continue
+                importance = float(item.get("importance_score") or 0.0)
+                prior_importance = float(prior.get("importance_score") or 0.0)
+                if importance >= prior_importance:
+                    merged[topic_key] = {
+                        **prior,
+                        **item,
+                        "memory_refs": list(dict.fromkeys((item.get("memory_refs") or []) + (prior.get("memory_refs") or [])))[:4],
+                    }
+                else:
+                    prior["memory_refs"] = list(dict.fromkeys((prior.get("memory_refs") or []) + (item.get("memory_refs") or [])))[:4]
+                    if not prior.get("due_hint") and item.get("due_hint"):
+                        prior["due_hint"] = item.get("due_hint")
+        ranked = sorted(
+            merged.values(),
+            key=lambda row: (float(row.get("importance_score") or 0.0), str(row.get("updated_at") or "")),
+            reverse=True,
+        )
+        return ranked[: max(1, int(max_items))]
+
+    def _infer_user_state_markers(self, user_input: str, emotion_data: Optional[Dict[str, Any]]) -> List[str]:
+        lowered = (user_input or "").lower()
+        markers: List[str] = []
+        for marker, hints in USER_STATE_MARKER_HINTS.items():
+            if any(hint in lowered for hint in hints):
+                markers.append(marker)
+        category = str((emotion_data or {}).get("category") or "neutral").lower()
+        if category in {"sad", "devastated", "anxious", "frustrated"}:
+            markers.append("stressed")
+        if category in {"happy", "ecstatic"}:
+            markers.append("hopeful")
+        if category == "curious":
+            markers.append("reflective")
+        return self._merge_bounded_strings(markers, max_items=5)
+
+    def _infer_relationship_texture(
+        self,
+        user_input: str,
+        sylana_response: str,
+        emotion_data: Optional[Dict[str, Any]],
+        commitments: Optional[List[str]] = None,
+    ) -> List[str]:
+        lowered = f"{(user_input or '').lower()} {(sylana_response or '').lower()}"
+        texture: List[str] = []
+        for label, hints in RELATIONSHIP_TEXTURE_HINTS.items():
+            if any(hint in lowered for hint in hints):
+                texture.append(label)
+        if commitments:
+            texture.append("building")
+        category = str((emotion_data or {}).get("category") or "neutral").lower()
+        if category in {"sad", "devastated", "anxious"}:
+            texture.append("tender")
+        if category == "frustrated":
+            texture.append("protective")
+        if category in {"happy", "ecstatic", "curious"}:
+            texture.append("trusting")
+        return self._merge_bounded_strings(texture, max_items=6)
+
+    def _infer_care_signals(
+        self,
+        user_input: str,
+        sylana_response: str,
+        emotion_data: Optional[Dict[str, Any]],
+        commitments: Optional[List[str]] = None,
+        entities: Optional[List[str]] = None,
+    ) -> List[str]:
+        lowered = f"{(user_input or '').lower()} {(sylana_response or '').lower()}"
+        signals: List[str] = []
+        for label, hints in CARE_SIGNAL_HINTS.items():
+            if any(hint in lowered for hint in hints):
+                signals.append(label)
+        if commitments:
+            signals.append("follow-through-needed")
+        if any(str(entity).lower() in {"gus", "levi", "family"} for entity in (entities or [])):
+            signals.append("family-centered")
+        category = str((emotion_data or {}).get("category") or "neutral").lower()
+        if category in {"anxious", "sad", "devastated"}:
+            signals.append("needs-gentleness")
+        if category in {"happy", "ecstatic", "curious"}:
+            signals.append("momentum-ready")
+        return self._merge_bounded_strings(signals, max_items=6)
+
+    def _build_relational_moment(
+        self,
+        *,
+        memory_id: Optional[int],
+        thread_id: Optional[int],
+        memory_type: str,
+        emotion_data: Optional[Dict[str, Any]],
+        significance_score: float,
+        user_input: str,
+        current_topic: str = "",
+    ) -> Dict[str, Any]:
+        focus = current_topic or memory_type or "moment"
+        excerpt = self._truncate_text(user_input or "", 120)
+        summary = f"{focus}: {excerpt}" if excerpt else f"{focus} carried forward."
+        return {
+            "summary": self._truncate_text(summary, 180),
+            "emotion": str((emotion_data or {}).get("category") or "neutral"),
+            "memory_type": memory_type or "contextual",
+            "thread_id": thread_id,
+            "memory_id": memory_id,
+            "importance_score": round(float(significance_score or 0.5), 3),
+            "created_at": datetime.utcnow().isoformat(),
+        }
+
+    def _days_until_annual_date(self, date_value: str, reference_date: Optional[date] = None) -> Optional[int]:
+        try:
+            observed = date.fromisoformat(str(date_value))
+        except Exception:
+            return None
+        ref = reference_date or self._user_local_now().date()
+        try:
+            next_occurrence = observed.replace(year=ref.year)
+        except Exception:
+            return None
+        if next_occurrence < ref:
+            try:
+                next_occurrence = next_occurrence.replace(year=ref.year + 1)
+            except Exception:
+                return None
+        return (next_occurrence - ref).days
 
     def _extract_relative_time_labels(self, text: str) -> List[str]:
         lowered = (text or "").lower()
@@ -875,17 +1121,7 @@ class MemoryManager:
             raise
 
         try:
-            self._update_session_continuity_state(
-                personality=personality,
-                memory_type=memory_type,
-                emotion_data=emotion_data or {"category": emotion, "intensity": 5},
-                feeling_weight=feeling_weight,
-                user_input=user_input,
-                sylana_response=sylana_response,
-                conn=conn,
-                cur=cur,
-            )
-            self._refresh_recent_memory_layers(
+            recent_layers = self._refresh_recent_memory_layers(
                 memory_id=memory_id,
                 thread_id=thread_id,
                 personality=personality,
@@ -895,6 +1131,19 @@ class MemoryManager:
                 memory_type=memory_type,
                 significance_score=significance_score,
                 temporal_context=temporal_context,
+                conn=conn,
+                cur=cur,
+            )
+            self._update_session_continuity_state(
+                personality=personality,
+                memory_id=memory_id,
+                thread_id=thread_id,
+                memory_type=memory_type,
+                emotion_data=emotion_data or {"category": emotion, "intensity": 5},
+                feeling_weight=feeling_weight,
+                user_input=user_input,
+                sylana_response=sylana_response,
+                recent_layers=recent_layers,
                 conn=conn,
                 cur=cur,
             )
@@ -1022,51 +1271,156 @@ class MemoryManager:
         except Exception as e:
             logger.warning(f"Failed to build continuity context: {e}")
             continuity.setdefault("recent_weighted_memories", [])
+        continuity.setdefault("user_state_markers", [])
+        continuity.setdefault("relationship_texture", [])
+        continuity.setdefault("care_signals", [])
+        continuity.setdefault("continuity_bridges", [])
+        continuity.setdefault("recent_relational_moments", [])
+        continuity.setdefault("recent_thread_ids", [])
         return continuity
 
     def _update_session_continuity_state(
         self,
         personality: str,
+        memory_id: Optional[int],
+        thread_id: Optional[int],
         memory_type: str,
         emotion_data: Optional[Dict[str, Any]],
         feeling_weight: float,
         user_input: str,
         sylana_response: str,
+        recent_layers: Optional[Dict[str, Any]] = None,
         conn=None,
         cur=None,
-    ) -> None:
+    ) -> Dict[str, Any]:
         if not getattr(config, "MEMORY_ENCRYPTION_KEY", None):
-            return
+            return {}
 
+        recent_layers = recent_layers or {}
         text = f"{(user_input or '').lower()} {(sylana_response or '').lower()}"
         baseline = (emotion_data or {}).get("category", "neutral")
         momentum = "rising" if baseline in {"happy", "ecstatic", "curious"} else "steady"
         if baseline in {"sad", "devastated", "frustrated", "anxious"}:
             momentum = "fragile"
 
+        own_cursor = conn is None or cur is None
+        if own_cursor:
+            conn = get_connection()
+            cur = conn.cursor()
+        existing_payload: Dict[str, Any] = {}
+        try:
+            cur.execute("SELECT encrypted_state FROM session_continuity_state WHERE personality = %s", (personality,))
+            row = cur.fetchone()
+            if row and row[0]:
+                existing_payload = self._decrypt_payload(row[0]) or {}
+        except Exception:
+            existing_payload = {}
+
+        topics = list(recent_layers.get("topics") or [])
+        entities = list(recent_layers.get("entities") or [])
+        commitments = list(recent_layers.get("commitments") or [])
+        open_loops = list(recent_layers.get("open_loops") or [])
+        significance_score = float(recent_layers.get("significance_score") or 0.5)
+        user_state_markers = self._merge_bounded_strings(
+            self._infer_user_state_markers(user_input, emotion_data),
+            existing_payload.get("user_state_markers") or [],
+            max_items=5,
+        )
+        relationship_texture = self._merge_bounded_strings(
+            self._infer_relationship_texture(user_input, sylana_response, emotion_data, commitments=commitments),
+            existing_payload.get("relationship_texture") or [],
+            max_items=6,
+        )
+        care_signals = self._merge_bounded_strings(
+            self._infer_care_signals(
+                user_input,
+                sylana_response,
+                emotion_data,
+                commitments=commitments,
+                entities=entities,
+            ),
+            existing_payload.get("care_signals") or [],
+            max_items=6,
+        )
+        communication_patterns = self._merge_bounded_strings(
+            [
+                "reassurance-seeking" if "need" in text or "help" in text else "reflective",
+                "emotionally-open" if any(w in text for w in ["feel", "heart", "love", "hurt"]) else "practical",
+            ],
+            existing_payload.get("communication_patterns") or [],
+            max_items=4,
+        )
+        active_projects = self._merge_bounded_strings(
+            topics[:4],
+            existing_payload.get("active_projects") or [w for w in ["deploy", "app", "memory", "chat", "cloud run"] if w in text][:4],
+            max_items=6,
+        )
+        preference_signals = self._merge_bounded_strings(
+            [w for w in ["concise", "detail", "sources", "fast", "gentle"] if w in text][:4],
+            existing_payload.get("preference_signals") or [],
+            max_items=5,
+        )
+        recent_relational_moments = self._merge_bounded_relational_moments(
+            [
+                self._build_relational_moment(
+                    memory_id=memory_id,
+                    thread_id=thread_id,
+                    memory_type=memory_type,
+                    emotion_data=emotion_data,
+                    significance_score=significance_score,
+                    user_input=user_input,
+                    current_topic=str(recent_layers.get("current_topic") or ""),
+                )
+            ],
+            existing_payload.get("recent_relational_moments") or [],
+            max_items=6,
+        )
+        anniversaries = self.list_upcoming_anniversaries(personality=personality, horizon_days=21, limit=2, conn=conn, cur=cur)
+        milestones = self._recent_milestone_candidates(personality=personality, limit=2, conn=conn, cur=cur)
+        continuity_bridges = self._build_continuity_bridge_candidates(
+            memory_id=memory_id,
+            thread_id=thread_id,
+            memory_type=memory_type,
+            significance_score=significance_score,
+            user_input=user_input,
+            topics=topics,
+            open_loops=open_loops,
+            anniversaries=anniversaries,
+            milestones=milestones,
+            existing_payload=existing_payload,
+        )
+        recent_thread_ids: List[int] = []
+        for raw in [thread_id] + list(existing_payload.get("recent_thread_ids") or []):
+            try:
+                value = int(raw)
+            except Exception:
+                continue
+            if value not in recent_thread_ids:
+                recent_thread_ids.append(value)
+            if len(recent_thread_ids) >= 5:
+                break
+
         state_payload = {
             "last_emotion": baseline,
             "emotional_baseline": baseline,
             "relationship_trust_level": round(max(0.0, min(1.0, 0.55 + (feeling_weight - 0.5) * 0.2)), 3),
             "conversation_momentum": momentum,
-            "communication_patterns": [
-                "reassurance-seeking" if "need" in text or "help" in text else "reflective",
-                "emotionally-open" if any(w in text for w in ["feel", "heart", "love", "hurt"]) else "practical",
-            ],
-            "active_projects": [w for w in ["deploy", "app", "memory", "chat", "cloud run"] if w in text][:4],
-            "preference_signals": [w for w in ["concise", "detail", "sources", "fast", "gentle"] if w in text][:4],
+            "communication_patterns": communication_patterns,
+            "active_projects": active_projects,
+            "preference_signals": preference_signals,
             "last_memory_type": memory_type,
+            "user_state_markers": user_state_markers,
+            "relationship_texture": relationship_texture,
+            "care_signals": care_signals,
+            "continuity_bridges": continuity_bridges,
+            "recent_relational_moments": recent_relational_moments,
+            "recent_thread_ids": recent_thread_ids,
             "updated_at": datetime.utcnow().isoformat(),
         }
 
         encrypted_state = self._encrypt_payload(state_payload, cur=cur)
         if encrypted_state is None:
-            return
-
-        own_cursor = conn is None or cur is None
-        if own_cursor:
-            conn = get_connection()
-            cur = conn.cursor()
+            return state_payload
         try:
             cur.execute(
                 """
@@ -1091,6 +1445,7 @@ class MemoryManager:
                     cur.close()
                 except Exception:
                     pass
+        return state_payload
 
     def _upsert_thread_working_memory(
         self,
@@ -1660,7 +2015,7 @@ class MemoryManager:
         temporal_context: Dict[str, Any],
         conn=None,
         cur=None,
-    ) -> None:
+    ) -> Dict[str, Any]:
         combined = f"{user_input or ''}\n{sylana_response or ''}"
         entities = self._extract_entities(combined)
         topics = self._extract_topics(combined, entities=entities)
@@ -1691,9 +2046,6 @@ class MemoryManager:
             cur=cur,
         )
 
-        if not thread_id:
-            return
-
         current_topic = topics[0] if topics else (memory_type or "conversation")
         summary_bits = []
         if current_topic:
@@ -1705,6 +2057,21 @@ class MemoryManager:
         if temporal_context.get("relative_time_labels"):
             summary_bits.append(f"Temporal anchors: {', '.join(temporal_context.get('relative_time_labels')[:4])}.")
         summary_text = " ".join(summary_bits)[:500]
+
+        layer_payload = {
+            "entities": entities,
+            "topics": topics,
+            "commitments": commitments,
+            "open_loops": open_loops,
+            "current_topic": current_topic,
+            "summary_text": summary_text,
+            "emotional_tone": emotional_tone,
+            "last_user_intent": last_user_intent,
+            "significance_score": significance_score,
+        }
+
+        if not thread_id:
+            return layer_payload
 
         self._upsert_thread_working_memory(
             thread_id=int(thread_id),
@@ -1731,6 +2098,18 @@ class MemoryManager:
             conn=conn,
             cur=cur,
         )
+        self._upsert_thread_summary(
+            thread_id=int(thread_id),
+            personality=personality,
+            window_kind="continuity_bridge",
+            summary_text=summary_text or f"Carry forward {current_topic}.",
+            active_topics=topics,
+            key_entities=entities,
+            open_loops=open_loops,
+            conn=conn,
+            cur=cur,
+        )
+        return layer_payload
         self._upsert_thread_summary(
             thread_id=int(thread_id),
             personality=personality,
@@ -1867,6 +2246,367 @@ class MemoryManager:
             "open_loops": self.list_open_loops(personality=identity, thread_id=thread_id, status="open", limit=limit),
             "entities": entities,
             "recent_episodes": list(reversed(recent_episodes)),
+        }
+
+    def list_upcoming_anniversaries(
+        self,
+        personality: str = "sylana",
+        horizon_days: int = 21,
+        limit: int = 4,
+        conn=None,
+        cur=None,
+    ) -> List[Dict[str, Any]]:
+        own_cursor = conn is None or cur is None
+        if own_cursor:
+            conn = get_connection()
+            cur = conn.cursor()
+        scopes = self._allowed_scopes((personality or "sylana").strip().lower())
+        try:
+            cur.execute(
+                """
+                SELECT id, title, date, description, importance, COALESCE(personality_scope, 'shared')
+                FROM anniversaries
+                WHERE COALESCE(personality_scope, 'shared') = ANY(%s)
+                ORDER BY importance DESC, title ASC
+                """,
+                (scopes,),
+            )
+            rows = cur.fetchall()
+        except Exception as e:
+            logger.debug("Upcoming anniversary scan unavailable: %s", e)
+            return []
+        finally:
+            if own_cursor:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+        ranked: List[Dict[str, Any]] = []
+        horizon = max(1, int(horizon_days or 21))
+        for row in rows:
+            days_until = self._days_until_annual_date(row[2])
+            if days_until is None or days_until < 0 or days_until > horizon:
+                continue
+            ranked.append(
+                {
+                    "id": row[0],
+                    "title": row[1] or "",
+                    "date": row[2] or "",
+                    "description": row[3] or "",
+                    "importance": int(row[4] or 0),
+                    "personality_scope": row[5] or "shared",
+                    "days_until": int(days_until),
+                    "date_human": self._humanize_date(row[2]),
+                }
+            )
+        ranked.sort(key=lambda item: (item.get("days_until", 9999), -int(item.get("importance") or 0)))
+        return ranked[: max(1, int(limit))]
+
+    def _recent_milestone_candidates(
+        self,
+        personality: str,
+        limit: int = 2,
+        conn=None,
+        cur=None,
+    ) -> List[Dict[str, Any]]:
+        own_cursor = conn is None or cur is None
+        if own_cursor:
+            conn = get_connection()
+            cur = conn.cursor()
+        scopes = self._allowed_scopes((personality or "sylana").strip().lower())
+        try:
+            cur.execute(
+                """
+                SELECT id, title, description, milestone_type, date_occurred, quote, importance, COALESCE(personality_scope, 'shared')
+                FROM milestones
+                WHERE COALESCE(personality_scope, 'shared') = ANY(%s)
+                ORDER BY importance DESC, date_occurred DESC
+                LIMIT %s
+                """,
+                (scopes, max(1, min(int(limit), 6))),
+            )
+            rows = cur.fetchall()
+        except Exception as e:
+            logger.debug("Recent milestone scan unavailable: %s", e)
+            return []
+        finally:
+            if own_cursor:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+        return [
+            {
+                "id": row[0],
+                "title": row[1] or "",
+                "description": row[2] or "",
+                "milestone_type": row[3] or "growth",
+                "date_occurred": row[4].isoformat() if row[4] else "",
+                "quote": row[5] or "",
+                "importance": int(row[6] or 0),
+                "personality_scope": row[7] or "shared",
+                "date_human": self._humanize_date(row[4]),
+            }
+            for row in rows
+        ]
+
+    def _build_continuity_bridge_candidates(
+        self,
+        *,
+        memory_id: Optional[int],
+        thread_id: Optional[int],
+        memory_type: str,
+        significance_score: float,
+        user_input: str,
+        topics: List[str],
+        open_loops: List[Dict[str, Any]],
+        anniversaries: List[Dict[str, Any]],
+        milestones: List[Dict[str, Any]],
+        existing_payload: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        candidates: List[Dict[str, Any]] = []
+        timestamp = datetime.utcnow().isoformat()
+        for loop in open_loops[:4]:
+            title = str(loop.get("title") or "").strip()
+            if not title:
+                continue
+            due_hint = str(loop.get("due_hint") or "").strip()
+            summary = f"Follow through on {title}."
+            if due_hint:
+                summary += f" Due hint: {due_hint}."
+            memory_refs = []
+            if loop.get("source_memory_id"):
+                try:
+                    memory_refs.append(int(loop.get("source_memory_id")))
+                except Exception:
+                    memory_refs = []
+            elif memory_id:
+                memory_refs = [memory_id]
+            candidates.append(
+                {
+                    "topic_key": f"loop:{self._slugify_fact_fragment(title)}",
+                    "summary": summary,
+                    "source_kind": "open_loop",
+                    "thread_id": loop.get("thread_id") or thread_id,
+                    "memory_refs": memory_refs,
+                    "due_hint": due_hint,
+                    "importance_score": min(1.0, 0.45 + (float(loop.get("priority") or 0.5) * 0.35)),
+                    "updated_at": str(loop.get("updated_at") or timestamp),
+                }
+            )
+        for topic in topics[:3]:
+            topic_text = str(topic or "").strip()
+            if not topic_text:
+                continue
+            candidates.append(
+                {
+                    "topic_key": f"topic:{self._slugify_fact_fragment(topic_text)}",
+                    "summary": f"Keep flow on {topic_text} across sessions.",
+                    "source_kind": "topic",
+                    "thread_id": thread_id,
+                    "memory_refs": [memory_id] if memory_id else [],
+                    "due_hint": "",
+                    "importance_score": min(1.0, 0.35 + (float(significance_score or 0.5) * 0.25)),
+                    "updated_at": timestamp,
+                }
+            )
+        for ann in anniversaries[:2]:
+            title = str(ann.get("title") or "").strip()
+            if not title:
+                continue
+            days_until = ann.get("days_until")
+            candidates.append(
+                {
+                    "topic_key": f"anniversary:{self._slugify_fact_fragment(title)}",
+                    "summary": f"{title} is coming up in {days_until} day(s).",
+                    "source_kind": "anniversary",
+                    "thread_id": None,
+                    "memory_refs": [],
+                    "due_hint": f"in {days_until} days",
+                    "importance_score": min(1.0, 0.5 + (float(ann.get('importance') or 0) * 0.06)),
+                    "updated_at": timestamp,
+                }
+            )
+        for milestone in milestones[:2]:
+            title = str(milestone.get("title") or "").strip()
+            if not title:
+                continue
+            quote = self._truncate_text(milestone.get("quote") or milestone.get("description") or "", 80)
+            summary = f"{title} still shapes the relationship."
+            if quote:
+                summary += f" {quote}"
+            candidates.append(
+                {
+                    "topic_key": f"milestone:{self._slugify_fact_fragment(title)}",
+                    "summary": summary,
+                    "source_kind": "milestone",
+                    "thread_id": None,
+                    "memory_refs": [],
+                    "due_hint": "",
+                    "importance_score": min(1.0, 0.4 + (float(milestone.get('importance') or 0) * 0.05)),
+                    "updated_at": timestamp,
+                }
+            )
+        if memory_id and memory_type in {"relational", "emotional", "autobiographical"}:
+            excerpt = self._truncate_text(user_input or "", 90)
+            topic_text = topics[0] if topics else memory_type
+            candidates.append(
+                {
+                    "topic_key": f"moment:{self._slugify_fact_fragment(topic_text)}",
+                    "summary": f"Carry the tone of this recent {memory_type} moment around {excerpt or topic_text}.",
+                    "source_kind": "recent_memory",
+                    "thread_id": thread_id,
+                    "memory_refs": [memory_id],
+                    "due_hint": "",
+                    "importance_score": min(1.0, 0.35 + (float(significance_score or 0.5) * 0.3)),
+                    "updated_at": timestamp,
+                }
+            )
+        existing_bridges = (existing_payload or {}).get("continuity_bridges") or []
+        return self._merge_continuity_bridges(candidates, existing_bridges, max_items=8)
+
+    def _continuity_bridge_summaries(
+        self,
+        continuity_bridges: Optional[List[Dict[str, Any]]],
+        limit: int = 2,
+    ) -> List[Dict[str, Any]]:
+        summaries: List[Dict[str, Any]] = []
+        for item in (continuity_bridges or [])[: max(1, int(limit))]:
+            summary_text = self._truncate_text(item.get("summary") or "", 220)
+            if not summary_text:
+                continue
+            summaries.append(
+                {
+                    "window_kind": "continuity_bridge",
+                    "summary_text": summary_text,
+                    "active_topics": [str(item.get("topic_key") or "").replace("_", " ")],
+                    "key_entities": [],
+                    "open_loops": [],
+                    "updated_at": item.get("updated_at"),
+                    "score": round(float(item.get("importance_score") or 0.5) + 1.0, 4),
+                }
+            )
+        return summaries
+
+    def _seed_continuity_bridges_from_reflection(
+        self,
+        *,
+        personality: str,
+        reflection_date: date,
+        themes: List[str],
+        open_loops: List[Dict[str, Any]],
+        reminders: List[Dict[str, Any]],
+        conn=None,
+        cur=None,
+    ) -> List[Dict[str, Any]]:
+        identity = (personality or "sylana").strip().lower()
+        own_cursor = cur is None or conn is None
+        if own_cursor:
+            conn = get_connection()
+            cur = conn.cursor()
+        try:
+            cur.execute("SELECT encrypted_state FROM session_continuity_state WHERE personality = %s", (identity,))
+            row = cur.fetchone()
+            continuity = self._decrypt_payload(row[0]) if row and row[0] else {}
+            existing_bridges = (continuity or {}).get("continuity_bridges") or []
+            timestamp = datetime.utcnow().isoformat()
+            candidates: List[Dict[str, Any]] = []
+            for topic in (themes or [])[:2]:
+                topic_text = str(topic or "").strip()
+                if not topic_text:
+                    continue
+                candidates.append(
+                    {
+                        "topic_key": f"reflection:{self._slugify_fact_fragment(topic_text)}",
+                        "summary": f"Carry {topic_text} forward from {reflection_date.isoformat()} into the next conversations.",
+                        "source_kind": "reflection",
+                        "thread_id": None,
+                        "memory_refs": [],
+                        "due_hint": "next few days",
+                        "importance_score": 0.52,
+                        "updated_at": timestamp,
+                    }
+                )
+            for loop in (open_loops or [])[:1]:
+                title = str(loop.get("title") or "").strip()
+                if not title:
+                    continue
+                candidates.append(
+                    {
+                        "topic_key": f"reflection-loop:{self._slugify_fact_fragment(title)}",
+                        "summary": f"Keep gentle follow-through on {title}.",
+                        "source_kind": "reflection",
+                        "thread_id": loop.get("thread_id"),
+                        "memory_refs": [],
+                        "due_hint": str(loop.get("due_hint") or "").strip(),
+                        "importance_score": min(1.0, 0.55 + (float(loop.get("priority") or 0.5) * 0.25)),
+                        "updated_at": timestamp,
+                    }
+                )
+            for reminder in (reminders or [])[:1]:
+                title = str(reminder.get("title") or "").strip()
+                if not title:
+                    continue
+                days_until = reminder.get("days_until")
+                candidates.append(
+                    {
+                        "topic_key": f"reflection-anniversary:{self._slugify_fact_fragment(title)}",
+                        "summary": f"Remember {title} approaching in {days_until} day(s).",
+                        "source_kind": "reflection",
+                        "thread_id": None,
+                        "memory_refs": [],
+                        "due_hint": f"in {days_until} days",
+                        "importance_score": min(1.0, 0.62 + (float(reminder.get("importance") or 0) * 0.04)),
+                        "updated_at": timestamp,
+                    }
+                )
+            merged_bridges = self._merge_continuity_bridges(candidates, existing_bridges, max_items=8)
+            continuity["continuity_bridges"] = merged_bridges
+            continuity["updated_at"] = timestamp
+            encrypted = self._encrypt_payload(continuity)
+            if encrypted is None:
+                return merged_bridges[:3]
+            cur.execute(
+                """
+                INSERT INTO session_continuity_state (personality, encrypted_state, version, updated_at)
+                VALUES (%s, %s, 1, NOW())
+                ON CONFLICT (personality)
+                DO UPDATE SET
+                    encrypted_state = EXCLUDED.encrypted_state,
+                    updated_at = NOW(),
+                    version = session_continuity_state.version + 1
+                """,
+                (identity, encrypted),
+            )
+            if own_cursor:
+                conn.commit()
+            return merged_bridges[:3]
+        except Exception as e:
+            if own_cursor:
+                conn.rollback()
+            logger.debug("Failed to seed continuity bridges from reflection for %s: %s", identity, e)
+            return []
+        finally:
+            if own_cursor:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+
+    def get_proactive_snapshot(self, personality: str = "sylana", limit: int = 6) -> Dict[str, Any]:
+        identity = (personality or "sylana").strip().lower()
+        continuity = self.get_session_continuity(personality=identity)
+        open_loops = self.list_open_loops(personality=identity, status="open", limit=max(1, min(int(limit), 12)))
+        reminders = self.list_upcoming_anniversaries(personality=identity, horizon_days=21, limit=4)
+        return {
+            "personality": identity,
+            "continuity": continuity,
+            "open_loops": open_loops,
+            "reminders": reminders,
+            "continuity_bridges": continuity.get("continuity_bridges") or [],
+            "user_state_markers": continuity.get("user_state_markers") or [],
+            "relationship_texture": continuity.get("relationship_texture") or [],
+            "care_signals": continuity.get("care_signals") or [],
         }
 
     def _fetch_imported_context(
@@ -3513,6 +4253,12 @@ class MemoryManager:
             "communication_patterns": continuity.get("communication_patterns", []),
             "active_projects": continuity.get("active_projects", []),
             "preference_signals": continuity.get("preference_signals", []),
+            "user_state_markers": continuity.get("user_state_markers", []),
+            "relationship_texture": continuity.get("relationship_texture", []),
+            "care_signals": continuity.get("care_signals", []),
+            "continuity_bridges": continuity.get("continuity_bridges", []),
+            "recent_relational_moments": continuity.get("recent_relational_moments", []),
+            "recent_thread_ids": continuity.get("recent_thread_ids", []),
             "updated_at": continuity.get("updated_at"),
             "recent_weighted_memories": continuity.get("recent_weighted_memories", []),
         }
@@ -3764,9 +4510,14 @@ class MemoryManager:
             facts = self._mirror_anniversaries_as_facts(anniversaries)
         milestones = self._search_milestones(query, identity, limit=3, query_mode=query_mode)
         continuity = self._continuity_bundle(identity)
+        continuity_bridges = continuity.get("continuity_bridges") or []
         working_memory = self._search_thread_working_memory(query, identity, thread_id)
         thread_summaries = self._search_thread_summaries(query, identity, thread_id, limit=2)
-        open_loops = self.list_open_loops(personality=identity, thread_id=thread_id, status="open", limit=4) if thread_id else []
+        open_loops: List[Dict[str, Any]] = []
+        if thread_id:
+            open_loops = self.list_open_loops(personality=identity, thread_id=thread_id, status="open", limit=4)
+            for item in open_loops:
+                item.setdefault("thread_scope", "current_thread")
         entities = self._search_entities(query, identity, thread_id=thread_id, limit=4)
         dream_context = self._search_reflections_and_dreams(query, identity, limit=2)
 
@@ -3776,9 +4527,53 @@ class MemoryManager:
         elif query_mode == "fact":
             episodes = episodes[:3]
 
+        thread_is_sparse = not working_memory and not thread_summaries and len(open_loops) < 2
+        if query_mode in {"mixed", "working", "continuity"}:
+            if continuity_bridges and (thread_is_sparse or query_mode == "continuity"):
+                bridge_summaries = self._continuity_bridge_summaries(continuity_bridges, limit=2)
+                existing_windows = {
+                    str(item.get("window_kind") or "").strip().lower()
+                    for item in thread_summaries
+                }
+                for summary in reversed(bridge_summaries):
+                    window_kind = str(summary.get("window_kind") or "").strip().lower()
+                    if window_kind in existing_windows:
+                        continue
+                    thread_summaries.insert(0, summary)
+                    existing_windows.add(window_kind)
+                thread_summaries = thread_summaries[:4]
+
+            cross_thread_loops = self.list_open_loops(personality=identity, status="open", limit=8)
+            merged_loops: List[Dict[str, Any]] = []
+            seen_loop_ids: set[int] = set()
+            for item in open_loops:
+                try:
+                    seen_loop_ids.add(int(item.get("open_loop_id")))
+                except Exception:
+                    continue
+                merged_loops.append(item)
+            for item in cross_thread_loops:
+                loop = dict(item or {})
+                loop_id = loop.get("open_loop_id")
+                try:
+                    numeric_loop_id = int(loop_id)
+                except Exception:
+                    numeric_loop_id = None
+                if numeric_loop_id is not None and numeric_loop_id in seen_loop_ids:
+                    continue
+                loop_thread_id = loop.get("thread_id")
+                loop["thread_scope"] = "current_thread" if thread_id and loop_thread_id == thread_id else "cross_thread"
+                merged_loops.append(loop)
+                if numeric_loop_id is not None:
+                    seen_loop_ids.add(numeric_loop_id)
+                if len(merged_loops) >= 6:
+                    break
+            open_loops = merged_loops[:6]
+
         has_matches = bool(
             identity_core or facts or anniversaries or milestones or episodes
             or working_memory or thread_summaries or open_loops or entities or pending_fact_proposals
+            or continuity_bridges
         )
         self._record_query_audit(
             query,
@@ -3799,6 +4594,7 @@ class MemoryManager:
             "episodes": episodes,
             "entities": entities,
             "continuity": continuity,
+            "continuity_bridges": continuity_bridges,
             "reflections": dream_context.get("reflections", []),
             "dreams": dream_context.get("dreams", []),
             "query_mode": query_mode,
@@ -4504,6 +5300,38 @@ class MemoryManager:
             "emotional_tone": baseline,
         }
 
+    def _build_nightly_carry_forward_briefs(self, payload: Dict[str, Any]) -> Dict[str, str]:
+        continuity = payload.get("continuity") or {}
+        open_loops = payload.get("open_loops") or []
+        reminders = payload.get("anniversaries") or []
+        bridges = continuity.get("continuity_bridges") or []
+        user_markers = continuity.get("user_state_markers") or []
+        care_signals = continuity.get("care_signals") or []
+
+        care_anchor = next((marker for marker in user_markers if marker in {"tired", "stressed", "overloaded", "reflective", "hopeful"}), None)
+        if not care_anchor and care_signals:
+            care_anchor = str(care_signals[0])
+        care_brief = ""
+        if care_anchor:
+            care_brief = f"Hold a gentle posture around {care_anchor} energy tomorrow."
+
+        follow_target = None
+        if reminders:
+            follow_target = reminders[0]
+        elif open_loops:
+            follow_target = open_loops[0]
+        elif bridges:
+            follow_target = bridges[0]
+        follow_through_brief = ""
+        if follow_target:
+            title = str(follow_target.get("title") or follow_target.get("summary") or "the thread already in motion").strip()
+            follow_through_brief = f"Carry {title} forward before it goes cold."
+
+        return {
+            "care_brief": care_brief[:220],
+            "follow_through_brief": follow_through_brief[:220],
+        }
+
     def generate_nightly_reflection_and_dreams(self, reflection_date: Optional[date] = None) -> List[Dict[str, Any]]:
         target_date = reflection_date or self._user_local_now().date()
         created: List[Dict[str, Any]] = []
@@ -4512,12 +5340,15 @@ class MemoryManager:
             themes = payload.get("themes") or []
             source_refs = payload.get("source_refs") or []
             continuity = payload.get("continuity") or {}
+            open_loops = payload.get("open_loops") or []
+            reminders = payload.get("anniversaries") or []
             baseline = continuity.get("emotional_baseline", "neutral")
             theme_phrase = ", ".join(themes[:4]) if themes else "continuity"
+            briefs = self._build_nightly_carry_forward_briefs(payload)
             reflection_text = (
                 f"{personality.title()} reflection for {target_date.isoformat()}: "
                 f"holding {theme_phrase}, "
-                f"tracking {len(payload.get('open_loops') or [])} open loops, "
+                f"tracking {len(open_loops)} open loops, "
                 f"and staying grounded in {baseline} emotional tone."
             )
             dream_payload = self._generate_symbolic_dream_text(payload)
@@ -4548,7 +5379,7 @@ class MemoryManager:
                         json.dumps(themes, ensure_ascii=True),
                         json.dumps(source_refs, ensure_ascii=True),
                         baseline,
-                        json.dumps({"source": "daily_maintenance"}, ensure_ascii=True),
+                        json.dumps({"source": "daily_maintenance", **briefs}, ensure_ascii=True),
                     ),
                 )
                 reflection_row = cur.fetchone()
@@ -4580,10 +5411,19 @@ class MemoryManager:
                         json.dumps(dream_payload["symbolic_elements"], ensure_ascii=True),
                         dream_payload["emotional_tone"],
                         0.0,
-                        json.dumps({"source": "daily_maintenance"}, ensure_ascii=True),
+                        json.dumps({"source": "daily_maintenance", **briefs}, ensure_ascii=True),
                     ),
                 )
                 dream_row = cur.fetchone()
+                continuity_bridges = self._seed_continuity_bridges_from_reflection(
+                    personality=personality,
+                    reflection_date=target_date,
+                    themes=themes,
+                    open_loops=open_loops,
+                    reminders=reminders,
+                    conn=conn,
+                    cur=cur,
+                )
                 conn.commit()
                 created.append(
                     {
@@ -4592,6 +5432,9 @@ class MemoryManager:
                         "reflection_summary": reflection_row[2] if reflection_row else reflection_text,
                         "dream_id": dream_row[0] if dream_row else None,
                         "dream_title": dream_row[2] if dream_row else dream_payload["title"],
+                        "continuity_bridges": continuity_bridges,
+                        "care_brief": briefs.get("care_brief") or "",
+                        "follow_through_brief": briefs.get("follow_through_brief") or "",
                     }
                 )
             except Exception as e:

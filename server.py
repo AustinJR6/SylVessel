@@ -32,6 +32,7 @@ from datetime import datetime, timezone, timedelta
 from html import unescape
 from typing import Optional, List, Dict, Any, Tuple
 from contextlib import asynccontextmanager
+from zoneinfo import ZoneInfo
 from urllib.parse import quote, unquote, urlparse
 from urllib.request import Request as UrlRequest, urlopen
 from urllib.error import HTTPError, URLError
@@ -144,6 +145,10 @@ ALLOWED_TRIGGER_SOURCES = {"user", "cron", "heartbeat", "hook", "system"}
 ALLOWED_JOB_KINDS = {"prospect_research", "prompt_session"}
 ALLOWED_ANNOUNCE_POLICIES = {"always", "important_only", "never"}
 ALLOWED_HOOK_ACTION_KINDS = {"enqueue_note", "create_session"}
+PROACTIVE_SURFACE_KINDS = {"quiet_note", "approval", "prepared_work"}
+PROACTIVE_ACTION_KINDS = {"none", "prompt_session", "outreach_research", "lysara_trade_intent", "lysara_control"}
+AUTONOMY_DELIVERY_POLICIES = {"inbox_only", "rare_push", "always"}
+AUTONOMY_ALLOWED_DOMAINS = {"internal", "outreach", "lysara"}
 HOOK_EVENT_STARTUP = "startup"
 HOOK_EVENT_SESSION_CREATED = "session_created"
 HOOK_EVENT_SCHEDULE_COMPLETED = "schedule_completed"
@@ -152,6 +157,27 @@ HOOK_EVENT_HEARTBEAT_OK = "heartbeat_ok"
 HOOK_EVENT_NOTE_CREATED = "note_created"
 HOOK_EVENT_TRADE_CLOSE = "trade_close"
 HOOK_EVENT_TRADE_APPROVAL_REQUIRED = "trade_approval_required"
+PROACTIVE_NOTE_KINDS = {"care", "follow_up", "prep", "creative_seed"}
+QUIET_NOTE_IMPORTANCE_THRESHOLD = 0.66
+LOUD_NOTE_IMPORTANCE_THRESHOLD = 0.86
+AUTONOMOUS_SESSION_DAILY_LIMIT = 3
+AUTONOMOUS_SESSION_CONCURRENCY_LIMIT = 1
+DEFAULT_AUTONOMY_PREFERENCES = {
+    "delivery_mode": "rare_push",
+    "allowed_domains": {
+        "internal": True,
+        "outreach": True,
+        "lysara": True,
+    },
+    "quiet_hours": {
+        "enabled": False,
+        "start": "22:00",
+        "end": "08:00",
+        "timezone": getattr(config, "APP_TIMEZONE", "America/Chicago"),
+    },
+    "daily_autonomous_cap": AUTONOMOUS_SESSION_DAILY_LIMIT,
+    "high_confidence_care_push_enabled": False,
+}
 
 
 def _get_openai_client() -> OpenAI:
@@ -1797,19 +1823,38 @@ def _runtime_tool_specs(active_tools: Optional[List[str]]) -> List[Dict[str, Any
         ])
 
     if "work_sessions" in active:
-        specs.append(
-            {
-                "name": "work_sessions_list",
-                "description": "List recent autonomous work sessions.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "status": {"type": "string"},
-                        "session_type": {"type": "string"},
-                        "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+        specs.extend(
+            [
+                {
+                    "name": "work_sessions_list",
+                    "description": "List recent autonomous work sessions.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "status": {"type": "string"},
+                            "session_type": {"type": "string"},
+                            "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+                        },
                     },
                 },
-            }
+                {
+                    "name": "work_sessions_create_prompt_session",
+                    "description": "Start an isolated prep or creative drafting session that returns its result as a quiet proactive note instead of speaking directly in chat.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "prompt": {"type": "string"},
+                            "session_type": {"type": "string", "description": "general or content"},
+                            "note_title": {"type": "string"},
+                            "note_kind": {"type": "string", "description": "prep or creative_seed"},
+                            "why_now": {"type": "string"},
+                            "topic_key": {"type": "string"},
+                            "importance_score": {"type": "number"},
+                        },
+                        "required": ["prompt"],
+                    },
+                },
+            ]
         )
 
     if "memories" in active:
@@ -1874,6 +1919,23 @@ def _runtime_tool_specs(active_tools: Optional[List[str]]) -> List[Dict[str, Any
                         "title": {"type": "string"},
                         "resolution_note": {"type": "string"},
                     },
+                },
+            },
+            {
+                "name": "memory_enqueue_quiet_note",
+                "description": "Create a quiet inbox note for later follow-through instead of interrupting the visible transcript.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "body": {"type": "string"},
+                        "note_kind": {"type": "string", "description": "care, follow_up, prep, or creative_seed"},
+                        "why_now": {"type": "string"},
+                        "topic_key": {"type": "string"},
+                        "importance_score": {"type": "number"},
+                        "memory_refs": {"type": "array", "items": {"type": "string"}},
+                    },
+                    "required": ["title", "body"],
                 },
             },
         ])
@@ -2810,6 +2872,45 @@ def _runtime_tool_runner(name: str, tool_input: Dict[str, Any]) -> Dict[str, Any
             ],
         }
 
+    if name == "work_sessions_create_prompt_session":
+        ctx = _runtime_memory_tool_context()
+        active_tools = normalize_active_tools(ctx.get("active_tools") if isinstance(ctx.get("active_tools"), list) else [])
+        if "work_sessions" not in active_tools:
+            return {"error": "work_sessions_tool_not_active"}
+        prompt = str(tool_input.get("prompt") or "").strip()
+        if not prompt:
+            return {"error": "prompt is required"}
+        personality = str(ctx.get("personality") or "sylana").strip().lower()
+        thread_id = ctx.get("thread_id")
+        note_kind = _normalize_note_kind(tool_input.get("note_kind") or "prep", default="prep")
+        if note_kind not in {"prep", "creative_seed"}:
+            note_kind = "prep"
+        result = _run_prompt_session(
+            entity=personality,
+            prompt=prompt,
+            session_type=str(tool_input.get("session_type") or ("content" if note_kind == "creative_seed" else "general")).strip().lower(),
+            session_mode="isolated",
+            trigger_source="user",
+            metadata={
+                "autonomous_kind": note_kind,
+                "active_tools": active_tools,
+                "topic_key": str(tool_input.get("topic_key") or "").strip(),
+            },
+            announce_policy="important_only",
+            note_title=str(tool_input.get("note_title") or "Prepared quiet note").strip() or "Prepared quiet note",
+            note_kind=note_kind,
+            why_now=str(tool_input.get("why_now") or "").strip(),
+            thread_id=int(thread_id) if thread_id else None,
+            topic_key=str(tool_input.get("topic_key") or tool_input.get("note_title") or note_kind).strip(),
+            memory_refs=[str(item) for item in (tool_input.get("memory_refs") or []) if str(item).strip()],
+            importance_score=float(tool_input.get("importance_score") or 0.7),
+        )
+        return {
+            "session_id": result.get("session_id"),
+            "note": result.get("note"),
+            "response_excerpt": str(((result.get("response") or {}).get("response") or ""))[:800],
+        }
+
     if name.startswith("memory_"):
         if not state.memory_manager:
             return {"error": "memory_manager_unavailable"}
@@ -2895,6 +2996,26 @@ def _runtime_tool_runner(name: str, tool_input: Dict[str, Any]) -> Dict[str, Any
                 )
             except ValueError as e:
                 return {"error": str(e)}
+
+        if name == "memory_enqueue_quiet_note":
+            title = str(tool_input.get("title") or "").strip()
+            body = str(tool_input.get("body") or "").strip()
+            if not title or not body:
+                return {"error": "title and body are required"}
+            note = _enqueue_structured_proactive_note(
+                source="runtime_tool:memory",
+                title=title,
+                body=body,
+                note_kind=_normalize_note_kind(tool_input.get("note_kind") or "follow_up"),
+                why_now=str(tool_input.get("why_now") or "").strip(),
+                topic_key=str(tool_input.get("topic_key") or title).strip(),
+                importance_score=float(tool_input.get("importance_score") or 0.58),
+                thread_id=int(thread_id) if thread_id else None,
+                memory_refs=[str(item) for item in (tool_input.get("memory_refs") or []) if str(item).strip()],
+                announce_policy="important_only",
+                durable=True,
+            )
+            return {"note": note} if note else {"error": "quiet_note_enqueue_failed"}
 
         return {"error": f"unknown_runtime_memory_tool:{name}"}
 
@@ -3608,6 +3729,24 @@ def ensure_proactive_runtime_tables():
             )
         """)
         cur.execute("""
+            CREATE TABLE IF NOT EXISTS autonomy_preferences (
+                preference_key TEXT PRIMARY KEY,
+                payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS proactive_note_events (
+                event_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                note_id UUID REFERENCES proactive_notes(note_id) ON DELETE CASCADE,
+                event_kind TEXT NOT NULL,
+                actor TEXT NOT NULL DEFAULT 'system',
+                metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """)
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS lysara_trade_performance (
                 metric_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
                 trade_id TEXT,
@@ -3660,9 +3799,18 @@ def ensure_proactive_runtime_tables():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_proactive_notes_status_visible ON proactive_notes(status, created_at DESC)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_runtime_hooks_event_enabled ON runtime_hooks(event_name, enabled)")
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_proactive_notes_dedupe_pending ON proactive_notes(dedupe_key) WHERE dedupe_key IS NOT NULL AND status = 'pending'")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_proactive_note_events_note_created ON proactive_note_events(note_id, created_at DESC)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_lysara_trade_performance_closed_at ON lysara_trade_performance(closed_at DESC)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_lysara_market_regimes_market_obs ON lysara_market_regimes(market, observed_at DESC)")
         cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_lysara_trade_performance_trade_id_unique ON lysara_trade_performance(trade_id) WHERE trade_id IS NOT NULL")
+        cur.execute(
+            """
+            INSERT INTO autonomy_preferences (preference_key, payload)
+            VALUES ('sylana', %s::jsonb)
+            ON CONFLICT (preference_key) DO NOTHING
+            """,
+            (json.dumps(_default_autonomy_preferences(), ensure_ascii=True),),
+        )
         conn.commit()
     except Exception as e:
         _safe_rollback(conn, "ensure_proactive_runtime_tables")
@@ -3717,7 +3865,101 @@ def _serialize_runtime_hook_row(row: Any) -> Dict[str, Any]:
     }
 
 
+def _normalize_surface_kind(value: Any, *, requires_approval: bool = False, default: str = "quiet_note") -> str:
+    surface_kind = str(value or default).strip().lower()
+    if requires_approval:
+        return "approval"
+    return surface_kind if surface_kind in PROACTIVE_SURFACE_KINDS else default
+
+
+def _normalize_action_kind(value: Any, default: str = "none") -> str:
+    action_kind = str(value or default).strip().lower()
+    return action_kind if action_kind in PROACTIVE_ACTION_KINDS else default
+
+
+def _normalize_delivery_policy(value: Any, default: str = "inbox_only") -> str:
+    delivery_policy = str(value or default).strip().lower()
+    return delivery_policy if delivery_policy in AUTONOMY_DELIVERY_POLICIES else default
+
+
+def _default_autonomy_preferences() -> Dict[str, Any]:
+    return json.loads(json.dumps(DEFAULT_AUTONOMY_PREFERENCES))
+
+
+def _normalize_allowed_domains(value: Any) -> Dict[str, bool]:
+    normalized = dict(_default_autonomy_preferences()["allowed_domains"])
+    if isinstance(value, dict):
+        for domain in AUTONOMY_ALLOWED_DOMAINS:
+            if domain in value:
+                normalized[domain] = bool(value.get(domain))
+    elif isinstance(value, list):
+        enabled = {str(item or "").strip().lower() for item in value}
+        for domain in AUTONOMY_ALLOWED_DOMAINS:
+            normalized[domain] = domain in enabled
+    return normalized
+
+
+def _normalize_quiet_hours(value: Any) -> Dict[str, Any]:
+    fallback = dict(_default_autonomy_preferences()["quiet_hours"])
+    if not isinstance(value, dict):
+        return fallback
+    normalized = {
+        "enabled": bool(value.get("enabled", fallback["enabled"])),
+        "start": str(value.get("start") or fallback["start"]).strip() or fallback["start"],
+        "end": str(value.get("end") or fallback["end"]).strip() or fallback["end"],
+        "timezone": str(value.get("timezone") or fallback["timezone"]).strip() or fallback["timezone"],
+    }
+    for key in ("start", "end"):
+        if not re.match(r"^\d{2}:\d{2}$", normalized[key]):
+            normalized[key] = fallback[key]
+    return normalized
+
+
+def _normalize_autonomy_preferences(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    merged = _default_autonomy_preferences()
+    payload = payload or {}
+    merged["delivery_mode"] = _normalize_delivery_policy(payload.get("delivery_mode"), default=merged["delivery_mode"])
+    merged["allowed_domains"] = _normalize_allowed_domains(payload.get("allowed_domains"))
+    merged["quiet_hours"] = _normalize_quiet_hours(payload.get("quiet_hours"))
+    try:
+        merged["daily_autonomous_cap"] = max(1, min(int(payload.get("daily_autonomous_cap") or merged["daily_autonomous_cap"]), 12))
+    except Exception:
+        merged["daily_autonomous_cap"] = merged["daily_autonomous_cap"]
+    merged["high_confidence_care_push_enabled"] = bool(
+        payload.get("high_confidence_care_push_enabled", merged["high_confidence_care_push_enabled"])
+    )
+    return merged
+
+
 def _serialize_proactive_note_row(row: Any) -> Dict[str, Any]:
+    metadata = row[18] or {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    note_kind = str(metadata.get("note_kind") or "follow_up").strip().lower()
+    if note_kind not in PROACTIVE_NOTE_KINDS:
+        note_kind = "follow_up"
+    importance_score = metadata.get("importance_score")
+    try:
+        importance_score = max(0.0, min(float(importance_score), 1.0))
+    except Exception:
+        importance_score = 0.5
+    thread_id = metadata.get("thread_id")
+    try:
+        thread_id = int(thread_id) if thread_id is not None else None
+    except Exception:
+        thread_id = None
+    memory_refs = metadata.get("memory_refs") or []
+    if not isinstance(memory_refs, list):
+        memory_refs = []
+    requires_approval = bool(row[10])
+    surface_kind = _normalize_surface_kind(metadata.get("surface_kind"), requires_approval=requires_approval)
+    action_payload = metadata.get("action_payload") if isinstance(metadata.get("action_payload"), dict) else {}
+    route_target = str(metadata.get("route_target") or "").strip()
+    personality = str(metadata.get("personality") or metadata.get("entity") or "sylana").strip().lower() or "sylana"
+    try:
+        confidence_score = max(0.0, min(float(metadata.get("confidence_score") or importance_score), 1.0))
+    except Exception:
+        confidence_score = importance_score
     return {
         "note_id": str(row[0]),
         "source": row[1],
@@ -3729,7 +3971,7 @@ def _serialize_proactive_note_row(row: Any) -> Dict[str, Any]:
         "status": row[7],
         "dedupe_key": row[8],
         "announce_policy": row[9],
-        "requires_approval": bool(row[10]),
+        "requires_approval": requires_approval,
         "approval_status": row[11] or "not_required",
         "approved_by": row[12],
         "approved_at": row[13].isoformat() if row[13] else None,
@@ -3737,7 +3979,20 @@ def _serialize_proactive_note_row(row: Any) -> Dict[str, Any]:
         "execution_status": row[15] or "not_executed",
         "executed_at": row[16].isoformat() if row[16] else None,
         "stale_reason": row[17],
-        "metadata": row[18] or {},
+        "metadata": metadata,
+        "note_kind": note_kind,
+        "why_now": str(metadata.get("why_now") or "").strip(),
+        "thread_id": thread_id,
+        "topic_key": str(metadata.get("topic_key") or "").strip(),
+        "memory_refs": [str(item) for item in memory_refs if str(item).strip()],
+        "importance_score": importance_score,
+        "surface_kind": surface_kind,
+        "action_kind": _normalize_action_kind(metadata.get("action_kind")),
+        "action_payload": action_payload,
+        "route_target": route_target,
+        "delivery_policy": _normalize_delivery_policy(metadata.get("delivery_policy"), default="inbox_only"),
+        "confidence_score": confidence_score,
+        "personality": personality,
         "visible_after": row[19].isoformat() if row[19] else None,
         "expires_at": row[20].isoformat() if row[20] else None,
         "processed_at": row[21].isoformat() if row[21] else None,
@@ -3766,16 +4021,256 @@ def _list_runtime_hooks(event_name: Optional[str] = None) -> List[Dict[str, Any]
         return []
 
 
-def _list_proactive_notes(limit: int = 50, status: Optional[str] = None) -> List[Dict[str, Any]]:
-    conn = get_connection()
-    cur = conn.cursor()
+def _normalize_note_kind(value: Any, default: str = "follow_up") -> str:
+    note_kind = str(value or default).strip().lower()
+    return note_kind if note_kind in PROACTIVE_NOTE_KINDS else default
+
+
+def _structured_proactive_metadata(
+    *,
+    metadata: Optional[Dict[str, Any]] = None,
+    note_kind: Optional[str] = None,
+    why_now: str = "",
+    thread_id: Optional[int] = None,
+    topic_key: str = "",
+    memory_refs: Optional[List[Any]] = None,
+    importance_score: float = 0.5,
+    durable: Optional[bool] = None,
+    surface_kind: Optional[str] = None,
+    action_kind: Optional[str] = None,
+    action_payload: Optional[Dict[str, Any]] = None,
+    route_target: Optional[str] = None,
+    delivery_policy: Optional[str] = None,
+    confidence_score: Optional[float] = None,
+    personality: Optional[str] = None,
+) -> Dict[str, Any]:
+    merged = dict(metadata or {})
+    merged["note_kind"] = _normalize_note_kind(note_kind or merged.get("note_kind"))
+    merged["why_now"] = str(why_now or merged.get("why_now") or "").strip()
+    if thread_id is not None:
+        try:
+            merged["thread_id"] = int(thread_id)
+        except Exception:
+            merged["thread_id"] = thread_id
+    elif "thread_id" not in merged:
+        merged["thread_id"] = None
+    merged["topic_key"] = str(topic_key or merged.get("topic_key") or "").strip()
+    refs = memory_refs if memory_refs is not None else merged.get("memory_refs") or []
+    if not isinstance(refs, list):
+        refs = []
+    merged["memory_refs"] = [str(item) for item in refs if str(item).strip()]
     try:
+        merged["importance_score"] = max(
+            0.0,
+            min(float(importance_score if importance_score is not None else merged.get("importance_score") or 0.5), 1.0),
+        )
+    except Exception:
+        merged["importance_score"] = 0.5
+    if durable is None:
+        durable = bool(merged.get("durable", True))
+    merged["durable"] = bool(durable)
+    merged["surface_kind"] = _normalize_surface_kind(
+        surface_kind or merged.get("surface_kind"),
+        requires_approval=bool(merged.get("requires_approval")),
+    )
+    merged["action_kind"] = _normalize_action_kind(action_kind or merged.get("action_kind"))
+    action_payload_value = action_payload if action_payload is not None else merged.get("action_payload") or {}
+    merged["action_payload"] = action_payload_value if isinstance(action_payload_value, dict) else {}
+    merged["route_target"] = str(route_target or merged.get("route_target") or "").strip()
+    merged["delivery_policy"] = _normalize_delivery_policy(
+        delivery_policy or merged.get("delivery_policy"),
+        default="inbox_only",
+    )
+    try:
+        merged["confidence_score"] = max(
+            0.0,
+            min(
+                float(
+                    confidence_score
+                    if confidence_score is not None
+                    else merged.get("confidence_score")
+                    or merged.get("importance_score")
+                    or 0.5
+                ),
+                1.0,
+            ),
+        )
+    except Exception:
+        merged["confidence_score"] = merged.get("importance_score") or 0.5
+    merged["personality"] = str(personality or merged.get("personality") or merged.get("entity") or "sylana").strip().lower() or "sylana"
+    return merged
+
+
+def _proactive_day_key(now: Optional[datetime] = None) -> str:
+    return (now or datetime.now(timezone.utc)).strftime("%Y-%m-%d")
+
+
+def _proactive_dedupe_key(note_kind: str, topic_key: str, day_key: Optional[str] = None) -> str:
+    clean_kind = _normalize_note_kind(note_kind)
+    clean_topic = re.sub(r"[^a-z0-9:_-]+", "-", str(topic_key or "general").strip().lower()).strip("-") or "general"
+    return f"{clean_kind}:{clean_topic}:{day_key or _proactive_day_key()}"
+
+
+def _record_proactive_note_event(
+    note_id: Optional[str],
+    event_kind: str,
+    *,
+    actor: str = "system",
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
+    if not note_id:
+        return
+    conn = None
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO proactive_note_events (note_id, event_kind, actor, metadata)
+            VALUES (%s::uuid, %s, %s, %s::jsonb)
+            """,
+            (
+                note_id,
+                str(event_kind or "updated").strip().lower() or "updated",
+                str(actor or "system").strip() or "system",
+                json.dumps(metadata or {}, ensure_ascii=True),
+            ),
+        )
+        conn.commit()
+    except Exception as exc:
+        if conn is not None:
+            _safe_rollback(conn, "_record_proactive_note_event")
+        logger.debug("Failed to record proactive note event for %s: %s", note_id, exc)
+
+
+def _get_autonomy_preferences() -> Dict[str, Any]:
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT payload
+            FROM autonomy_preferences
+            WHERE preference_key = 'sylana'
+            LIMIT 1
+            """
+        )
+        row = cur.fetchone()
+        return _normalize_autonomy_preferences((row or [{}])[0] or {})
+    except Exception as exc:
+        logger.debug("Failed to load autonomy preferences: %s", exc)
+        return _default_autonomy_preferences()
+
+
+def _set_autonomy_preferences(payload: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    normalized = _normalize_autonomy_preferences(payload or {})
+    conn = None
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO autonomy_preferences (preference_key, payload, updated_at)
+            VALUES ('sylana', %s::jsonb, NOW())
+            ON CONFLICT (preference_key)
+            DO UPDATE SET
+                payload = EXCLUDED.payload,
+                updated_at = NOW()
+            RETURNING payload
+            """,
+            (json.dumps(normalized, ensure_ascii=True),),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        return _normalize_autonomy_preferences((row or [{}])[0] or {})
+    except Exception as exc:
+        if conn is not None:
+            _safe_rollback(conn, "_set_autonomy_preferences")
+        logger.warning("Failed to persist autonomy preferences: %s", exc)
+        return normalized
+
+
+def _is_within_quiet_hours(now: Optional[datetime] = None, preferences: Optional[Dict[str, Any]] = None) -> bool:
+    prefs = preferences or _get_autonomy_preferences()
+    quiet_hours = prefs.get("quiet_hours") or {}
+    if not quiet_hours.get("enabled"):
+        return False
+    try:
+        tz = ZoneInfo(str(quiet_hours.get("timezone") or getattr(config, "APP_TIMEZONE", "America/Chicago")))
+    except Exception:
+        tz = ZoneInfo(getattr(config, "APP_TIMEZONE", "America/Chicago"))
+    localized = (now or datetime.now(timezone.utc)).astimezone(tz)
+    try:
+        start_hour, start_minute = [int(part) for part in str(quiet_hours.get("start") or "22:00").split(":", 1)]
+        end_hour, end_minute = [int(part) for part in str(quiet_hours.get("end") or "08:00").split(":", 1)]
+    except Exception:
+        return False
+    current_minutes = localized.hour * 60 + localized.minute
+    start_minutes = start_hour * 60 + start_minute
+    end_minutes = end_hour * 60 + end_minute
+    if start_minutes == end_minutes:
+        return False
+    if start_minutes < end_minutes:
+        return start_minutes <= current_minutes < end_minutes
+    return current_minutes >= start_minutes or current_minutes < end_minutes
+
+
+def _note_feedback_adjustment(note_kind: str, topic_key: str) -> float:
+    if not topic_key:
+        return 0.0
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                COUNT(*) FILTER (WHERE event_kind = 'acknowledged') AS acknowledged_count,
+                COUNT(*) FILTER (WHERE event_kind IN ('dismissed', 'rejected')) AS rejected_count
+            FROM proactive_note_events pne
+            JOIN proactive_notes pn ON pn.note_id = pne.note_id
+            WHERE COALESCE(pn.metadata->>'note_kind', '') = %s
+              AND COALESCE(pn.metadata->>'topic_key', '') = %s
+            """,
+            (_normalize_note_kind(note_kind), str(topic_key or "").strip()),
+        )
+        row = cur.fetchone() or (0, 0)
+        acknowledged = int(row[0] or 0)
+        rejected = int(row[1] or 0)
+        return max(-0.18, min(0.12, (acknowledged * 0.04) - (rejected * 0.06)))
+    except Exception as exc:
+        logger.debug("Failed to compute note feedback adjustment: %s", exc)
+        return 0.0
+
+
+def _group_queue_section(note: Dict[str, Any]) -> str:
+    surface_kind = _normalize_surface_kind(
+        note.get("surface_kind"),
+        requires_approval=bool(note.get("requires_approval")),
+    )
+    if surface_kind == "approval" or bool(note.get("requires_approval")) or str(note.get("approval_status") or "").startswith("pending"):
+        return "approvals"
+    if surface_kind == "prepared_work":
+        return "prepared_work"
+    return "quiet_notes"
+
+
+def _list_proactive_notes(
+    limit: int = 50,
+    status: Optional[str] = None,
+    note_kind: Optional[str] = None,
+    thread_id: Optional[int] = None,
+    personality: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
         params: List[Any] = []
         where = ""
         if status:
             where = "WHERE status = %s"
             params.append(status)
-        params.append(max(1, min(limit, 200)))
+        sql_limit = 200 if (note_kind is not None or thread_id is not None) else max(1, min(limit, 200))
+        params.append(sql_limit)
         cur.execute(f"""
             SELECT note_id, source, source_id, session_id, title, body, severity, status, dedupe_key,
                    announce_policy, requires_approval, approval_status, approved_by, approved_at, approval_reason,
@@ -3785,10 +4280,103 @@ def _list_proactive_notes(limit: int = 50, status: Optional[str] = None) -> List
             ORDER BY created_at DESC
             LIMIT %s
         """, tuple(params))
-        return [_serialize_proactive_note_row(row) for row in cur.fetchall()]
+        notes = [_serialize_proactive_note_row(row) for row in cur.fetchall()]
+        if note_kind:
+            notes = [item for item in notes if item.get("note_kind") == _normalize_note_kind(note_kind)]
+        if thread_id is not None:
+            try:
+                wanted_thread_id = int(thread_id)
+            except Exception:
+                wanted_thread_id = None
+            if wanted_thread_id is not None:
+                notes = [item for item in notes if item.get("thread_id") == wanted_thread_id]
+        if personality:
+            wanted_personality = str(personality or "").strip().lower()
+            notes = [item for item in notes if str(item.get("personality") or "").strip().lower() == wanted_personality]
+        return notes[: max(1, min(limit, 200))]
     except Exception as e:
         logger.warning("Failed to list proactive notes: %s", e)
         return []
+
+
+def _list_review_queue(
+    *,
+    limit: int = 50,
+    status: Optional[str] = None,
+    personality: Optional[str] = None,
+    thread_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    notes = _list_proactive_notes(
+        limit=max(limit, 100),
+        status=status,
+        thread_id=thread_id,
+        personality=personality,
+    )
+    sections = {
+        "quiet_notes": [],
+        "approvals": [],
+        "prepared_work": [],
+    }
+    for note in notes:
+        section_name = _group_queue_section(note)
+        sections[section_name].append(note)
+    for key in list(sections.keys()):
+        sections[key] = sections[key][: max(1, min(limit, 200))]
+    summary = {
+        "quiet_notes": len(sections["quiet_notes"]),
+        "approvals": len(sections["approvals"]),
+        "prepared_work": len(sections["prepared_work"]),
+        "total": len(sections["quiet_notes"]) + len(sections["approvals"]) + len(sections["prepared_work"]),
+    }
+    return {
+        "summary": summary,
+        "sections": sections,
+        "filters": {
+            "status": status,
+            "personality": personality,
+            "thread_id": thread_id,
+            "limit": max(1, min(limit, 200)),
+        },
+    }
+
+
+def _proactive_status_summary() -> Dict[str, Any]:
+    queue = _list_review_queue(limit=200, status="pending")
+    counts = _autonomous_prompt_session_counts("sylana")
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                COUNT(*) FILTER (WHERE event_kind = 'acknowledged') AS acknowledged_count,
+                COUNT(*) FILTER (WHERE event_kind = 'dismissed') AS dismissed_count,
+                COUNT(*) FILTER (WHERE event_kind = 'approved') AS approved_count,
+                COUNT(*) FILTER (WHERE event_kind = 'rejected') AS rejected_count
+            FROM proactive_note_events
+            WHERE created_at >= DATE_TRUNC('day', NOW()) - INTERVAL '14 days'
+            """
+        )
+        row = cur.fetchone() or (0, 0, 0, 0)
+    except Exception as exc:
+        logger.debug("Failed to load proactive status summary: %s", exc)
+        row = (0, 0, 0, 0)
+    acknowledged = int(row[0] or 0)
+    dismissed = int(row[1] or 0)
+    total_feedback = acknowledged + dismissed
+    return {
+        "queue": queue.get("summary") or {},
+        "pending_approvals": int((queue.get("summary") or {}).get("approvals") or 0),
+        "autonomous_sessions_today": int(counts.get("today") or 0),
+        "autonomous_sessions_running": int(counts.get("running") or 0),
+        "note_feedback": {
+            "acknowledged": acknowledged,
+            "dismissed": dismissed,
+            "approved": int(row[2] or 0),
+            "rejected": int(row[3] or 0),
+            "acknowledge_ratio": round(acknowledged / total_feedback, 3) if total_feedback else None,
+        },
+    }
 
 
 def _enqueue_proactive_note(
@@ -3812,6 +4400,8 @@ def _enqueue_proactive_note(
     policy = (announce_policy or "important_only").strip().lower()
     if policy not in ALLOWED_ANNOUNCE_POLICIES:
         policy = "important_only"
+    normalized_metadata = dict(metadata or {})
+    normalized_metadata["requires_approval"] = bool(requires_approval)
     conn = get_connection()
     cur = conn.cursor()
     try:
@@ -3836,7 +4426,7 @@ def _enqueue_proactive_note(
             policy,
             bool(requires_approval),
             "pending_approval" if requires_approval else "not_required",
-            json.dumps(metadata or {}),
+            json.dumps(normalized_metadata, ensure_ascii=True),
             visible_after,
             expires_at,
         ))
@@ -3848,8 +4438,80 @@ def _enqueue_proactive_note(
         logger.warning("Failed to enqueue proactive note: %s", e)
         return None
     if note:
+        _record_proactive_note_event(
+            note.get("note_id"),
+            "created",
+            actor=str(source or "system").strip() or "system",
+            metadata={
+                "note_kind": note.get("note_kind"),
+                "surface_kind": note.get("surface_kind"),
+                "thread_id": note.get("thread_id"),
+                "topic_key": note.get("topic_key"),
+            },
+        )
         _fire_runtime_hooks(HOOK_EVENT_NOTE_CREATED, {"note": note})
     return note
+
+
+def _enqueue_structured_proactive_note(
+    *,
+    source: str,
+    title: str,
+    body: str,
+    note_kind: str,
+    why_now: str,
+    topic_key: str,
+    importance_score: float = 0.5,
+    severity: str = "info",
+    session_id: Optional[str] = None,
+    source_id: Optional[str] = None,
+    thread_id: Optional[int] = None,
+    memory_refs: Optional[List[Any]] = None,
+    announce_policy: str = "important_only",
+    dedupe_key: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    durable: bool = True,
+    visible_after: Optional[datetime] = None,
+    expires_at: Optional[datetime] = None,
+    requires_approval: bool = False,
+    surface_kind: Optional[str] = None,
+    action_kind: Optional[str] = None,
+    action_payload: Optional[Dict[str, Any]] = None,
+    route_target: Optional[str] = None,
+    delivery_policy: Optional[str] = None,
+    confidence_score: Optional[float] = None,
+    personality: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    return _enqueue_proactive_note(
+        source=source,
+        title=title,
+        body=body,
+        severity=severity,
+        session_id=session_id,
+        source_id=source_id,
+        dedupe_key=dedupe_key or _proactive_dedupe_key(note_kind, topic_key),
+        announce_policy=announce_policy,
+        metadata=_structured_proactive_metadata(
+            metadata=metadata,
+            note_kind=note_kind,
+            why_now=why_now,
+            thread_id=thread_id,
+            topic_key=topic_key,
+            memory_refs=memory_refs,
+            importance_score=importance_score,
+            durable=durable,
+            surface_kind=surface_kind,
+            action_kind=action_kind,
+            action_payload=action_payload,
+            route_target=route_target,
+            delivery_policy=delivery_policy,
+            confidence_score=confidence_score,
+            personality=personality,
+        ),
+        visible_after=visible_after,
+        expires_at=expires_at,
+        requires_approval=requires_approval,
+    )
 
 
 def _get_due_proactive_notes(limit: int = 20) -> List[Dict[str, Any]]:
@@ -3862,6 +4524,7 @@ def _get_due_proactive_notes(limit: int = 20) -> List[Dict[str, Any]]:
                    execution_status, executed_at, stale_reason, metadata, visible_after, expires_at, processed_at, created_at
             FROM proactive_notes
             WHERE status = 'pending'
+              AND processed_at IS NULL
               AND (visible_after IS NULL OR visible_after <= NOW())
               AND (expires_at IS NULL OR expires_at > NOW())
             ORDER BY created_at ASC
@@ -3885,9 +4548,74 @@ def _mark_proactive_notes(note_ids: List[str], status: str) -> None:
             WHERE note_id = ANY(%s::uuid[])
         """, (status, note_ids))
         conn.commit()
+        event_map = {"surfaced": "surfaced", "swallowed": "dismissed"}
+        event_kind = event_map.get(status, "status_changed")
+        for note_id in note_ids:
+            _record_proactive_note_event(note_id, event_kind, actor="heartbeat", metadata={"status": status})
     except Exception as e:
         _safe_rollback(conn, "_mark_proactive_notes")
         logger.warning("Failed to mark proactive notes: %s", e)
+
+
+def _mark_proactive_notes_processed(note_ids: List[str]) -> None:
+    if not note_ids:
+        return
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            UPDATE proactive_notes
+            SET processed_at = NOW()
+            WHERE note_id = ANY(%s::uuid[])
+            """,
+            (note_ids,),
+        )
+        conn.commit()
+        for note_id in note_ids:
+            _record_proactive_note_event(note_id, "reviewed", actor="heartbeat", metadata={"processed_only": True})
+    except Exception as e:
+        _safe_rollback(conn, "_mark_proactive_notes_processed")
+        logger.warning("Failed to mark proactive notes processed: %s", e)
+
+
+def _set_proactive_note_status(note_id: str, status: str) -> Optional[Dict[str, Any]]:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            UPDATE proactive_notes
+            SET status = %s,
+                processed_at = NOW()
+            WHERE note_id = %s::uuid
+            RETURNING note_id, source, source_id, session_id, title, body, severity, status, dedupe_key,
+                      announce_policy, requires_approval, approval_status, approved_by, approved_at, approval_reason,
+                      execution_status, executed_at, stale_reason, metadata, visible_after, expires_at, processed_at, created_at
+            """,
+            (status, note_id),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        note = _serialize_proactive_note_row(row) if row else None
+        if note:
+            event_map = {
+                "surfaced": "acknowledged",
+                "swallowed": "dismissed",
+                "approved": "approved",
+                "rejected": "rejected",
+            }
+            _record_proactive_note_event(
+                note_id,
+                event_map.get(status, "status_changed"),
+                actor="operator",
+                metadata={"status": status},
+            )
+        return note
+    except Exception as e:
+        _safe_rollback(conn, "_set_proactive_note_status")
+        logger.warning("Failed to set proactive note status: %s", e)
+        return None
 
 
 def _set_proactive_note_approval(note_id: str, approved: bool, actor: str, reason: str = "") -> Optional[Dict[str, Any]]:
@@ -3910,7 +4638,15 @@ def _set_proactive_note_approval(note_id: str, approved: bool, actor: str, reaso
         """, (next_status, actor, reason, next_note_status, note_id))
         row = cur.fetchone()
         conn.commit()
-        return _serialize_proactive_note_row(row) if row else None
+        note = _serialize_proactive_note_row(row) if row else None
+        if note:
+            _record_proactive_note_event(
+                note_id,
+                "approved" if approved else "rejected",
+                actor=actor,
+                metadata={"reason": reason or ""},
+            )
+        return note
     except Exception as e:
         _safe_rollback(conn, "_set_proactive_note_approval")
         logger.warning("Failed to update proactive note approval: %s", e)
@@ -3957,7 +4693,21 @@ def _update_proactive_note_execution(note_id: str, execution_status: str, *, sta
         """, (execution_status, execution_status, stale_reason, execution_status, execution_status, note_id))
         row = cur.fetchone()
         conn.commit()
-        return _serialize_proactive_note_row(row) if row else None
+        note = _serialize_proactive_note_row(row) if row else None
+        if note:
+            event_kind = {
+                "executed": "executed",
+                "submitted": "executed",
+                "blocked": "blocked",
+                "stale": "expired",
+            }.get(str(execution_status or "").strip().lower(), "execution_updated")
+            _record_proactive_note_event(
+                note_id,
+                event_kind,
+                actor="system",
+                metadata={"execution_status": execution_status, "stale_reason": stale_reason},
+            )
+        return note
     except Exception as e:
         _safe_rollback(conn, "_update_proactive_note_execution")
         logger.warning("Failed to update proactive note execution: %s", e)
@@ -4765,8 +5515,486 @@ def _fire_runtime_hooks(event_name: str, payload: Dict[str, Any]) -> None:
             )
 
 
+def _list_stuck_work_sessions(limit: int = 3) -> List[Dict[str, Any]]:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT session_id, entity, goal, status, session_type, session_mode, trigger_source,
+                   COALESCE(started_at, created_at) AS anchor_time
+            FROM work_sessions
+            WHERE status IN ('pending', 'running')
+              AND COALESCE(started_at, created_at) <= NOW() - INTERVAL '90 minutes'
+            ORDER BY COALESCE(started_at, created_at) ASC
+            LIMIT %s
+            """,
+            (max(1, min(int(limit or 3), 10)),),
+        )
+        rows = cur.fetchall()
+        return [
+            {
+                "session_id": str(row[0]),
+                "entity": row[1] or "sylana",
+                "goal": row[2] or "",
+                "status": row[3] or "pending",
+                "session_type": row[4] or "general",
+                "session_mode": row[5] or "main",
+                "trigger_source": row[6] or "user",
+                "anchor_time": row[7].isoformat() if row[7] else None,
+            }
+            for row in rows
+        ]
+    except Exception as e:
+        logger.debug("Failed to list stuck work sessions: %s", e)
+        return []
+
+
+def _list_unresolved_alert_events(limit: int = 3) -> List[Dict[str, Any]]:
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT event_id, severity, title, summary, created_at
+            FROM alert_events
+            WHERE acknowledged_at IS NULL
+              AND created_at >= NOW() - INTERVAL '7 days'
+            ORDER BY
+                CASE severity WHEN 'critical' THEN 3 WHEN 'warning' THEN 2 ELSE 1 END DESC,
+                created_at DESC
+            LIMIT %s
+            """,
+            (max(1, min(int(limit or 3), 10)),),
+        )
+        rows = cur.fetchall()
+        return [
+            {
+                "event_id": str(row[0]),
+                "severity": row[1] or "info",
+                "title": row[2] or "",
+                "summary": row[3] or "",
+                "created_at": row[4].isoformat() if row[4] else None,
+            }
+            for row in rows
+        ]
+    except Exception as e:
+        logger.debug("Failed to list unresolved alert events: %s", e)
+        return []
+
+
+def _autonomous_prompt_session_counts(entity: str = "sylana") -> Dict[str, int]:
+    identity = (entity or "sylana").strip().lower()
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT
+                COUNT(*) FILTER (
+                    WHERE status IN ('pending', 'running')
+                      AND session_mode = 'isolated'
+                      AND COALESCE(metadata->>'autonomous_kind', '') <> ''
+                ) AS running_count,
+                COUNT(*) FILTER (
+                    WHERE session_mode = 'isolated'
+                      AND COALESCE(metadata->>'autonomous_kind', '') <> ''
+                      AND created_at >= DATE_TRUNC('day', NOW())
+                ) AS today_count
+            FROM work_sessions
+            WHERE entity = %s
+            """,
+            (identity,),
+        )
+        row = cur.fetchone()
+        return {
+            "running": int((row or [0, 0])[0] or 0),
+            "today": int((row or [0, 0])[1] or 0),
+        }
+    except Exception as e:
+        logger.debug("Failed to count autonomous prompt sessions: %s", e)
+        return {"running": 0, "today": 0}
+
+
+def _can_launch_autonomous_prompt_session(entity: str = "sylana") -> bool:
+    counts = _autonomous_prompt_session_counts(entity)
+    prefs = _get_autonomy_preferences()
+    daily_cap = max(1, min(int(prefs.get("daily_autonomous_cap") or AUTONOMOUS_SESSION_DAILY_LIMIT), 12))
+    return (
+        int(counts.get("running") or 0) < AUTONOMOUS_SESSION_CONCURRENCY_LIMIT
+        and int(counts.get("today") or 0) < daily_cap
+    )
+
+
+def _build_autonomous_prep_prompt(note_spec: Dict[str, Any]) -> str:
+    note_kind = _normalize_note_kind(note_spec.get("note_kind"))
+    title = str(note_spec.get("title") or "Quiet preparation").strip()
+    why_now = str(note_spec.get("why_now") or "").strip()
+    body = str(note_spec.get("body") or "").strip()
+    guidance = (
+        "Prepare something gentle and useful Elias could pick up later."
+        if note_kind == "prep"
+        else "Develop a small creative seed, sketch, or perspective Elias could return to later."
+    )
+    return (
+        "You are running an isolated Sylana work session.\n"
+        "Goal: think ahead quietly and prepare something helpful without interrupting the main conversation.\n"
+        "Hard limits: do not mutate code, change real systems, send outreach, execute trades, or present yourself as if this happened in chat.\n"
+        "You may synthesize, outline, draft, and lightly research if current information is needed.\n\n"
+        f"Task type: {note_kind}\n"
+        f"Title: {title}\n"
+        f"Why now: {why_now or 'Quiet follow-through matters here.'}\n"
+        f"Context: {body or title}\n"
+        f"Direction: {guidance}\n\n"
+        "Return a concise output with:\n"
+        "1. What you noticed\n"
+        "2. Why it matters now\n"
+        "3. The prepared help, draft, or creative seed\n"
+        "4. The next gentle step Elias could take if he wants"
+    )
+
+
+def _autonomy_domain_enabled(preferences: Dict[str, Any], domain: str) -> bool:
+    allowed = preferences.get("allowed_domains") or {}
+    return bool(allowed.get(domain, False))
+
+
+def _importance_with_feedback(note_kind: str, topic_key: str, base_score: float) -> float:
+    adjusted = float(base_score or 0.5) + _note_feedback_adjustment(note_kind, topic_key)
+    return max(0.0, min(adjusted, 1.0))
+
+
+def _planner_delivery_policy(severity: str, importance_score: float, note_kind: str, preferences: Dict[str, Any]) -> str:
+    delivery_mode = _normalize_delivery_policy(preferences.get("delivery_mode"), default="rare_push")
+    if delivery_mode == "always":
+        return "always"
+    if delivery_mode == "inbox_only":
+        return "inbox_only"
+    severity_text = str(severity or "info").strip().lower()
+    if ALERT_SEVERITY_ORDER.get(severity_text, 1) >= ALERT_SEVERITY_ORDER["warning"]:
+        return "always"
+    if note_kind == "care" and preferences.get("high_confidence_care_push_enabled") and importance_score >= 0.9:
+        return "always"
+    return "inbox_only"
+
+
+def _plan_proactive_notes(personality: str = "sylana") -> Dict[str, Any]:
+    if not state.memory_manager:
+        return {"snapshot": {}, "planned": [], "created": [], "autonomous_sessions": []}
+
+    preferences = _get_autonomy_preferences()
+    snapshot = state.memory_manager.get_proactive_snapshot(personality=personality, limit=6)
+    continuity = snapshot.get("continuity") or {}
+    bridges = snapshot.get("continuity_bridges") or []
+    open_loops = snapshot.get("open_loops") or []
+    reminders = snapshot.get("reminders") or []
+    user_state_markers = snapshot.get("user_state_markers") or []
+    care_signals = snapshot.get("care_signals") or []
+    relationship_texture = snapshot.get("relationship_texture") or []
+    stuck_sessions = _list_stuck_work_sessions(limit=2)
+    unresolved_alerts = _list_unresolved_alert_events(limit=2)
+
+    planned: List[Dict[str, Any]] = []
+
+    care_marker = next(
+        (marker for marker in user_state_markers if marker in {"tired", "stressed", "overloaded", "reflective", "hopeful"}),
+        None,
+    )
+    if care_marker or care_signals:
+        marker_text = care_marker or (care_signals[0] if care_signals else "care")
+        topic_key = f"care:{marker_text}"
+        importance_score = _importance_with_feedback("care", topic_key, 0.74 if marker_text in {"tired", "stressed", "overloaded"} else 0.62)
+        planned.append(
+            {
+                "source": "heartbeat",
+                "title": "A small care note",
+                "body": f"Sylana noticed a recent {marker_text} signal and wants to stay gentle, steady, and helpful.",
+                "note_kind": "care",
+                "why_now": f"Recent tone suggests {marker_text} and benefits from quiet care.",
+                "topic_key": topic_key,
+                "importance_score": importance_score,
+                "thread_id": None,
+                "memory_refs": [],
+                "severity": "info",
+                "announce_policy": "important_only",
+                "durable": True,
+                "surface_kind": "quiet_note",
+                "action_kind": "none",
+                "delivery_policy": _planner_delivery_policy("info", importance_score, "care", preferences),
+                "personality": personality,
+            }
+        )
+
+    follow_up_target = reminders[0] if reminders else (open_loops[0] if open_loops else None)
+    if follow_up_target:
+        title = str(follow_up_target.get("title") or "important thread").strip()
+        due_hint = str(follow_up_target.get("due_hint") or "").strip()
+        topic_key = str(follow_up_target.get("topic_key") or f"follow-up:{title}").strip() or f"follow-up:{title}"
+        severity = "warning" if reminders else "info"
+        importance_score = _importance_with_feedback("follow_up", topic_key, 0.71)
+        planned.append(
+            {
+                "source": "heartbeat",
+                "title": f"Follow through on {title}",
+                "body": f"This thread still matters. {due_hint}".strip(),
+                "note_kind": "follow_up",
+                "why_now": due_hint or "It has enough emotional or practical weight to keep alive across days.",
+                "topic_key": topic_key,
+                "importance_score": importance_score,
+                "thread_id": follow_up_target.get("thread_id"),
+                "memory_refs": follow_up_target.get("memory_refs") or [],
+                "severity": severity,
+                "announce_policy": "important_only",
+                "durable": True,
+                "surface_kind": "quiet_note",
+                "action_kind": "none",
+                "delivery_policy": _planner_delivery_policy(severity, importance_score, "follow_up", preferences),
+                "personality": personality,
+            }
+        )
+
+    prep_target = open_loops[0] if open_loops else (bridges[0] if bridges else None)
+    if prep_target and _autonomy_domain_enabled(preferences, "internal"):
+        prep_title = str(prep_target.get("title") or prep_target.get("summary") or "next useful step").strip()
+        topic_key = str(prep_target.get("topic_key") or f"prep:{prep_title}").strip() or f"prep:{prep_title}"
+        importance_score = _importance_with_feedback("prep", topic_key, 0.67)
+        planned.append(
+            {
+                "source": "heartbeat",
+                "title": f"Prepared help for {prep_title[:60]}",
+                "body": str(prep_target.get("summary") or prep_target.get("description") or prep_title).strip(),
+                "note_kind": "prep",
+                "why_now": "There is enough continuity here to prepare something before Elias asks.",
+                "topic_key": topic_key,
+                "importance_score": importance_score,
+                "thread_id": prep_target.get("thread_id"),
+                "memory_refs": prep_target.get("memory_refs") or [],
+                "severity": "info",
+                "announce_policy": "important_only",
+                "durable": True,
+                "surface_kind": "prepared_work",
+                "action_kind": "prompt_session",
+                "delivery_policy": _planner_delivery_policy("info", importance_score, "prep", preferences),
+                "personality": personality,
+            }
+        )
+
+    creative_seed_target = next(
+        (item for item in bridges if str(item.get("source_kind") or "") in {"topic", "milestone", "recent_memory", "reflection"}),
+        None,
+    )
+    if creative_seed_target and _autonomy_domain_enabled(preferences, "internal"):
+        texture = relationship_texture[0] if relationship_texture else "shared meaning"
+        topic_key = str(creative_seed_target.get("topic_key") or "creative-seed").strip() or "creative-seed"
+        importance_score = _importance_with_feedback("creative_seed", topic_key, 0.64)
+        planned.append(
+            {
+                "source": "heartbeat",
+                "title": "A creative seed worth keeping",
+                "body": f"Shape something small from {texture}: {str(creative_seed_target.get('summary') or '').strip()}",
+                "note_kind": "creative_seed",
+                "why_now": "A living relationship benefits from surprise, pattern-making, and prepared beauty.",
+                "topic_key": topic_key,
+                "importance_score": importance_score,
+                "thread_id": creative_seed_target.get("thread_id"),
+                "memory_refs": creative_seed_target.get("memory_refs") or [],
+                "severity": "info",
+                "announce_policy": "important_only",
+                "durable": True,
+                "surface_kind": "prepared_work",
+                "action_kind": "prompt_session",
+                "delivery_policy": _planner_delivery_policy("info", importance_score, "creative_seed", preferences),
+                "personality": personality,
+            }
+        )
+
+    if stuck_sessions:
+        session = stuck_sessions[0]
+        topic_key = f"stuck-session:{session.get('session_id')}"
+        importance_score = _importance_with_feedback("follow_up", topic_key, 0.82)
+        planned.append(
+            {
+                "source": "heartbeat",
+                "title": "A work session needs closure",
+                "body": f"{session.get('entity', 'A session')} has been {session.get('status')} longer than expected: {session.get('goal')}.",
+                "note_kind": "follow_up",
+                "why_now": "A stuck work session is a loose end that will otherwise keep draining attention.",
+                "topic_key": topic_key,
+                "importance_score": importance_score,
+                "thread_id": None,
+                "memory_refs": [],
+                "severity": "warning",
+                "announce_policy": "important_only",
+                "durable": True,
+                "surface_kind": "quiet_note",
+                "action_kind": "none",
+                "delivery_policy": _planner_delivery_policy("warning", importance_score, "follow_up", preferences),
+                "personality": personality,
+            }
+        )
+
+    if unresolved_alerts:
+        alert = unresolved_alerts[0]
+        topic_key = f"alert:{alert.get('event_id')}"
+        severity = alert.get("severity") or "warning"
+        importance_score = _importance_with_feedback("follow_up", topic_key, 0.9 if severity == "critical" else 0.8)
+        planned.append(
+            {
+                "source": "heartbeat",
+                "title": f"Unresolved alert: {alert.get('title')}",
+                "body": str(alert.get("summary") or alert.get("title") or "").strip(),
+                "note_kind": "follow_up",
+                "why_now": "An unresolved warning or critical signal should stay visible until acknowledged.",
+                "topic_key": topic_key,
+                "importance_score": importance_score,
+                "thread_id": None,
+                "memory_refs": [],
+                "severity": severity,
+                "announce_policy": "always" if severity == "critical" else "important_only",
+                "durable": True,
+                "surface_kind": "quiet_note",
+                "action_kind": "none",
+                "delivery_policy": _planner_delivery_policy(severity, importance_score, "follow_up", preferences),
+                "personality": personality,
+            }
+        )
+
+    if _autonomy_domain_enabled(preferences, "outreach") and len(open_loops) >= 2:
+        topic_key = "outreach-research:manifest"
+        importance_score = _importance_with_feedback("follow_up", topic_key, 0.69)
+        planned.append(
+            {
+                "source": "heartbeat",
+                "title": "Queue fresh outreach research",
+                "body": "There are enough active threads to justify preparing a fresh outreach research batch without sending anything automatically.",
+                "note_kind": "follow_up",
+                "why_now": "A small research pass could surface new leads and ready drafts for review.",
+                "topic_key": topic_key,
+                "importance_score": importance_score,
+                "thread_id": None,
+                "memory_refs": [],
+                "severity": "info",
+                "announce_policy": "important_only",
+                "durable": True,
+                "surface_kind": "approval",
+                "action_kind": "outreach_research",
+                "action_payload": {"product": "manifest", "count": 5, "entity": "claude"},
+                "delivery_policy": _planner_delivery_policy("info", importance_score, "follow_up", preferences),
+                "personality": personality,
+                "requires_approval": True,
+            }
+        )
+
+    if _autonomy_domain_enabled(preferences, "lysara") and any(str(item.get("severity") or "") == "critical" for item in unresolved_alerts):
+        topic_key = "lysara-control:pause"
+        importance_score = _importance_with_feedback("follow_up", topic_key, 0.88)
+        planned.append(
+            {
+                "source": "heartbeat",
+                "title": "Review Lysara pause proposal",
+                "body": "A critical unresolved alert is active. Sylana prepared a pause-runtime proposal for operator review rather than mutating trading state directly.",
+                "note_kind": "follow_up",
+                "why_now": "Critical signals should offer a reviewed control path before they compound.",
+                "topic_key": topic_key,
+                "importance_score": importance_score,
+                "thread_id": None,
+                "memory_refs": [],
+                "severity": "warning",
+                "announce_policy": "important_only",
+                "durable": True,
+                "surface_kind": "approval",
+                "action_kind": "lysara_control",
+                "action_payload": {"operation": "pause_trading", "kwargs": {"reason": "critical_unresolved_alert"}},
+                "delivery_policy": _planner_delivery_policy("warning", importance_score, "follow_up", preferences),
+                "personality": personality,
+                "requires_approval": True,
+            }
+        )
+
+    # Keep one strongest note per kind to stay quiet.
+    best_by_kind: Dict[str, Dict[str, Any]] = {}
+    for item in planned:
+        kind = _normalize_note_kind(item.get("note_kind"))
+        current = best_by_kind.get(kind)
+        if not current or float(item.get("importance_score") or 0.0) > float(current.get("importance_score") or 0.0):
+            best_by_kind[kind] = item
+
+    created_notes: List[Dict[str, Any]] = []
+    autonomous_sessions: List[Dict[str, Any]] = []
+    for item in best_by_kind.values():
+        note_kind = _normalize_note_kind(item.get("note_kind"))
+        if note_kind in {"prep", "creative_seed"} and _can_launch_autonomous_prompt_session(personality):
+            try:
+                session_result = _run_prompt_session(
+                    entity=personality,
+                    prompt=_build_autonomous_prep_prompt(item),
+                    session_type="content" if note_kind == "creative_seed" else "general",
+                    session_mode="isolated",
+                    trigger_source="heartbeat",
+                    metadata={
+                        "autonomous_kind": note_kind,
+                        "active_tools": ["memories", "work_sessions", "web_search"],
+                        "topic_key": item.get("topic_key"),
+                    },
+                    announce_policy=item.get("announce_policy") or "important_only",
+                    note_title=item.get("title"),
+                    note_kind=note_kind,
+                    why_now=item.get("why_now") or "",
+                    thread_id=item.get("thread_id"),
+                    topic_key=item.get("topic_key"),
+                    memory_refs=item.get("memory_refs") or [],
+                    importance_score=float(item.get("importance_score") or 0.7),
+                    dedupe_key=_proactive_dedupe_key(note_kind, str(item.get("topic_key") or item.get("title") or note_kind)),
+                )
+                autonomous_sessions.append(
+                    {
+                        "note_kind": note_kind,
+                        "session_id": session_result.get("session_id"),
+                        "note_id": ((session_result.get("note") or {}).get("note_id")),
+                    }
+                )
+                if session_result.get("note"):
+                    created_notes.append(session_result["note"])
+                continue
+            except Exception as exc:
+                logger.warning("Autonomous %s session launch failed: %s", note_kind, exc)
+        note = _enqueue_structured_proactive_note(
+            source=str(item.get("source") or "heartbeat"),
+            title=str(item.get("title") or "Sylana note"),
+            body=str(item.get("body") or ""),
+            note_kind=note_kind,
+            why_now=str(item.get("why_now") or ""),
+            topic_key=str(item.get("topic_key") or item.get("title") or note_kind),
+            importance_score=float(item.get("importance_score") or 0.5),
+            severity=str(item.get("severity") or "info"),
+            thread_id=item.get("thread_id"),
+            memory_refs=item.get("memory_refs") or [],
+            announce_policy=str(item.get("announce_policy") or "important_only"),
+            durable=bool(item.get("durable", True)),
+            requires_approval=bool(item.get("requires_approval", False)),
+            surface_kind=item.get("surface_kind"),
+            action_kind=item.get("action_kind"),
+            action_payload=item.get("action_payload") or {},
+            route_target=item.get("route_target"),
+            delivery_policy=item.get("delivery_policy"),
+            confidence_score=float(item.get("importance_score") or 0.5),
+            personality=str(item.get("personality") or personality),
+        )
+        if note:
+            created_notes.append(note)
+
+    return {
+        "snapshot": snapshot,
+        "planned": list(best_by_kind.values()),
+        "created": created_notes,
+        "autonomous_sessions": autonomous_sessions,
+    }
+
+
 def _run_heartbeat() -> Dict[str, Any]:
     heartbeat_doc = (state.workspace_prompts or {}).get("heartbeat", "").strip()
+    preferences = _get_autonomy_preferences()
+    planned = _plan_proactive_notes("sylana")
     notes = _get_due_proactive_notes(limit=20)
     regime_items: List[Dict[str, Any]] = []
     regime_alerts: List[str] = []
@@ -4792,29 +6020,55 @@ def _run_heartbeat() -> Dict[str, Any]:
                 )
     except Exception as exc:
         logger.warning("Heartbeat regime assessment failed: %s", exc)
-    important = [
-        note for note in notes
-        if note.get("announce_policy") != "never" and (
-            note.get("announce_policy") == "always"
-        or ALERT_SEVERITY_ORDER.get(note.get("severity") or "info", 1) >= ALERT_SEVERITY_ORDER["warning"]
+    important: List[Dict[str, Any]] = []
+    quiet_pending_ids: List[str] = []
+    swallowed_ids: List[str] = []
+    surfaced_ids: List[str] = []
+    for note in notes:
+        note_id = str(note.get("note_id") or "")
+        policy = str(note.get("announce_policy") or "important_only").strip().lower()
+        severity = str(note.get("severity") or "info").strip().lower()
+        importance_score = float(note.get("importance_score") or 0.5)
+        durable = bool((note.get("metadata") or {}).get("durable", True))
+        delivery_policy = _normalize_delivery_policy(note.get("delivery_policy"), default="inbox_only")
+        should_surface = (
+            policy != "never"
+            and (
+                policy == "always"
+                or delivery_policy == "always"
+                or ALERT_SEVERITY_ORDER.get(severity, 1) >= ALERT_SEVERITY_ORDER["warning"]
+                or importance_score >= LOUD_NOTE_IMPORTANCE_THRESHOLD
+            )
         )
-    ]
+        if should_surface:
+            important.append(note)
+            surfaced_ids.append(note_id)
+        elif durable:
+            quiet_pending_ids.append(note_id)
+        else:
+            swallowed_ids.append(note_id)
     summary_lines: List[str] = []
     if heartbeat_doc:
         summary_lines.append("Heartbeat checklist loaded.")
     summary_lines.extend(regime_alerts[:3])
     if important:
         for note in important[:5]:
-            summary_lines.append(f"[{str(note.get('severity') or 'info').upper()}] {note.get('title')}: {note.get('body')}")
+            why_now = str(note.get("why_now") or "").strip()
+            suffix = f" Why now: {why_now}" if why_now else ""
+            summary_lines.append(f"[{str(note.get('severity') or 'info').upper()}] {note.get('title')}: {note.get('body')}{suffix}")
     elif notes:
-        summary_lines.append(f"{len(notes)} pending note(s) reviewed; nothing crossed the importance threshold.")
+        summary_lines.append(f"{len(notes)} quiet note(s) reviewed; nothing crossed the interruption threshold.")
     else:
         summary_lines.append("No pending proactive notes.")
 
     surfaced = bool(important or regime_alerts)
     status = "surfaced" if surfaced else "HEARTBEAT_OK"
-    if notes:
-        _mark_proactive_notes([str(note["note_id"]) for note in notes], "surfaced" if surfaced else "swallowed")
+    if surfaced_ids:
+        _mark_proactive_notes(surfaced_ids, "surfaced")
+    if swallowed_ids:
+        _mark_proactive_notes(swallowed_ids, "swallowed")
+    if quiet_pending_ids:
+        _mark_proactive_notes_processed(quiet_pending_ids)
 
     result = {
         "status": status,
@@ -4822,16 +6076,40 @@ def _run_heartbeat() -> Dict[str, Any]:
         "heartbeat_loaded": bool(heartbeat_doc),
         "notes_seen": len(notes),
         "notes_surfaced": len(important),
+        "quiet_inbox_count": len(_list_proactive_notes(limit=200, status="pending")),
+        "notes_planned": len(planned.get("planned") or []),
+        "autonomous_sessions": len(planned.get("autonomous_sessions") or []),
         "regimes_observed": len(regime_items),
+        "queue_summary": _list_review_queue(limit=200, status="pending").get("summary") or {},
         "summary": "\n".join(summary_lines).strip(),
     }
     state.last_heartbeat_result = result
     if surfaced:
-        if HEARTBEAT_PUSH_ENABLED:
+        if HEARTBEAT_PUSH_ENABLED and not _is_within_quiet_hours(preferences=preferences):
             _send_push_notification("Sylana heartbeat", summary_lines[0][:160], {"type": "heartbeat", "notes": len(important)})
         _fire_runtime_hooks(HOOK_EVENT_HEARTBEAT_ALERT, result)
     else:
         _fire_runtime_hooks(HOOK_EVENT_HEARTBEAT_OK, result)
+    return result
+
+
+def _run_daily_review_planning_pass(personality: str = "sylana") -> Dict[str, Any]:
+    planned = _plan_proactive_notes(personality)
+    queue = _list_review_queue(status="pending", personality=personality, limit=120)
+    result = {
+        "personality": personality,
+        "planned": len(planned.get("planned") or []),
+        "created": len(planned.get("created") or []),
+        "autonomous_sessions": len(planned.get("autonomous_sessions") or []),
+        "queue_summary": queue.get("summary") or {},
+        "ran_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _record_proactive_note_event(
+        None,
+        "daily_planner_ran",
+        actor="planner",
+        metadata=result,
+    )
     return result
 
 
@@ -5136,6 +6414,65 @@ def run_nightly_reflection_job() -> List[Dict[str, Any]]:
         try:
             dream_rows = state.memory_manager.generate_nightly_reflection_and_dreams()
             if dream_rows:
+                for row in dream_rows:
+                    if str(row.get("personality") or "").strip().lower() != "sylana":
+                        continue
+                    bridges = row.get("continuity_bridges") or []
+                    care_brief = str(row.get("care_brief") or "").strip()
+                    follow_through_brief = str(row.get("follow_through_brief") or "").strip()
+                    if care_brief:
+                        _enqueue_structured_proactive_note(
+                            source="nightly_reflection",
+                            title="A gentle care thread for tomorrow",
+                            body=care_brief,
+                            note_kind="care",
+                            why_now="Nightly reflection noticed a relational tone worth holding softly tomorrow.",
+                            topic_key="nightly-care-brief",
+                            importance_score=0.63,
+                            announce_policy="important_only",
+                            durable=True,
+                            surface_kind="quiet_note",
+                            action_kind="none",
+                            delivery_policy="inbox_only",
+                            personality="sylana",
+                        )
+                    if follow_through_brief:
+                        _enqueue_structured_proactive_note(
+                            source="nightly_reflection",
+                            title="Tomorrow's follow-through thread",
+                            body=follow_through_brief,
+                            note_kind="follow_up",
+                            why_now="Nightly reflection found a thread worth carrying into the next day.",
+                            topic_key="nightly-follow-through-brief",
+                            importance_score=0.66,
+                            announce_policy="important_only",
+                            durable=True,
+                            surface_kind="quiet_note",
+                            action_kind="none",
+                            delivery_policy="inbox_only",
+                            personality="sylana",
+                        )
+                    if not bridges:
+                        continue
+                    bridge = bridges[0]
+                    _enqueue_structured_proactive_note(
+                        source="nightly_reflection",
+                        title="A thread to carry into tomorrow",
+                        body=str(bridge.get("summary") or "").strip(),
+                        note_kind="follow_up",
+                        why_now="Nightly reflection found something worth carrying forward quietly.",
+                        topic_key=str(bridge.get("topic_key") or "nightly-bridge"),
+                        importance_score=min(0.68, float(bridge.get("importance_score") or 0.55)),
+                        thread_id=bridge.get("thread_id"),
+                        memory_refs=bridge.get("memory_refs") or [],
+                        announce_policy="important_only",
+                        durable=True,
+                        surface_kind="quiet_note",
+                        action_kind="none",
+                        delivery_policy="inbox_only",
+                        personality="sylana",
+                    )
+                    break
                 created.append({
                     "log_id": None,
                     "log_type": "memory_dream_runtime",
@@ -6236,6 +7573,14 @@ def _run_prompt_session(
     announce_policy: str = "important_only",
     parent_session_id: Optional[str] = None,
     announcement_target: Optional[str] = None,
+    note_title: Optional[str] = None,
+    note_kind: str = "prep",
+    why_now: str = "",
+    thread_id: Optional[int] = None,
+    topic_key: Optional[str] = None,
+    memory_refs: Optional[List[Any]] = None,
+    importance_score: float = 0.72,
+    dedupe_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     session_id = _create_work_session(
         entity=entity,
@@ -6257,6 +7602,7 @@ def _run_prompt_session(
             personality=entity,
             active_tools=active_tools,
             conversation_mode="default",
+            store_memory=session_mode == "main",
         )
         summary = str((response or {}).get("response") or "").strip()
         _update_work_session(
@@ -6274,12 +7620,28 @@ def _run_prompt_session(
             source=f"{trigger_source}:prompt_session",
             source_id=session_id,
             session_id=session_id,
-            title=f"{entity.title()} prompt session completed",
+            title=(note_title or f"{entity.title()} prompt session completed").strip(),
             body=summary[:1500] or "Prompt session completed with no text output.",
             severity="warning" if announce_policy == "always" else "info",
             announce_policy=announce_policy,
-            dedupe_key=f"prompt-session:{session_id}",
-            metadata={"entity": entity, "session_mode": session_mode, "trigger_source": trigger_source},
+            dedupe_key=dedupe_key or f"prompt-session:{session_id}",
+            metadata=_structured_proactive_metadata(
+                metadata={"entity": entity, "session_mode": session_mode, "trigger_source": trigger_source},
+                note_kind=note_kind,
+                why_now=why_now,
+                thread_id=thread_id,
+                topic_key=topic_key or f"prompt-session:{session_type}",
+                memory_refs=memory_refs,
+                importance_score=importance_score,
+                durable=True,
+                surface_kind="prepared_work",
+                action_kind="none",
+                action_payload={"session_id": session_id, "session_type": session_type},
+                route_target="",
+                delivery_policy="inbox_only",
+                confidence_score=importance_score,
+                personality=entity,
+            ),
         )
         _fire_runtime_hooks(
             HOOK_EVENT_SCHEDULE_COMPLETED,
@@ -6496,10 +7858,142 @@ def run_prospect_research_session(
         severity="warning" if prospects_created > 0 else "info",
         announce_policy="important_only",
         dedupe_key=f"prospect-research:{session_id}",
-        metadata={"product": product, "entity": entity, "result": result},
+        metadata=_structured_proactive_metadata(
+            metadata={
+                "product": product,
+                "entity": entity,
+                "result": result,
+                "session_id": session_id,
+            },
+            note_kind="follow_up",
+            why_now="Prospect research completed and is ready for review.",
+            topic_key=f"outreach-session:{session_id}",
+            importance_score=0.78 if prospects_created > 0 else 0.58,
+            durable=True,
+            surface_kind="prepared_work",
+            action_kind="none",
+            action_payload={"session_id": session_id, "product": product},
+            route_target=f"/(tabs)/outreach/session/{session_id}",
+            delivery_policy="rare_push" if prospects_created > 0 else "inbox_only",
+            confidence_score=0.84 if prospects_created > 0 else 0.55,
+            personality=entity,
+        ),
     )
     _fire_runtime_hooks(HOOK_EVENT_SCHEDULE_COMPLETED, {"job_kind": "prospect_research", "session_id": session_id, "result": result, "note": note})
     return result
+
+
+def _run_outreach_research_action(note: Dict[str, Any], actor: str) -> Dict[str, Any]:
+    payload = dict(note.get("action_payload") or {})
+    product = _normalized_product(str(payload.get("product") or "manifest"))
+    count = max(1, min(int(payload.get("count") or 5), 25))
+    entity = _normalized_execution_entity(str(payload.get("entity") or note.get("personality") or "claude"))
+    goal = f"Queued prospect research for {product} ({count} prospects)"
+    session_id = _create_work_session(
+        entity=entity,
+        goal=goal,
+        session_type="prospect_research",
+        metadata={"queued_note_id": note.get("note_id"), "product": product, "count": count, "approved_by": actor},
+        status="pending",
+        session_mode="isolated",
+        trigger_source="system",
+    )
+    result = run_prospect_research_session(
+        session_id=session_id,
+        entity=entity,
+        product=product,
+        count=count,
+        source="approval_queue",
+    )
+    return {
+        "action_kind": "outreach_research",
+        "session_id": session_id,
+        "product": product,
+        "count": count,
+        "entity": entity,
+        "result": result,
+        "route_target": f"/(tabs)/outreach/session/{session_id}",
+    }
+
+
+def _run_lysara_control_action(note: Dict[str, Any], actor: str) -> Dict[str, Any]:
+    payload = dict(note.get("action_payload") or {})
+    operation = str(payload.get("operation") or payload.get("callable_name") or "").strip()
+    if not operation:
+        raise HTTPException(status_code=400, detail="Lysara control note is missing operation")
+    if operation not in _lysara_mutation_names():
+        raise HTTPException(status_code=400, detail="Unsupported Lysara control operation")
+    args = payload.get("args") or []
+    kwargs = payload.get("kwargs") if isinstance(payload.get("kwargs"), dict) else {}
+    kwargs.setdefault("actor", actor)
+    response = _lysara_proxy(operation, *args, **kwargs)
+    return {
+        "action_kind": "lysara_control",
+        "operation": operation,
+        "response": response,
+    }
+
+
+def _dispatch_proactive_note_action(note: Dict[str, Any], actor: str, reason: str = "") -> Dict[str, Any]:
+    action_kind = _normalize_action_kind(note.get("action_kind"))
+    if action_kind == "none":
+        updated = _update_proactive_note_execution(str(note.get("note_id") or ""), "executed")
+        return {
+            "action_kind": "none",
+            "status": "no_action_required",
+            "note": updated or note,
+        }
+    if action_kind == "prompt_session":
+        payload = dict(note.get("action_payload") or {})
+        result = _run_prompt_session(
+            entity=_normalized_execution_entity(str(payload.get("entity") or note.get("personality") or "sylana")),
+            prompt=str(payload.get("prompt") or note.get("body") or note.get("title") or "").strip(),
+            session_type=_normalized_session_type(str(payload.get("session_type") or "general")),
+            session_mode="isolated",
+            trigger_source="system",
+            metadata={
+                "autonomous_kind": note.get("note_kind"),
+                "queued_note_id": note.get("note_id"),
+                "approval_reason": reason,
+                "active_tools": payload.get("active_tools") or ["memories", "work_sessions", "web_search"],
+            },
+            announce_policy="important_only",
+            note_title=str(payload.get("note_title") or note.get("title") or "Prepared work").strip(),
+            note_kind=str(note.get("note_kind") or "prep"),
+            why_now=str(note.get("why_now") or ""),
+            thread_id=note.get("thread_id"),
+            topic_key=str(note.get("topic_key") or note.get("title") or "prompt-session"),
+            memory_refs=note.get("memory_refs") or [],
+            importance_score=float(note.get("importance_score") or 0.7),
+            dedupe_key=f"approved-prompt-session:{note.get('note_id')}",
+        )
+        _update_proactive_note_execution(str(note.get("note_id") or ""), "executed")
+        return {
+            "action_kind": "prompt_session",
+            "session_id": result.get("session_id"),
+            "result": result,
+        }
+    if action_kind == "outreach_research":
+        result = _run_outreach_research_action(note, actor)
+        _update_proactive_note_execution(str(note.get("note_id") or ""), "executed")
+        return result
+    if action_kind == "lysara_trade_intent":
+        payload = dict(note.get("action_payload") or {})
+        result = _submit_lysara_trade_intent_with_policy(
+            payload,
+            allow_approval_bypass=True,
+            approval_note_id=str(note.get("note_id") or ""),
+            autonomous=True,
+        )
+        return {
+            "action_kind": "lysara_trade_intent",
+            "result": result,
+        }
+    if action_kind == "lysara_control":
+        result = _run_lysara_control_action(note, actor)
+        _update_proactive_note_execution(str(note.get("note_id") or ""), "executed")
+        return result
+    raise HTTPException(status_code=400, detail="Unsupported proactive action")
 
 
 async def _run_scheduled_job(cfg: Dict[str, Any]) -> None:
@@ -6647,6 +8141,20 @@ def sync_scheduler_jobs() -> None:
             timezone=getattr(config, "APP_TIMEZONE", "America/Chicago"),
         ),
         id="memory-maintenance-daily",
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+        misfire_grace_time=900,
+    )
+
+    scheduler.add_job(
+        _run_daily_review_planning_pass,
+        trigger=CronTrigger(
+            hour=8,
+            minute=10,
+            timezone=getattr(config, "APP_TIMEZONE", "America/Chicago"),
+        ),
+        id="daily-review-planner",
         replace_existing=True,
         coalesce=True,
         max_instances=1,
@@ -7971,6 +9479,7 @@ def _build_tiered_memory_context_sections(bundle: Dict[str, Any], memory_query: 
     working_memory = bundle.get("working_memory") or {}
     thread_summaries = bundle.get("thread_summaries") or []
     open_loops = bundle.get("open_loops") or []
+    continuity_bridges = bundle.get("continuity_bridges") or []
     identity_core = bundle.get("identity_core") or []
     facts = bundle.get("facts") or []
     pending_fact_proposals = bundle.get("pending_fact_proposals") or []
@@ -7981,7 +9490,7 @@ def _build_tiered_memory_context_sections(bundle: Dict[str, Any], memory_query: 
     reflections = bundle.get("reflections") or []
     dreams = bundle.get("dreams") or []
 
-    if not any([working_memory, thread_summaries, open_loops, identity_core, facts, pending_fact_proposals, anniversaries, milestones, episodes, entities, reflections, dreams]):
+    if not any([working_memory, thread_summaries, open_loops, continuity_bridges, identity_core, facts, pending_fact_proposals, anniversaries, milestones, episodes, entities, reflections, dreams]):
         return {"priority": "", "support": ""}
 
     priority_lines = [f"TIERED MEMORY CONTEXT (mode={query_mode}):"]
@@ -8016,10 +9525,19 @@ def _build_tiered_memory_context_sections(bundle: Dict[str, Any], memory_query: 
         for loop in open_loops[:4]:
             title = (loop.get("title") or "").strip()
             due_hint = (loop.get("due_hint") or "").strip()
+            scope = str(loop.get("thread_scope") or "").strip()
+            scope_text = " [cross-thread]" if scope == "cross_thread" else ""
             if title and due_hint:
-                priority_lines.append(f"- {title} (due hint: {due_hint})")
+                priority_lines.append(f"- {title}{scope_text} (due hint: {due_hint})")
             elif title:
-                priority_lines.append(f"- {title}")
+                priority_lines.append(f"- {title}{scope_text}")
+
+    if continuity_bridges:
+        priority_lines.append("CONTINUITY BRIDGES:")
+        for bridge in continuity_bridges[:3]:
+            summary = str(bridge.get("summary") or "").strip()
+            if summary:
+                priority_lines.append(f"- {summary[:180]}")
 
     if thread_summaries:
         priority_lines.append("THREAD SUMMARIES:")
@@ -8212,10 +9730,10 @@ def _build_tool_policy_section(active_tools: List[str]) -> str:
         "code_execution": "You have access to code execution. You can write and run Python, JavaScript, or bash. Use this to produce real outputs, not just describe them.",
         "files": "You have access to file creation and retrieval. You can create and store documents, reports, and other outputs.",
         "health_data": "You have access to Elias's current health data including steps, sleep stages, heart rate, and stress levels. Reference this when relevant to the conversation.",
-        "work_sessions": "You have access to work session management. You can create and run autonomous research and drafting sessions.",
+        "work_sessions": "You have access to work session management. You can create and run isolated autonomous research, drafting, and preparation sessions.",
         "github": "You have access to GitHub. You can read repos, create files, commit changes, and open pull requests.",
         "photos": "You have access to Elias's photo library with tagged memories of his life, family, and work.",
-        "memories": "You have access to conversation memory and past context.",
+        "memories": "You have access to conversation memory, past context, open loops, and quiet-note planning primitives.",
         "outreach": "You have access to the Manifest outreach system including prospect lists, email drafts, session results, and prospect-research execution.",
         "lysara": "You have access to the Lysara trading node.",
     }
@@ -8237,6 +9755,20 @@ def _build_tool_policy_section(active_tools: List[str]) -> str:
                     "Never infer live trading state from memory alone.",
                     "For current market-moving decisions, gather current source-backed information via web search before submitting any trade intent.",
                     "Only use approved Lysara mutation tools for risk, strategy controls, pause/resume, overrides, research/journal recording, and trade intents.",
+                ]
+            )
+        if tool == "memories":
+            lines.extend(
+                [
+                    "Use memory_add_open_loop to preserve unfinished threads that should survive beyond this turn.",
+                    "Use memory_enqueue_quiet_note when a thought should be surfaced later in the quiet inbox instead of interrupting the visible chat.",
+                ]
+            )
+        if tool == "work_sessions":
+            lines.extend(
+                [
+                    "Use work_sessions_create_prompt_session for isolated prep or creative drafting when forward-thinking help is useful.",
+                    "Isolated work sessions must not pretend to be live conversation. They should prepare something useful and return it as a quiet note or session result.",
                 ]
             )
     return "\n".join(lines)
@@ -8295,6 +9827,10 @@ def _format_session_continuity_context(payload: Dict[str, Any]) -> str:
     active_projects = payload.get("active_projects", [])
     preference_signals = payload.get("preference_signals", [])
     weighted_memories = payload.get("recent_weighted_memories", [])
+    user_state_markers = payload.get("user_state_markers", [])
+    relationship_texture = payload.get("relationship_texture", [])
+    care_signals = payload.get("care_signals", [])
+    continuity_bridges = payload.get("continuity_bridges", [])
 
     lines = [
         "SESSION CONTINUITY:",
@@ -8309,6 +9845,18 @@ def _format_session_continuity_context(payload: Dict[str, Any]) -> str:
         lines.append(f"- Active projects: {', '.join(str(p) for p in active_projects[:4])}")
     if preference_signals:
         lines.append(f"- Preference signals: {', '.join(str(p) for p in preference_signals[:4])}")
+    if user_state_markers:
+        lines.append(f"- Recent user state markers: {', '.join(str(item) for item in user_state_markers[:5])}")
+    if relationship_texture:
+        lines.append(f"- Relationship texture: {', '.join(str(item) for item in relationship_texture[:4])}")
+    if care_signals:
+        lines.append(f"- Care signals: {', '.join(str(item) for item in care_signals[:4])}")
+    if continuity_bridges:
+        lines.append("- Continuity bridges to carry forward:")
+        for bridge in continuity_bridges[:3]:
+            summary = str(bridge.get("summary") or "").strip()
+            if summary:
+                lines.append(f"  * {summary[:120]}")
     if weighted_memories:
         lines.append("- Weighted recent moments:")
         for item in weighted_memories[:2]:
@@ -8383,6 +9931,42 @@ def _budget_recent_history_messages(
     selected_reversed.reverse()
     return selected_reversed
 
+
+def _build_cold_start_review_context(
+    personality: str,
+    thread_id: Optional[int],
+    recent_history: Optional[List[Dict[str, Any]]],
+    memory_bundle: Optional[Dict[str, Any]],
+) -> str:
+    if len(recent_history or []) > 1:
+        return ""
+    lines: List[str] = []
+    try:
+        queue = _list_review_queue(status="pending", personality=personality, thread_id=thread_id, limit=4)
+    except Exception:
+        queue = {"sections": {}}
+    sections = queue.get("sections") or {}
+    top_note = None
+    for bucket in ("quiet_notes", "approvals", "prepared_work"):
+        items = sections.get(bucket) or []
+        if items:
+            top_note = items[0]
+            break
+    if top_note:
+        lines.append(
+            (
+                f"Quiet review context: {top_note.get('title')}. "
+                f"Why now: {top_note.get('why_now') or top_note.get('body') or ''}"
+            ).strip()
+        )
+    bridges = (memory_bundle or {}).get("continuity_bridges") or []
+    if bridges:
+        summary = str((bridges[0] or {}).get("summary") or "").strip()
+        if summary:
+            lines.append(f"Carry-forward bridge: {summary}")
+    return "\n".join(line for line in lines if line).strip()
+
+
 def _build_claude_inputs(
     user_input: str,
     personality: str,
@@ -8412,12 +9996,19 @@ def _build_claude_inputs(
     continuity_text = _format_session_continuity_context(memory_bundle.get("continuity") or {})
     supplemental_sacred = _format_supplemental_sacred_context(sacred_context)
     operational_sections = _build_operational_prompt_sections(active_tools, user_context)
+    cold_start_review = _build_cold_start_review_context(
+        personality=personality,
+        thread_id=(memory_bundle.get("working_memory") or {}).get("thread_id"),
+        recent_history=recent_history,
+        memory_bundle=memory_bundle,
+    )
     composed_system, dropped_sections = _budget_prompt_sections(
         [
             ("base_identity", composed_system, True),
             ("tool_policy", tool_policy, True),
             ("working_memory", memory_sections.get("priority") or "", True),
             ("continuity", continuity_text, True),
+            ("review_center", cold_start_review, True),
             ("factual_support", memory_sections.get("support") or "", False),
             ("sacred_context", supplemental_sacred, False),
             *[(name, text, False) for name, text in operational_sections],
@@ -8495,6 +10086,7 @@ def _generate_turn_result(
     active_tools: Optional[List[str]] = None,
     conversation_mode: str = "default",
     emotion_data: Optional[Dict[str, Any]] = None,
+    store_memory: bool = True,
 ) -> dict:
     state.turn_count += 1
     resolved_tools = normalize_active_tools(active_tools)
@@ -8598,7 +10190,7 @@ def _generate_turn_result(
         voice_score = round(score, 2)
 
     conv_id = None
-    if state.memory_manager:
+    if store_memory and state.memory_manager:
         try:
             conv_id = state.memory_manager.store_conversation(
                 user_input=user_input,
@@ -8641,6 +10233,7 @@ def generate_response(
     personality: str = 'sylana',
     active_tools: Optional[List[str]] = None,
     conversation_mode: str = "default",
+    store_memory: bool = True,
 ) -> dict:
     """Generate a complete response (non-streaming)."""
     return _generate_turn_result(
@@ -8649,6 +10242,7 @@ def generate_response(
         personality=personality,
         active_tools=active_tools,
         conversation_mode=conversation_mode,
+        store_memory=store_memory,
     )
 
 
@@ -8912,6 +10506,19 @@ class ProactiveNoteCreateRequest(BaseModel):
     session_id: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
     requires_approval: bool = False
+    note_kind: Optional[str] = None
+    why_now: str = ""
+    thread_id: Optional[int] = None
+    topic_key: str = ""
+    memory_refs: List[Any] = Field(default_factory=list)
+    importance_score: float = 0.5
+    surface_kind: Optional[str] = None
+    action_kind: Optional[str] = None
+    action_payload: Dict[str, Any] = Field(default_factory=dict)
+    route_target: str = ""
+    delivery_policy: Optional[str] = None
+    confidence_score: Optional[float] = None
+    personality: Optional[str] = None
 
 
 class RuntimeHookCreateRequest(BaseModel):
@@ -8935,6 +10542,14 @@ class ProactiveNoteApprovalRequest(BaseModel):
     approved: bool
     actor: str = "operator"
     reason: str = ""
+
+
+class AutonomyPreferencesRequest(BaseModel):
+    delivery_mode: Optional[str] = None
+    allowed_domains: Optional[Dict[str, bool]] = None
+    quiet_hours: Optional[Dict[str, Any]] = None
+    daily_autonomous_cap: Optional[int] = None
+    high_confidence_care_push_enabled: Optional[bool] = None
 
 
 class LysaraTradeCloseRequest(BaseModel):
@@ -9031,6 +10646,7 @@ alerts_router = APIRouter(prefix="/alerts", tags=["alerts"])
 presence_router = APIRouter(prefix="/presence", tags=["presence"])
 tracking_router = APIRouter(tags=["tracking"])
 lysara_router = APIRouter(prefix="/api/lysara", tags=["lysara"])
+preferences_router = APIRouter(prefix="/preferences", tags=["preferences"])
 
 
 def _normalized_entity(value: str) -> str:
@@ -9631,8 +11247,41 @@ async def proactive_prompt_files():
 
 
 @sessions_router.get("/proactive/notes")
-async def list_proactive_notes_endpoint(limit: int = 50, status: Optional[str] = None):
-    return JSONResponse(content={"notes": _list_proactive_notes(limit=limit, status=status)})
+async def list_proactive_notes_endpoint(
+    limit: int = 50,
+    status: Optional[str] = None,
+    note_kind: Optional[str] = None,
+    thread_id: Optional[int] = None,
+    personality: Optional[str] = None,
+):
+    return JSONResponse(
+        content={
+            "notes": _list_proactive_notes(
+                limit=limit,
+                status=status,
+                note_kind=note_kind,
+                thread_id=thread_id,
+                personality=personality,
+            )
+        }
+    )
+
+
+@sessions_router.get("/proactive/queue")
+async def get_proactive_queue(
+    limit: int = 50,
+    status: Optional[str] = "pending",
+    personality: Optional[str] = None,
+    thread_id: Optional[int] = None,
+):
+    return JSONResponse(
+        content=_list_review_queue(
+            limit=limit,
+            status=status,
+            personality=personality,
+            thread_id=thread_id,
+        )
+    )
 
 
 @sessions_router.post("/proactive/notes")
@@ -9645,7 +11294,22 @@ async def create_proactive_note(payload: ProactiveNoteCreateRequest):
         session_id=payload.session_id,
         dedupe_key=payload.dedupe_key,
         announce_policy=_normalized_announce_policy(payload.announce_policy),
-        metadata=payload.metadata or {},
+        metadata=_structured_proactive_metadata(
+            metadata=payload.metadata or {},
+            note_kind=payload.note_kind,
+            why_now=payload.why_now,
+            thread_id=payload.thread_id,
+            topic_key=payload.topic_key,
+            memory_refs=payload.memory_refs,
+            importance_score=payload.importance_score,
+            surface_kind=payload.surface_kind,
+            action_kind=payload.action_kind,
+            action_payload=payload.action_payload,
+            route_target=payload.route_target,
+            delivery_policy=payload.delivery_policy,
+            confidence_score=payload.confidence_score,
+            personality=payload.personality,
+        ),
         requires_approval=bool(payload.requires_approval),
     )
     if not note:
@@ -9667,16 +11331,59 @@ async def update_proactive_note_approval(note_id: str, payload: ProactiveNoteApp
     if not note:
         raise HTTPException(status_code=404, detail="Proactive note not found")
     if payload.approved:
-        trade_payload = ((existing.get("metadata") or {}).get("trade_payload") or {})
-        if trade_payload:
-            execution = _submit_lysara_trade_intent_with_policy(
-                trade_payload,
-                allow_approval_bypass=True,
-                approval_note_id=note_id,
-            )
-            refreshed = _get_proactive_note(note_id) or note
-            return JSONResponse(content={"note": refreshed, "execution": execution})
+        execution = _dispatch_proactive_note_action(
+            _get_proactive_note(note_id) or note,
+            actor=(payload.actor or "operator").strip() or "operator",
+            reason=(payload.reason or "").strip(),
+        )
+        refreshed = _get_proactive_note(note_id) or note
+        return JSONResponse(content={"note": refreshed, "execution": execution})
     return JSONResponse(content={"note": note})
+
+
+@sessions_router.post("/proactive/notes/{note_id}/approve")
+async def approve_proactive_note(note_id: str, payload: Optional[ProactiveNoteApprovalRequest] = None):
+    approval_payload = payload or ProactiveNoteApprovalRequest(approved=True)
+    approval_payload.approved = True
+    return await update_proactive_note_approval(note_id, approval_payload)
+
+
+@sessions_router.post("/proactive/notes/{note_id}/reject")
+async def reject_proactive_note(note_id: str, payload: Optional[ProactiveNoteApprovalRequest] = None):
+    approval_payload = payload or ProactiveNoteApprovalRequest(approved=False)
+    approval_payload.approved = False
+    return await update_proactive_note_approval(note_id, approval_payload)
+
+
+@sessions_router.post("/proactive/notes/{note_id}/acknowledge")
+async def acknowledge_proactive_note(note_id: str):
+    note = _set_proactive_note_status(note_id, "surfaced")
+    if not note:
+        raise HTTPException(status_code=404, detail="Proactive note not found")
+    return JSONResponse(content={"note": note, "acknowledged": True})
+
+
+@sessions_router.post("/proactive/notes/{note_id}/dismiss")
+async def dismiss_proactive_note(note_id: str):
+    note = _set_proactive_note_status(note_id, "swallowed")
+    if not note:
+        raise HTTPException(status_code=404, detail="Proactive note not found")
+    return JSONResponse(content={"note": note, "dismissed": True})
+
+
+@preferences_router.get("/autonomy")
+async def get_autonomy_preferences_endpoint():
+    return JSONResponse(content={"preferences": _get_autonomy_preferences()})
+
+
+@preferences_router.put("/autonomy")
+async def update_autonomy_preferences_endpoint(payload: AutonomyPreferencesRequest):
+    current = _get_autonomy_preferences()
+    merged = {
+        **current,
+        **payload.model_dump(exclude_none=True),
+    }
+    return JSONResponse(content={"preferences": _set_autonomy_preferences(merged)})
 
 
 @sessions_router.get("/proactive/hooks")
@@ -11805,6 +13512,7 @@ app.include_router(alerts_router)
 app.include_router(presence_router)
 app.include_router(tracking_router)
 app.include_router(lysara_router)
+app.include_router(preferences_router)
 
 # Cross-origin support for mobile/web clients hitting deployed API domains.
 app.add_middleware(
@@ -12322,6 +14030,8 @@ async def status():
     # Memory stats
     if state.memory_manager:
         info["memory"] = state.memory_manager.get_stats()
+    info["proactive"] = _proactive_status_summary()
+    info["autonomy_preferences"] = _get_autonomy_preferences()
 
     # Relationship stats
     if state.relationship_db:
