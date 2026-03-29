@@ -353,6 +353,70 @@ def _filter_symbol_rows(payload: Dict[str, Any], symbols: list[str]) -> Dict[str
     return filtered
 
 
+def _sector_for_symbol(symbol: str, market: str) -> str:
+    upper = str(symbol or "").upper()
+    lower_market = str(market or "").lower()
+    if lower_market == "crypto":
+        if upper.startswith("BTC"):
+            return "store_of_value"
+        if upper.startswith("ETH") or upper.startswith("SOL"):
+            return "layer1"
+        return "crypto"
+    if upper in {"AAPL", "MSFT", "GOOG", "AMZN"}:
+        return "large_cap_tech"
+    return "equities"
+
+
+def _build_exposure_payload(state: Dict[str, Any], market: str = "crypto") -> Dict[str, Any]:
+    target_market = str(market or "crypto").strip().lower() or "crypto"
+    portfolio = state.get("portfolio") or {}
+    markets = (portfolio.get("markets") or {})
+    market_rows = ((markets.get(target_market) or {}).get("positions") or [])
+    sim = ((state.get("status") or {}).get("simulation_portfolio") or {})
+    portfolio_value = max(0.0, _safe_float(sim.get("portfolio_value"), portfolio.get("total_equity")))
+    cash = max(0.0, _safe_float(sim.get("cash"), 0.0))
+    holdings_value = round(sum(_safe_float(row.get("market_value"), 0.0) for row in market_rows), 2)
+    gross_exposure_pct = round((holdings_value / portfolio_value) * 100.0, 4) if portfolio_value > 0 else 0.0
+
+    positions = []
+    max_weight = 0.0
+    for row in market_rows:
+        market_value = round(_safe_float(row.get("market_value"), 0.0), 2)
+        weight_pct = round((market_value / portfolio_value) * 100.0, 4) if portfolio_value > 0 else 0.0
+        effective_weight_pct = weight_pct
+        max_weight = max(max_weight, effective_weight_pct)
+        positions.append(
+            {
+                "symbol": str(row.get("symbol") or "").upper(),
+                "market": target_market,
+                "quantity": round(_safe_float(row.get("quantity"), 0.0), 8),
+                "price": round(_safe_float(row.get("current_price"), row.get("avg_entry_price")), 6),
+                "market_value": market_value,
+                "weight_pct": weight_pct,
+                "effective_weight_pct": effective_weight_pct,
+                "heat_pct": effective_weight_pct,
+                "sector": _sector_for_symbol(str(row.get("symbol") or ""), target_market),
+            }
+        )
+
+    return {
+        "market": target_market,
+        "portfolio_value": round(portfolio_value, 2),
+        "cash": round(cash, 2),
+        "holdings_value": holdings_value,
+        "gross_exposure_pct": gross_exposure_pct,
+        "heat_score": round(max_weight, 4),
+        "total_effective_heat_pct": gross_exposure_pct,
+        "max_single_position_pct": 20.0,
+        "max_total_gross_exposure_pct": 100.0,
+        "simulation_mode": True,
+        "active_markets": list(((state.get("status") or {}).get("active_markets") or [])),
+        "positions": positions,
+        "mock_mode": True,
+        "updated_at": (state.get("status") or {}).get("updated_at") or _utc_now_iso(),
+    }
+
+
 def _execute_trade_intent_locked(payload: Dict[str, Any]) -> Dict[str, Any]:
     symbol = str(payload.get("symbol") or "").strip().upper()
     market = str(payload.get("market") or ("crypto" if symbol.endswith("-USD") else "stocks")).strip().lower()
@@ -557,6 +621,9 @@ class Handler(BaseHTTPRequestHandler):
                 payload = _filter_symbol_rows(deepcopy(STATE["event_risk"]), symbols)
                 payload["mock_mode"] = True
                 return _json(self, 200, payload)
+            if path == "/api/v1/ops/exposure":
+                market = (qs.get("market") or ["crypto"])[0]
+                return _json(self, 200, _build_exposure_payload(STATE, market))
             if path == "/api/v1/ops/override/status":
                 payload = deepcopy(STATE["override"])
                 payload["mock_mode"] = True
