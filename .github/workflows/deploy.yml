@@ -28,24 +28,24 @@ jobs:
               echo ">>> Syncing maintenance read token into backend env..."
               export MAINTENANCE_READ_TOKEN_VALUE='${{ secrets.MAINTENANCE_READ_TOKEN }}'
               python3 - <<'PY'
-from pathlib import Path
-import os
+              from pathlib import Path
+              import os
 
-env_path = Path('.env')
-token = os.environ.get('MAINTENANCE_READ_TOKEN_VALUE', '')
-lines = env_path.read_text(encoding='utf-8').splitlines() if env_path.exists() else []
-updated = False
-out = []
-for line in lines:
-    if line.startswith('MAINTENANCE_READ_TOKEN='):
-        out.append(f'MAINTENANCE_READ_TOKEN={token}')
-        updated = True
-    else:
-        out.append(line)
-if not updated:
-    out.append(f'MAINTENANCE_READ_TOKEN={token}')
-env_path.write_text('\n'.join(out) + '\n', encoding='utf-8')
-PY
+              env_path = Path('.env')
+              token = os.environ.get('MAINTENANCE_READ_TOKEN_VALUE', '')
+              lines = env_path.read_text(encoding='utf-8').splitlines() if env_path.exists() else []
+              updated = False
+              out = []
+              for line in lines:
+                  if line.startswith('MAINTENANCE_READ_TOKEN='):
+                      out.append(f'MAINTENANCE_READ_TOKEN={token}')
+                      updated = True
+                  else:
+                      out.append(line)
+              if not updated:
+                  out.append(f'MAINTENANCE_READ_TOKEN={token}')
+              env_path.write_text('\n'.join(out) + '\n', encoding='utf-8')
+              PY
             else
               echo ">>> MAINTENANCE_READ_TOKEN secret not set; leaving droplet env unchanged."
             fi
