@@ -10667,8 +10667,15 @@ def _max_new_tokens_for_turn(memory_query: bool) -> int:
     Use longer generation budgets to reduce clipped responses.
     Memory-heavy turns get a larger budget than generic chat.
     """
-    base = max(320, int(config.MAX_NEW_TOKENS))
-    return max(base, 420) if memory_query else base
+    chat_budget = max(
+        int(getattr(config, "MAX_NEW_TOKENS", 900)),
+        int(getattr(config, "CHAT_MAX_NEW_TOKENS", 1200)),
+    )
+    memory_budget = max(
+        chat_budget,
+        int(getattr(config, "MEMORY_QUERY_MAX_NEW_TOKENS", 1600)),
+    )
+    return memory_budget if memory_query else chat_budget
 
 
 def is_memory_query_legacy(lower: str) -> bool:

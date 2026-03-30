@@ -1794,7 +1794,7 @@ class MemoryManager:
                 break
 
         relationship_trust_level = round(max(0.0, min(1.0, 0.55 + (feeling_weight - 0.5) * 0.2)), 3)
-        relationship_state = self.update_relationship_depth(personality, relationship_trust_level, conn=conn, cur=cur)
+        relationship_state = self._update_relationship_state_from_trust(personality, relationship_trust_level)
 
         def _safe_vad_float(d: Optional[Dict[str, Any]], key: str) -> Optional[float]:
             if not d:
@@ -3989,12 +3989,10 @@ class MemoryManager:
             "updated_at": row[11].isoformat() if row[11] else None,
         }
 
-    def update_relationship_depth(
+    def _update_relationship_state_from_trust(
         self,
         personality: str,
         trust_level: float,
-        conn=None,
-        cur=None,
     ) -> str:
         """Map trust_level to a relationship_state string and persist it as a memory fact."""
         if trust_level < 0.4:

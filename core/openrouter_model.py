@@ -5,6 +5,7 @@ OpenAI-compatible wrapper for OpenRouter chat completions with optional tool loo
 
 import json
 import logging
+import os
 from typing import Any, Callable, Dict, Iterable, List, Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -34,6 +35,7 @@ class OpenRouterModel:
         self.site_url = site_url or ""
         self.enable_web_search = bool(enable_web_search and brave_api_key)
         self.brave_api_key = brave_api_key or ""
+        self.response_continuation_passes = max(0, int(os.getenv("RESPONSE_CONTINUATION_PASSES", "2") or "2"))
         self.external_tools_provider: Optional[Callable[[Optional[List[str]]], List[Dict[str, Any]]]] = None
         self.external_tool_runner: Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]] = None
 
@@ -145,6 +147,75 @@ class OpenRouterModel:
             return {}
         return (choices[0] or {}).get("message") or {}
 
+    @staticmethod
+    def _extract_finish_reason(payload: Dict[str, Any]) -> str:
+        choices = payload.get("choices") or []
+        if not choices:
+            return ""
+        return str((choices[0] or {}).get("finish_reason") or "").strip().lower()
+
+    @staticmethod
+    def _join_text_segments(parts: List[str]) -> str:
+        output = ""
+        for raw in parts or []:
+            piece = str(raw or "").strip()
+            if not piece:
+                continue
+            if not output:
+                output = piece
+                continue
+            if output[-1].isspace() or piece[0] in ",.;:!?)]}":
+                output += piece
+            else:
+                output += " " + piece
+        return output.strip()
+
+    def _continue_truncated_response(
+        self,
+        *,
+        convo: List[Dict[str, Any]],
+        initial_text: str,
+        response_payload: Dict[str, Any],
+        max_tokens: int,
+    ) -> str:
+        if not initial_text or self.response_continuation_passes <= 0:
+            return initial_text
+
+        combined_parts = [initial_text]
+        continuation_messages = list(convo or [])
+        continuation_messages.append({"role": "assistant", "content": initial_text})
+        current_payload = response_payload
+
+        for _ in range(self.response_continuation_passes):
+            if self._extract_finish_reason(current_payload) != "length":
+                break
+            continuation_messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Continue exactly where you left off. Do not restart, summarize, or repeat yourself. "
+                        "Finish the same answer in plain text."
+                    ),
+                }
+            )
+            continuation_payload = self._post_chat(
+                {
+                    "model": self.model,
+                    "messages": continuation_messages,
+                    "max_tokens": max_tokens,
+                    "temperature": 0.9,
+                }
+            )
+            next_message = self._extract_message(continuation_payload)
+            next_content = next_message.get("content")
+            next_text = next_content.strip() if isinstance(next_content, str) else ""
+            if next_text:
+                combined_parts.append(next_text)
+                continuation_messages.append({"role": "assistant", "content": next_text})
+            current_payload = continuation_payload
+
+        return self._join_text_segments(combined_parts)
+
     def _finalize_empty_response(
         self,
         *,
@@ -226,7 +297,16 @@ class OpenRouterModel:
 
             if not tool_calls:
                 if isinstance(content, str) and content.strip():
-                    return content.strip()
+                    text = content.strip()
+                    if self._extract_finish_reason(response) == "length":
+                        logger.info("OpenRouterModel hit max_tokens; requesting continuation")
+                        return self._continue_truncated_response(
+                            convo=convo,
+                            initial_text=text,
+                            response_payload=response,
+                            max_tokens=max_tokens,
+                        )
+                    return text
                 return ""
 
             convo.append(

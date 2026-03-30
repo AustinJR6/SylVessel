@@ -32,6 +32,7 @@ class ClaudeModel:
             (os.getenv("ENABLE_WEB_SEARCH", "true") or "true").strip().lower() == "true"
             and bool(self.brave_api_key)
         )
+        self.response_continuation_passes = max(0, int(os.getenv("RESPONSE_CONTINUATION_PASSES", "2") or "2"))
         if (os.getenv("ENABLE_WEB_SEARCH", "true") or "true").strip().lower() == "true" and not self.brave_api_key:
             logger.warning(
                 "ENABLE_WEB_SEARCH is true but BRAVE_SEARCH_API_KEY is missing; web search tools are disabled"
@@ -118,6 +119,68 @@ class ClaudeModel:
             if text:
                 parts.append(text)
         return "".join(parts).strip()
+
+    @staticmethod
+    def _join_text_segments(parts: List[str]) -> str:
+        output = ""
+        for raw in parts or []:
+            piece = str(raw or "").strip()
+            if not piece:
+                continue
+            if not output:
+                output = piece
+                continue
+            if output[-1].isspace() or piece[0] in ",.;:!?)]}":
+                output += piece
+            else:
+                output += " " + piece
+        return output.strip()
+
+    def _continue_truncated_response(
+        self,
+        *,
+        convo: List[Dict[str, Any]],
+        response: Any,
+        system_with_time: str,
+        max_tokens: int,
+    ) -> str:
+        initial_text = self._extract_text_from_response(response)
+        if not initial_text or self.response_continuation_passes <= 0:
+            return initial_text
+
+        combined_parts = [initial_text]
+        continuation_messages = list(convo or [])
+        assistant_blocks = [self._response_block_to_dict(b) for b in (response.content or [])]
+        if assistant_blocks:
+            continuation_messages.append({"role": "assistant", "content": assistant_blocks})
+
+        current_response = response
+        for _ in range(self.response_continuation_passes):
+            if getattr(current_response, "stop_reason", None) != "max_tokens":
+                break
+            continuation_messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Continue exactly where you left off. Do not restart, summarize, or repeat yourself. "
+                        "Finish the same answer in plain text."
+                    ),
+                }
+            )
+            current_response = self.client.messages.create(
+                model=self.model,
+                max_tokens=max_tokens,
+                system=system_with_time,
+                messages=continuation_messages,
+            )
+            next_text = self._extract_text_from_response(current_response)
+            if next_text:
+                combined_parts.append(next_text)
+            next_blocks = [self._response_block_to_dict(b) for b in (current_response.content or [])]
+            if next_blocks:
+                continuation_messages.append({"role": "assistant", "content": next_blocks})
+
+        return self._join_text_segments(combined_parts)
 
     def _finalize_empty_response(
         self,
@@ -308,6 +371,14 @@ class ClaudeModel:
 
         text = self._extract_text_from_response(response)
         if text:
+            if getattr(response, "stop_reason", None) == "max_tokens":
+                logger.info("ClaudeModel hit max_tokens; requesting continuation")
+                return self._continue_truncated_response(
+                    convo=convo,
+                    response=response,
+                    system_with_time=system_with_time,
+                    max_tokens=max_tokens,
+                )
             return text
         logger.warning(
             "ClaudeModel returned empty text after tool loop (stop_reason=%s, tools=%s)",

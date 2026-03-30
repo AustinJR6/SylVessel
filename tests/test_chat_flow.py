@@ -368,6 +368,16 @@ class ChatFlowTests(unittest.TestCase):
         self.assertEqual(model.calls[0]["active_tools"], [])
         self.assertIn("produced no visible reply", model.calls[0]["messages"][-1]["content"])
 
+    def test_max_new_tokens_for_turn_uses_chat_and_memory_budgets(self):
+        budget_config = types.SimpleNamespace(
+            MAX_NEW_TOKENS=900,
+            CHAT_MAX_NEW_TOKENS=1200,
+            MEMORY_QUERY_MAX_NEW_TOKENS=1600,
+        )
+        with patch.object(server, "config", budget_config):
+            self.assertEqual(server._max_new_tokens_for_turn(False), 1200)
+            self.assertEqual(server._max_new_tokens_for_turn(True), 1600)
+
 
 class ChatEndpointContinuityTests(unittest.IsolatedAsyncioTestCase):
     async def test_chat_endpoint_returns_409_for_invalid_explicit_thread(self):

@@ -25,6 +25,9 @@ class _StubSemanticMemoryEngine:
     def encode_query(self, query: str):
         return [0.0]
 
+    def encode_text_with_meta(self, text: str):
+        return [0.0], "test-embedding", 1
+
 
 class _BootstrapCursor:
     def execute(self, sql, params=None):
@@ -288,7 +291,10 @@ class MemoryContinuityTests(unittest.TestCase):
     def test_store_conversation_omits_missing_temporal_columns_for_legacy_schema(self):
         cursor = _StaticCursor(fetchone_values=[(88,)])
         conn = _CursorConnection(cursor)
-        self.manager.semantic_engine = types.SimpleNamespace(encode_text=lambda text: [0.0])
+        self.manager.semantic_engine = types.SimpleNamespace(
+            encode_text=lambda text: [0.0],
+            encode_text_with_meta=lambda text: ([0.0], "test-embedding", 1),
+        )
 
         temporal_context = {
             "recorded_at": "2026-03-29T03:49:01+00:00",
