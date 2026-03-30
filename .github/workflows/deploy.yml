@@ -51,17 +51,71 @@ jobs:
             echo ">>> Removing legacy fixed-name containers if present..."
             docker rm -f vessel caddy lysara 2>/dev/null || true
 
+            wait_for_health() {
+              service="$1"
+              timeout_seconds="${2:-180}"
+              start_ts=$(date +%s)
+              deadline=$((start_ts + timeout_seconds))
+
+              while [ "$(date +%s)" -lt "$deadline" ]; do
+                container_id=$(docker compose -f docker-compose.prod.yml ps -q "$service" 2>/dev/null || true)
+                if [ -z "$container_id" ]; then
+                  echo ">>> Waiting for $service container to exist..."
+                  sleep 5
+                  continue
+                fi
+
+                health=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$container_id" 2>/dev/null || true)
+                echo ">>> $service health: ${health:-unknown}"
+
+                case "$health" in
+                  healthy|running)
+                    return 0
+                    ;;
+                  unhealthy|exited|dead)
+                    echo ">>> $service failed health check; dumping logs..."
+                    docker compose -f docker-compose.prod.yml logs --tail=200 "$service" || true
+                    docker inspect "$container_id" || true
+                    return 1
+                    ;;
+                esac
+
+                sleep 5
+              done
+
+              echo ">>> Timed out waiting for $service health."
+              docker compose -f docker-compose.prod.yml ps || true
+              docker compose -f docker-compose.prod.yml logs --tail=200 "$service" || true
+              container_id=$(docker compose -f docker-compose.prod.yml ps -q "$service" 2>/dev/null || true)
+              if [ -n "$container_id" ]; then
+                docker inspect "$container_id" || true
+              fi
+              return 1
+            }
+
             echo ">>> Rebuilding Lysara without cache..."
             docker compose -f docker-compose.prod.yml build --no-cache lysara
 
-            echo ">>> Rebuilding and restarting Vessel + Lysara services..."
-            if ! docker compose -f docker-compose.prod.yml up -d --build --remove-orphans; then
-              echo ">>> Compose startup failed; dumping service state..."
+            echo ">>> Starting Lysara first..."
+            if ! docker compose -f docker-compose.prod.yml up -d --build --remove-orphans lysara; then
+              echo ">>> Lysara startup command failed; dumping service state..."
               docker compose -f docker-compose.prod.yml ps || true
               docker compose -f docker-compose.prod.yml logs --tail=200 lysara vessel || true
               docker inspect sylvessel-lysara-1 || true
               exit 1
             fi
+            wait_for_health lysara 240
+
+            echo ">>> Starting Vessel and Caddy after Lysara is healthy..."
+            if ! docker compose -f docker-compose.prod.yml up -d --build --remove-orphans vessel caddy; then
+              echo ">>> Vessel/Caddy startup command failed; dumping service state..."
+              docker compose -f docker-compose.prod.yml ps || true
+              docker compose -f docker-compose.prod.yml logs --tail=200 lysara vessel caddy || true
+              docker inspect sylvessel-lysara-1 || true
+              docker inspect sylvessel-vessel-1 || true
+              exit 1
+            fi
+            wait_for_health vessel 300
 
             echo ">>> Cleaning up old images..."
             docker system prune -f

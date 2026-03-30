@@ -33,10 +33,10 @@ services:
       - lysara_data:/app/runtime_data
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:18791/api/v1/ops/health')"]
-      interval: 30s
+      interval: 15s
       timeout: 10s
-      retries: 3
-      start_period: 5s
+      retries: 8
+      start_period: 20s
     networks:
       - internal
 
@@ -61,10 +61,10 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/api/health')"]
-      interval: 30s
+      interval: 15s
       timeout: 10s
-      retries: 3
-      start_period: 15s
+      retries: 8
+      start_period: 30s
     networks:
       - internal
 
