@@ -19,6 +19,17 @@ jobs:
           port: 22
           script: |
             set -e
+            cd /opt
+
+            if [ ! -d /opt/Lysara_Investments/.git ]; then
+              echo ">>> Cloning Lysara_Investments..."
+              git clone https://github.com/AustinJR6/Lysarainvestments.git /opt/Lysara_Investments
+            else
+              echo ">>> Pulling latest Lysara_Investments..."
+              cd /opt/Lysara_Investments
+              git pull origin main
+            fi
+
             cd /opt/SylVessel
 
             echo ">>> Pulling latest code..."

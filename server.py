@@ -2812,14 +2812,39 @@ def _flatten_feed_staleness(payload: Dict[str, Any]) -> Dict[str, float]:
     return flat
 
 
-def _refresh_lysara_runtime_from_status(status_payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def _refresh_lysara_runtime_from_status(
+    status_payload: Optional[Dict[str, Any]] = None,
+    runtime_payload: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     status_payload = status_payload or {}
+    runtime_payload = runtime_payload or {}
+    feed_sources = dict(runtime_payload.get("feed_sources") or status_payload.get("feed_sources") or {})
+    feed_staleness = (
+        dict(runtime_payload.get("feed_staleness") or {})
+        or _flatten_feed_staleness(runtime_payload.get("feed_freshness") or {})
+        or _flatten_feed_staleness(status_payload.get("feed_freshness") or {})
+    )
+    recent_decisions = runtime_payload.get("recent_decisions")
+    if recent_decisions is None:
+        recent_decisions = status_payload.get("recent_decisions") or []
+    blocked_reasons = runtime_payload.get("blocked_reasons")
+    if blocked_reasons is None:
+        blocked_reasons = status_payload.get("blocked_reasons") or []
     return _update_lysara_runtime_state(
         {
-            "paused": bool(status_payload.get("paused", False)),
-            "pause_reason": str(status_payload.get("pause_reason") or "").strip(),
-            "feed_sources": dict(status_payload.get("feed_sources") or {}),
-            "feed_staleness": _flatten_feed_staleness(status_payload.get("feed_freshness") or {}),
+            "simulation_mode": bool(runtime_payload.get("simulation_mode", status_payload.get("simulation_mode", _lysara_simulation_enabled()))),
+            "source": str(runtime_payload.get("source") or "sidecar"),
+            "autonomous_enabled": bool(runtime_payload.get("autonomous_enabled", status_payload.get("autonomous_enabled", status_payload.get("autonomous_mode", False)))),
+            "operator_interval_seconds": max(30, min(int(runtime_payload.get("operator_interval_seconds") or status_payload.get("operator_interval_seconds") or _lysara_operator_interval_seconds()), 3600)),
+            "paused": bool(runtime_payload.get("paused", status_payload.get("paused", False))),
+            "pause_reason": str(runtime_payload.get("pause_reason") or status_payload.get("pause_reason") or "").strip(),
+            "last_cycle_at": runtime_payload.get("last_cycle_at") or status_payload.get("last_cycle_at"),
+            "last_decision_at": runtime_payload.get("last_decision_at") or status_payload.get("last_decision_at"),
+            "last_feed_refresh_at": runtime_payload.get("last_feed_refresh_at") or status_payload.get("last_feed_refresh_at"),
+            "recent_decisions": recent_decisions,
+            "blocked_reasons": blocked_reasons,
+            "feed_sources": feed_sources,
+            "feed_staleness": feed_staleness,
         }
     )
 
@@ -2846,8 +2871,18 @@ def _augment_lysara_status_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 def _build_lysara_runtime_payload(status_payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     runtime = _serialize_lysara_runtime_state()
     if status_payload:
+        runtime["simulation_mode"] = bool(status_payload.get("simulation_mode", runtime["simulation_mode"]))
+        runtime["autonomous_enabled"] = bool(status_payload.get("autonomous_enabled", status_payload.get("autonomous_mode", runtime["autonomous_enabled"])))
         runtime["paused"] = bool(status_payload.get("paused", runtime.get("paused", False)))
         runtime["pause_reason"] = str(status_payload.get("pause_reason") or runtime.get("pause_reason") or "").strip()
+        runtime["last_cycle_at"] = status_payload.get("last_cycle_at") or runtime.get("last_cycle_at")
+        runtime["last_decision_at"] = status_payload.get("last_decision_at") or runtime.get("last_decision_at")
+        runtime["recent_decisions"] = _normalize_recent_lysara_decisions(status_payload.get("recent_decisions") or runtime.get("recent_decisions") or [])
+        runtime["blocked_reasons"] = [
+            str(item).strip()
+            for item in (status_payload.get("blocked_reasons") or runtime.get("blocked_reasons") or [])
+            if str(item).strip()
+        ][:12]
         runtime["feed_sources"] = dict(status_payload.get("feed_sources") or runtime.get("feed_sources") or {})
         runtime["feed_staleness"] = _flatten_feed_staleness(status_payload.get("feed_freshness") or {}) or runtime.get("feed_staleness") or {}
     return runtime
@@ -2920,12 +2955,15 @@ def _refresh_lysara_feeds_now(force: bool = True) -> Dict[str, Any]:
         raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
     snapshot = dict((payload or {}).get("snapshot") or {})
     _mirror_lysara_payload("get_market_snapshot", snapshot)
-    runtime_delta = {
-        "last_feed_refresh_at": datetime.now(timezone.utc).isoformat(),
-        "feed_sources": dict(snapshot.get("feed_sources") or {}),
-        "feed_staleness": _flatten_feed_staleness(snapshot.get("feed_freshness") or {}),
-    }
-    _update_lysara_runtime_state(runtime_delta)
+    runtime_delta = dict((payload or {}).get("runtime") or {})
+    runtime_delta.update(
+        {
+            "last_feed_refresh_at": datetime.now(timezone.utc).isoformat(),
+            "feed_sources": dict(snapshot.get("feed_sources") or runtime_delta.get("feed_sources") or {}),
+            "feed_staleness": _flatten_feed_staleness(snapshot.get("feed_freshness") or {}) or dict(runtime_delta.get("feed_staleness") or {}),
+        }
+    )
+    _refresh_lysara_runtime_from_status(runtime_payload=runtime_delta)
     return payload
 
 
@@ -14436,6 +14474,15 @@ def _lysara_proxy(callable_name: str, *args, **kwargs) -> Dict[str, Any]:
             state.lysara_last_status = payload
             _refresh_lysara_runtime_from_status(payload)
             payload = _augment_lysara_status_payload(payload)
+        elif callable_name in {"get_runtime", "update_runtime"}:
+            _refresh_lysara_runtime_from_status(runtime_payload=payload)
+            payload = _build_lysara_runtime_payload(state.lysara_last_status if isinstance(state.lysara_last_status, dict) else None)
+        elif callable_name == "run_operator_cycle":
+            runtime_payload = dict((payload or {}).get("runtime") or {})
+            status_payload = dict((payload or {}).get("status_payload") or {})
+            if status_payload:
+                state.lysara_last_status = status_payload
+            _refresh_lysara_runtime_from_status(status_payload=status_payload, runtime_payload=runtime_payload)
         elif callable_name == "refresh_feeds":
             snapshot = dict((payload or {}).get("snapshot") or {})
             _update_lysara_runtime_state(
@@ -14781,148 +14828,53 @@ async def _run_lysara_operator_cycle() -> None:
     client = _get_lysara_client()
     if client is None:
         return
-    cycle_blocked: List[str] = []
+    sync_blocked: List[str] = []
     try:
         status = client.get_status()
+        runtime_payload: Dict[str, Any] = {}
         state.lysara_last_status = status
         _mirror_lysara_payload("get_status", status)
-        _refresh_lysara_runtime_from_status(status)
-        _update_lysara_runtime_state({"last_cycle_at": datetime.now(timezone.utc).isoformat()})
-        if not _lysara_autonomous_enabled():
-            cycle_blocked.append("autonomous_disabled")
-            _set_lysara_blocked_reasons(cycle_blocked)
-            return
-        if bool(status.get("paused")):
-            cycle_blocked.append(str(status.get("pause_reason") or "trading_paused") or "trading_paused")
-            _set_lysara_blocked_reasons(cycle_blocked)
-            return
         try:
             refresh_payload = client.refresh_feeds()
             snapshot_from_refresh = dict((refresh_payload or {}).get("snapshot") or {})
             if snapshot_from_refresh:
                 _mirror_lysara_payload("get_market_snapshot", snapshot_from_refresh)
-                _update_lysara_runtime_state(
+                runtime_payload = dict((refresh_payload or {}).get("runtime") or {})
+                runtime_payload.update(
                     {
                         "last_feed_refresh_at": datetime.now(timezone.utc).isoformat(),
-                        "feed_sources": dict(snapshot_from_refresh.get("feed_sources") or {}),
-                        "feed_staleness": _flatten_feed_staleness(snapshot_from_refresh.get("feed_freshness") or {}),
+                        "feed_sources": dict(snapshot_from_refresh.get("feed_sources") or runtime_payload.get("feed_sources") or {}),
+                        "feed_staleness": _flatten_feed_staleness(snapshot_from_refresh.get("feed_freshness") or {}) or dict(runtime_payload.get("feed_staleness") or {}),
                     }
                 )
         except LysaraOpsError as exc:
-            cycle_blocked.append(f"feed_refresh_failed:{exc.message}")
+            sync_blocked.append(f"feed_refresh_failed:{exc.message}")
+        try:
+            latest_status = client.get_status()
+            state.lysara_last_status = latest_status
+            status = latest_status
+            _mirror_lysara_payload("get_status", latest_status)
+        except LysaraOpsError as exc:
+            sync_blocked.append(f"status_refresh_failed:{exc.message}")
+        try:
+            latest_runtime = client.get_runtime()
+            runtime_payload = {**runtime_payload, **dict(latest_runtime or {})}
+        except LysaraOpsError as exc:
+            sync_blocked.append(f"runtime_sync_failed:{exc.message}")
+        _refresh_lysara_runtime_from_status(status, runtime_payload)
         _run_lysara_sync_pass(client, status_payload=status)
-        guard = _autonomous_guard_status()
-        if not guard["ok"]:
-            cycle_blocked.extend([str(reason) for reason in (guard.get("reasons") or []) if str(reason).strip()])
-            _lysara_record_journal(
-                {
-                    "mode": "autonomous",
-                    "action": "autonomous_blocked",
-                    "status": "blocked",
-                    "market": "all",
-                    "summary": "Autonomous trading blocked by guard",
-                    "details": {"reasons": guard["reasons"], "guard": guard},
-                }
-            )
-            _set_lysara_blocked_reasons(cycle_blocked)
-            return
-        market_snapshot = client.get_market_snapshot()
-        _mirror_lysara_payload("get_market_snapshot", market_snapshot)
-        snapshot_prices = (market_snapshot or {}).get("prices") or {}
-        candidate_targets = _get_enabled_lysara_strategy_targets(client)
-        if not candidate_targets:
-            candidate_targets = [
-                {
-                    "market": "crypto" if "-" in str(symbol) else "stocks",
-                    "strategy_key": None,
-                    "symbol": str(symbol).strip().upper(),
-                }
-                for symbol in list(snapshot_prices.keys())[:4]
-                if str(symbol).strip()
-            ]
-        if not candidate_targets:
-            cycle_blocked.append("no_enabled_strategy_symbols")
-            _set_lysara_blocked_reasons(cycle_blocked)
-            return
-        for target in candidate_targets[:4]:
-            symbol = str(target.get("symbol") or "").strip().upper()
-            market = str(target.get("market") or ("crypto" if "-" in symbol else "stocks")).strip().lower()
-            strategy_key = _normalize_lysara_strategy_key(target.get("strategy_key"))
-            query = f"{symbol} latest market news trend"
-            search_payload = await asyncio.to_thread(_run_web_search, query, 4)
-            research = _lysara_research_summary(query, search_payload)
-            _lysara_record_research(
-                {
-                    "actor": "sylana",
-                    "market": market,
-                    "symbol": symbol,
-                    "summary": research["summary"],
-                    "bullish_factors": research["bullish_factors"],
-                    "bearish_factors": research["bearish_factors"],
-                    "confidence": research["confidence"],
-                    "horizon": "intraday",
-                    "sources": research["sources"],
-                    "stale_after": (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat(),
-                }
-            )
-            journal_payload = {
-                "mode": "autonomous",
-                "action": "market_monitor",
-                "status": "observed",
-                "market": market,
-                "symbol": symbol,
-                "summary": research["summary"],
-                "details": {"sources": research["sources"], "confidence": research["confidence"], "strategy_key": strategy_key},
-            }
-            if research["confidence"] < 0.55:
-                cycle_blocked.append(f"{symbol}:confidence_below_threshold")
-                _record_lysara_runtime_decision(
-                    symbol=symbol,
-                    market=market,
-                    strategy_key=strategy_key,
-                    action="observe",
-                    status="skipped",
-                    confidence=research["confidence"],
-                    reasons=["confidence_below_threshold"],
-                )
-            else:
-                side = "buy" if len(research["bullish_factors"]) >= len(research["bearish_factors"]) else "sell"
-                execution = _submit_lysara_trade_intent_with_policy(
-                    {
-                        "actor": "sylana",
-                        "source": "autonomous_monitor",
-                        "market": market,
-                        "symbol": symbol,
-                        "side": side,
-                        "thesis": research["summary"],
-                        "confidence": research["confidence"],
-                        "size_hint": 0.05,
-                        "time_horizon": "intraday",
-                    },
-                    autonomous=True,
-                )
-                execution_status = str(execution.get("status") or "submitted")
-                journal_payload["action"] = "submit_trade_intent"
-                journal_payload["status"] = execution_status
-                journal_payload["details"]["execution"] = execution
-                if execution_status in {"submitted", "filled"}:
-                    cycle_blocked = [reason for reason in cycle_blocked if not reason.startswith(f"{symbol}:")]
-                else:
-                    cycle_blocked.extend([f"{symbol}:{reason}" for reason in (execution.get("risk") or {}).get("reasons", [])])
-                _record_lysara_runtime_decision(
-                    symbol=symbol,
-                    market=market,
-                    strategy_key=strategy_key,
-                    action=side,
-                    status=execution_status,
-                    confidence=research["confidence"],
-                    reasons=[str(reason) for reason in ((execution.get("risk") or {}).get("reasons") or []) if str(reason).strip()],
-                )
-            _lysara_record_journal(journal_payload)
-        _set_lysara_blocked_reasons(cycle_blocked)
+        merged_reasons = [
+            str(item).strip()
+            for item in (runtime_payload.get("blocked_reasons") or status.get("blocked_reasons") or [])
+            if str(item).strip()
+        ]
+        for reason in sync_blocked:
+            if reason not in merged_reasons:
+                merged_reasons.append(reason)
+        _set_lysara_blocked_reasons(merged_reasons)
     except Exception as exc:
-        logger.warning("Lysara operator cycle failed: %s", exc)
-        _set_lysara_blocked_reasons([f"operator_cycle_failed:{exc}"])
+        logger.warning("Lysara operator sync cycle failed: %s", exc)
+        _set_lysara_blocked_reasons([f"operator_sync_failed:{exc}"])
 
 
 async def _lysara_operator_loop() -> None:
@@ -15200,40 +15152,80 @@ async def lysara_guard_status(symbol: str = "", market: str = "", side: str = ""
 
 @lysara_router.get("/runtime")
 async def lysara_runtime():
+    client = _lysara_client_or_503()
     status_payload: Optional[Dict[str, Any]] = None
+    runtime_payload: Optional[Dict[str, Any]] = None
     try:
-        status_payload = _lysara_proxy("get_status")
-    except HTTPException:
+        status_payload = client.get_status()
+        state.lysara_last_status = status_payload
+        _mirror_lysara_payload("get_status", status_payload)
+    except LysaraOpsError:
         status_payload = None
+    try:
+        runtime_payload = client.get_runtime()
+    except LysaraOpsError as exc:
+        if status_payload is None:
+            raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+        runtime_payload = None
+    _refresh_lysara_runtime_from_status(status_payload, runtime_payload)
     return JSONResponse(content=_build_lysara_runtime_payload(status_payload))
 
 
 @lysara_router.put("/runtime")
 async def lysara_runtime_update(payload: LysaraRuntimeUpdateRequest):
-    delta: Dict[str, Any] = {"source": "runtime_api"}
+    client = _lysara_client_or_503()
+    request_payload: Dict[str, Any] = {"actor": payload.actor}
     if payload.simulation_mode is not None:
-        delta["simulation_mode"] = bool(payload.simulation_mode)
+        request_payload["simulation_mode"] = bool(payload.simulation_mode)
     if payload.autonomous_enabled is not None:
-        delta["autonomous_enabled"] = bool(payload.autonomous_enabled)
+        request_payload["autonomous_enabled"] = bool(payload.autonomous_enabled)
     if payload.operator_interval_seconds is not None:
-        delta["operator_interval_seconds"] = max(30, min(int(payload.operator_interval_seconds), 3600))
-    runtime = _update_lysara_runtime_state(delta)
-    return JSONResponse(content={**_serialize_lysara_runtime_state(runtime), "actor": payload.actor})
+        request_payload["operator_interval_seconds"] = max(30, min(int(payload.operator_interval_seconds), 3600))
+    try:
+        runtime_payload = client.update_runtime(request_payload)
+    except LysaraOpsError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+    status_payload: Optional[Dict[str, Any]] = None
+    try:
+        status_payload = client.get_status()
+        state.lysara_last_status = status_payload
+        _mirror_lysara_payload("get_status", status_payload)
+    except LysaraOpsError:
+        status_payload = None
+    _refresh_lysara_runtime_from_status(status_payload, runtime_payload)
+    return JSONResponse(content={**_build_lysara_runtime_payload(status_payload), "actor": payload.actor})
 
 
 @lysara_router.post("/operator/run-now")
 async def lysara_operator_run_now():
-    await _run_lysara_operator_cycle()
-    status_payload: Optional[Dict[str, Any]] = None
+    client = _lysara_client_or_503()
     try:
-        status_payload = _lysara_proxy("get_status")
-    except HTTPException:
-        status_payload = None
+        cycle_response = client.run_operator_cycle()
+    except LysaraOpsError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+    status_payload: Optional[Dict[str, Any]] = dict((cycle_response or {}).get("status_payload") or {})
+    runtime_payload: Optional[Dict[str, Any]] = dict((cycle_response or {}).get("runtime") or {})
+    if not status_payload:
+        try:
+            status_payload = client.get_status()
+            state.lysara_last_status = status_payload
+            _mirror_lysara_payload("get_status", status_payload)
+        except LysaraOpsError:
+            status_payload = None
+    if not runtime_payload:
+        try:
+            runtime_payload = client.get_runtime()
+        except LysaraOpsError:
+            runtime_payload = None
+    _refresh_lysara_runtime_from_status(status_payload, runtime_payload)
+    if status_payload:
+        _run_lysara_sync_pass(client, status_payload=status_payload)
     return JSONResponse(
         content={
             "status": "completed",
             "runtime": _build_lysara_runtime_payload(status_payload),
-            "status_payload": status_payload,
+            "status_payload": _augment_lysara_status_payload(status_payload or {}),
+            "sidecar": cycle_response or {},
         }
     )
 
@@ -15241,25 +15233,43 @@ async def lysara_operator_run_now():
 @lysara_router.post("/feeds/refresh")
 async def lysara_refresh_feeds():
     payload = _refresh_lysara_feeds_now(force=True)
+    client = _get_lysara_client()
+    status_payload: Optional[Dict[str, Any]] = None
+    if client is not None:
+        try:
+            status_payload = client.get_status()
+            state.lysara_last_status = status_payload
+            _mirror_lysara_payload("get_status", status_payload)
+        except LysaraOpsError:
+            status_payload = None
     return JSONResponse(
         content={
             **payload,
-            "runtime": _serialize_lysara_runtime_state(),
+            "runtime": _build_lysara_runtime_payload(status_payload),
         }
     )
 
 
 @lysara_router.post("/emergency-stop")
 async def lysara_emergency_stop(payload: LysaraEmergencyStopRequest):
-    response = _lysara_proxy("pause_trading", payload.reason, payload.market, payload.actor)
-    runtime = _update_lysara_runtime_state(
-        {
-            "autonomous_enabled": False,
-            "paused": True,
-            "pause_reason": payload.reason,
-            "source": "emergency_stop",
-        }
-    )
+    client = _lysara_client_or_503()
+    try:
+        response = client.pause_trading(payload.reason, payload.market, payload.actor)
+    except LysaraOpsError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+    runtime_payload: Dict[str, Any] = {}
+    try:
+        runtime_payload = client.update_runtime({"actor": payload.actor, "autonomous_enabled": False})
+    except LysaraOpsError as exc:
+        logger.warning("Failed to disable Lysara autonomous mode during emergency stop: %s", exc.message)
+    status_payload: Optional[Dict[str, Any]] = None
+    try:
+        status_payload = client.get_status()
+        state.lysara_last_status = status_payload
+        _mirror_lysara_payload("get_status", status_payload)
+    except LysaraOpsError:
+        status_payload = None
+    _refresh_lysara_runtime_from_status(status_payload, runtime_payload)
     _record_lysara_runtime_decision(
         symbol=None,
         market=payload.market,
@@ -15269,17 +15279,35 @@ async def lysara_emergency_stop(payload: LysaraEmergencyStopRequest):
         confidence=1.0,
         reasons=[payload.reason],
     )
-    return JSONResponse(content={"status": "emergency_stopped", "response": response, "runtime": _serialize_lysara_runtime_state(runtime)})
-
+    return JSONResponse(
+        content={
+            "status": "emergency_stopped",
+            "response": response,
+            "runtime": _build_lysara_runtime_payload(status_payload),
+        }
+    )
 
 @lysara_router.get("/runtime-mode")
 async def lysara_runtime_mode():
-    return JSONResponse(content=_serialize_lysara_runtime_state())
+    return await lysara_runtime()
 
 
 @lysara_router.post("/runtime-mode")
 async def lysara_runtime_mode_update(payload: LysaraRuntimeModeUpdateRequest):
-    updated = _set_lysara_simulation_mode(payload.simulation_mode)
+    client = _lysara_client_or_503()
+    try:
+        runtime_payload = client.update_runtime({"simulation_mode": payload.simulation_mode, "actor": payload.actor})
+    except LysaraOpsError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
+    status_payload: Optional[Dict[str, Any]] = None
+    try:
+        status_payload = client.get_status()
+        state.lysara_last_status = status_payload
+        _mirror_lysara_payload("get_status", status_payload)
+    except LysaraOpsError:
+        status_payload = None
+    _refresh_lysara_runtime_from_status(status_payload, runtime_payload)
+    updated = _build_lysara_runtime_payload(status_payload)
     logger.info("Lysara simulation mode set to %s by %s", updated["simulation_mode"], payload.actor)
     return JSONResponse(content={**updated, "actor": payload.actor})
 

@@ -15,14 +15,15 @@
 services:
   lysara:
     build:
-      context: .
-      dockerfile: docker/lysara/Dockerfile
+      context: ../Lysara_Investments
+      dockerfile: Dockerfile
     restart: unless-stopped
     env_file: .env
     environment:
-      - MOCK_LYSARA_HOST=0.0.0.0
-      - MOCK_LYSARA_PORT=18791
-      - MOCK_LYSARA_STATE_PATH=/app/data/mock_lysara_state.json
+      - CONTROL_API_HOST=0.0.0.0
+      - CONTROL_API_PORT=18791
+      - SIMULATION_MODE=${LYSARA_SIMULATION_MODE:-true}
+      - ALLOW_LIVE_TRADING_STARTUP=true
     expose:
       - "18791"
     volumes:

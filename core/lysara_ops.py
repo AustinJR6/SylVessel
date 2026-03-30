@@ -89,6 +89,12 @@ class LysaraOpsClient:
     def get_status(self) -> Dict[str, Any]:
         return self._request("GET", "/api/v1/ops/status", expected={200})
 
+    def get_runtime(self) -> Dict[str, Any]:
+        return self._request("GET", "/api/v1/ops/runtime", expected={200})
+
+    def update_runtime(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return self._request("PUT", "/api/v1/ops/runtime", payload=payload, expected={200})
+
     def get_portfolio(self) -> Dict[str, Any]:
         return self._request("GET", "/api/v1/ops/portfolio", expected={200})
 
@@ -118,6 +124,9 @@ class LysaraOpsClient:
 
     def refresh_feeds(self) -> Dict[str, Any]:
         return self._request("POST", "/api/v1/ops/refresh-feeds", payload={}, expected={200})
+
+    def run_operator_cycle(self) -> Dict[str, Any]:
+        return self._request("POST", "/api/v1/ops/operator/run-now", payload={}, expected={200})
 
     def get_strategies(self) -> Dict[str, Any]:
         return self._request("GET", "/api/v1/ops/strategies", expected={200})
