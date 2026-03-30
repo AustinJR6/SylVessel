@@ -7,6 +7,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     CONTROL_API_HOST=0.0.0.0 \
     CONTROL_API_PORT=18791
 
+ARG CACHE_BUST=dev
+
 WORKDIR /app
 
 COPY requirements.txt /app/requirements.txt

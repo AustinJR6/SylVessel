@@ -23,6 +23,7 @@ jobs:
 
             echo ">>> Pulling latest code..."
             git pull origin main
+            export LYSARA_BUILD_SHA=$(git rev-parse HEAD)
 
             echo ">>> Cleaning stale vendored Lysara artifacts..."
             rm -rf /opt/SylVessel/vendor/Lysara_Investments/.git || true
@@ -50,8 +51,17 @@ jobs:
             echo ">>> Removing legacy fixed-name containers if present..."
             docker rm -f vessel caddy lysara 2>/dev/null || true
 
+            echo ">>> Rebuilding Lysara without cache..."
+            docker compose -f docker-compose.prod.yml build --no-cache lysara
+
             echo ">>> Rebuilding and restarting Vessel + Lysara services..."
-            docker compose -f docker-compose.prod.yml up -d --build --remove-orphans
+            if ! docker compose -f docker-compose.prod.yml up -d --build --remove-orphans; then
+              echo ">>> Compose startup failed; dumping service state..."
+              docker compose -f docker-compose.prod.yml ps || true
+              docker compose -f docker-compose.prod.yml logs --tail=200 lysara vessel || true
+              docker inspect sylvessel-lysara-1 || true
+              exit 1
+            fi
 
             echo ">>> Cleaning up old images..."
             docker system prune -f

@@ -17,6 +17,8 @@ services:
     build:
       context: ./vendor/Lysara_Investments
       dockerfile: Dockerfile
+      args:
+        CACHE_BUST: ${LYSARA_BUILD_SHA:-dev}
     restart: unless-stopped
     env_file: .env
     environment:
