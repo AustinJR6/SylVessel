@@ -1,0 +1,30 @@
+{
+  "trade_symbols": ["EUR_USD", "GBP_USD", "USD_JPY"],
+  "min_trade_size": {
+    "EUR_USD": 1000,
+    "GBP_USD": 1000,
+    "USD_JPY": 1000
+  },
+  "trade_precision": {
+    "EUR_USD": 2,
+    "GBP_USD": 2,
+    "USD_JPY": 2
+  },
+  "risk_per_trade": 0.01,
+  "max_drawdown": 0.15,
+  "max_daily_loss": -300,
+  "market_poll_interval_seconds": 60,
+  "ai_review_interval_seconds": 900,
+  "ai_decision_cache_ttl_seconds": 3600,
+  "atr_period": 14,
+  "strategies": [
+    {
+      "type": "rsi_trend",
+      "trade_symbols": ["EUR_USD", "GBP_USD"]
+    },
+    {
+      "type": "rsi_trend",
+      "trade_symbols": ["USD_JPY"]
+    }
+  ]
+}

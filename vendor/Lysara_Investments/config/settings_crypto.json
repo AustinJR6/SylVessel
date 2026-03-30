@@ -1,0 +1,42 @@
+{
+  "trade_symbols": [
+    "BTC-USD",
+    "ETH-USD",
+    "SOL-USD",
+    "ADA-USD"
+  ],
+  "min_trade_size": {
+    "BTC-USD": 0.0001,
+    "ETH-USD": 0.001,
+    "SOL-USD": 0.01,
+    "ADA-USD": 1
+  },
+  "trade_precision": {
+    "BTC-USD": 6,
+    "ETH-USD": 6,
+    "SOL-USD": 4,
+    "ADA-USD": 2
+  },
+  "risk_per_trade": 0.045,
+  "max_position_value_pct": 0.2,
+  "max_drawdown": 0.2,
+  "max_daily_loss": -200,
+  "market_poll_interval_seconds": 15,
+  "ai_review_interval_seconds": 300,
+  "ai_decision_cache_ttl_seconds": 1800,
+  "trade_cooldown_seconds": 180,
+  "stop_loss_pct": 0.02,
+  "take_profit_pct": 0.04,
+  "atr_period": 14,
+  "volatility_multiplier": 3,
+  "strategies": [
+    {
+      "type": "momentum",
+      "trade_symbols": ["BTC-USD", "ETH-USD"]
+    },
+    {
+      "type": "momentum",
+      "trade_symbols": ["SOL-USD", "ADA-USD"]
+    }
+  ]
+}

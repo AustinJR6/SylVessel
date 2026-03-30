@@ -1,0 +1,32 @@
+{
+  "trade_symbols": ["AAPL", "MSFT", "GOOG", "AMZN"],
+  "min_trade_size": {
+    "AAPL": 1,
+    "MSFT": 1,
+    "GOOG": 1,
+    "AMZN": 1
+  },
+  "trade_precision": {
+    "AAPL": 0,
+    "MSFT": 0,
+    "GOOG": 0,
+    "AMZN": 0
+  },
+  "risk_per_trade": 0.01,
+  "max_drawdown": 0.1,
+  "max_daily_loss": -500,
+  "market_poll_interval_seconds": 60,
+  "ai_review_interval_seconds": 900,
+  "ai_decision_cache_ttl_seconds": 3600,
+  "moving_average_period": 20,
+  "strategies": [
+    {
+      "type": "stock_momentum",
+      "trade_symbols": ["AAPL", "MSFT"]
+    },
+    {
+      "type": "stock_momentum",
+      "trade_symbols": ["GOOG", "AMZN"]
+    }
+  ]
+}

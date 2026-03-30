@@ -24,18 +24,6 @@ jobs:
             echo ">>> Pulling latest code..."
             git pull origin main
 
-            mkdir -p /opt/SylVessel/vendor
-
-            if [ ! -d /opt/SylVessel/vendor/Lysara_Investments/.git ]; then
-              echo ">>> Cloning Lysara_Investments..."
-              git clone https://github.com/AustinJR6/LysaraInvestments.git /opt/SylVessel/vendor/Lysara_Investments
-            else
-              echo ">>> Pulling latest Lysara_Investments..."
-              cd /opt/SylVessel/vendor/Lysara_Investments
-              git pull origin main
-              cd /opt/SylVessel
-            fi
-
             if [ -n "${{ secrets.MAINTENANCE_READ_TOKEN }}" ]; then
               echo ">>> Syncing maintenance read token into backend env..."
               export MAINTENANCE_READ_TOKEN_VALUE='${{ secrets.MAINTENANCE_READ_TOKEN }}'

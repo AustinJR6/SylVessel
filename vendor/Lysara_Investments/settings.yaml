@@ -1,0 +1,18 @@
+# Default configuration for Lysara Investments AI Trading Engine
+
+sentiment:
+  twitter_half_life: 6  # hours
+  reddit_half_life: 12  # hours
+  news_half_life: 24  # hours
+  macro_suppression: 0.2
+  whitelist: []
+  blacklist: []
+
+risk:
+  max_daily_loss_pct: 5
+  drawdown_disable_pct: 20
+
+trading:
+  tickers: ["AAPL", "MSFT", "TSLA"]
+  position_size_pct: 0.02
+
