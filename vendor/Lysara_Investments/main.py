@@ -75,13 +75,16 @@ async def main():
     runtime_overrides = get_runtime_store().get_runtime()
     state.apply_runtime_overrides(runtime_overrides)
 
-    launcher = BotLauncher(config)
-    launcher.start_all_bots()
-
     # Start Tier 2 Control API unless explicitly disabled
     if not args.no_control_api:
         port = int(os.getenv("CONTROL_API_PORT", "18791"))
         asyncio.create_task(_start_control_api(port))
+
+    launcher = BotLauncher(config)
+    try:
+        launcher.start_all_bots()
+    except Exception as exc:
+        logging.error("Bot bootstrap failed: %s", exc)
 
     try:
         while True:
