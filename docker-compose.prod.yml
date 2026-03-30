@@ -32,7 +32,7 @@ services:
     volumes:
       - lysara_data:/app/runtime_data
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:18791/api/v1/ops/health')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18791/api/v1/ops/health')"]
       interval: 15s
       timeout: 10s
       retries: 8
@@ -60,7 +60,7 @@ services:
       lysara:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/api/health')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/health')"]
       interval: 15s
       timeout: 10s
       retries: 8
