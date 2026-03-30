@@ -65,6 +65,8 @@ data/*.log
 huggingface_cache/
 torch_cache/
 models/
+!vendor/Lysara_Investments/db/models/
+!vendor/Lysara_Investments/db/models/*.py
 nul
 
 # Jupyter Notebooks
