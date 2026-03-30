@@ -18,7 +18,11 @@ _API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
 def _require_auth(key: str = Security(_API_KEY_HEADER)) -> str:
-    secret = os.getenv("CONTROL_API_SECRET", "").strip()
+    secret = (
+        os.getenv("CONTROL_API_SECRET", "")
+        or os.getenv("LYSARA_CONTROL_SECRET", "")
+        or os.getenv("LYSARA_OPS_API_KEY", "")
+    ).strip()
     if not secret:
         raise HTTPException(status_code=503, detail="CONTROL_API_SECRET is not configured")
     if not key:
