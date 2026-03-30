@@ -15,7 +15,7 @@
 services:
   lysara:
     build:
-      context: ../Lysara_Investments
+      context: ./vendor/Lysara_Investments
       dockerfile: Dockerfile
     restart: unless-stopped
     env_file: .env
