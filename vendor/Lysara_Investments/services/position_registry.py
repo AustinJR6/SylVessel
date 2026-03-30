@@ -6,6 +6,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from utils.runtime_paths import env_or_runtime_path
+
 
 @dataclass
 class RegisteredPosition:
@@ -21,8 +23,8 @@ class RegisteredPosition:
 
 
 class PositionRegistry:
-    def __init__(self, path: str | Path = "data/position_registry.json") -> None:
-        self.path = Path(path)
+    def __init__(self, path: str | Path | None = None) -> None:
+        self.path = Path(path) if path else env_or_runtime_path("POSITION_REGISTRY_PATH", "position_registry.json")
         self._lock = threading.RLock()
         self._positions: dict[str, RegisteredPosition] = {}
         self._load()

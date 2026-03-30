@@ -4,6 +4,8 @@ import asyncio
 import logging
 import os
 
+from utils.runtime_paths import env_or_runtime_path
+
 
 async def _run_strategy_rebalance_loop(meta_router, strategy_instances, interval_seconds=3600):
     """Hourly: update MetaStrategyRouter with performance data, adjust position size caps."""
@@ -66,7 +68,7 @@ class BotLauncher:
                 self.config.setdefault("stocks_settings", {}).setdefault(
                     "trade_symbols", stocks
                 )
-        self.db = DatabaseManager(config.get("db_path", "trades.db"))
+        self.db = DatabaseManager(config.get("db_path") or str(env_or_runtime_path("DB_PATH", "trades.db")))
         state = get_state()
         state.register_db_manager(self.db)
         state.set_runtime_config(config)
@@ -74,9 +76,7 @@ class BotLauncher:
         self.sim_portfolio = None
         if self.config.get("simulation_mode", True):
             starting = self.config.get("starting_balance", 1000.0)
-            state_file = self.config.get(
-                "sim_state_file", "data/sim_state.json"
-            )
+            state_file = self.config.get("sim_state_file")
             self.sim_portfolio = SimulatedPortfolio(
                 starting_balance=starting, state_file=state_file
             )

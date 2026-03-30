@@ -4,6 +4,7 @@ from pathlib import Path
 from datetime import datetime
 
 from data.price_cache import get_price
+from utils.runtime_paths import env_or_runtime_path
 
 class SimulatedPortfolio:
     """Simple portfolio tracker for simulation mode."""
@@ -11,11 +12,11 @@ class SimulatedPortfolio:
     def __init__(
         self,
         starting_balance: float = 1000.0,
-        state_file: str = "data/sim_state.json",
-        trades_file: str = "data/simulated_trades.json",
+        state_file: str | None = None,
+        trades_file: str | None = None,
     ):
-        self.state_file = Path(state_file)
-        self.trades_file = Path(trades_file)
+        self.state_file = Path(state_file) if state_file else env_or_runtime_path("SIM_STATE_FILE", "sim_state.json")
+        self.trades_file = Path(trades_file) if trades_file else env_or_runtime_path("SIM_TRADES_FILE", "simulated_trades.json")
         self.starting_balance = starting_balance
         self.current_balance = starting_balance
         self.open_positions: dict[str, float] = {}

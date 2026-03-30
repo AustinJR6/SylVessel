@@ -24,12 +24,13 @@ services:
     environment:
       - CONTROL_API_HOST=0.0.0.0
       - CONTROL_API_PORT=18791
+      - LYSARA_RUNTIME_DIR=/app/runtime_data
       - SIMULATION_MODE=${LYSARA_SIMULATION_MODE:-true}
       - ALLOW_LIVE_TRADING_STARTUP=true
     expose:
       - "18791"
     volumes:
-      - lysara_data:/app/data
+      - lysara_data:/app/runtime_data
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:18791/api/v1/ops/health')"]
       interval: 30s

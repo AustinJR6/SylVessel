@@ -8,10 +8,12 @@ from typing import Any
 from urllib.parse import quote
 from urllib.request import urlopen
 
+from utils.runtime_paths import get_runtime_dir
+
 
 def _history_path(symbol: str) -> Path:
     safe = str(symbol or "").strip().upper().replace("/", "_")
-    return Path("data") / "daily_history" / f"{safe}.json"
+    return get_runtime_dir() / "daily_history" / f"{safe}.json"
 
 
 def fetch_daily_history(symbol: str, range_label: str = "6mo", interval: str = "1d") -> list[dict[str, Any]]:

@@ -6,6 +6,7 @@ from pathlib import Path
 from datetime import datetime
 import asyncio
 from .notifications import send_slack_message
+from .runtime_paths import env_or_runtime_path
 
 async def log_live_trade(
     symbol: str,
@@ -19,11 +20,12 @@ async def log_live_trade(
 ):
     """Append live trade details to log file and send Slack alert."""
     log_line = f"{datetime.utcnow().isoformat()} {symbol} {side} {qty} @ {price}"
-    Path("logs").mkdir(exist_ok=True)
-    with open("logs/trade_log.txt", "a") as f:
+    log_path = env_or_runtime_path("TRADE_LOG_PATH", "logs", "trade_log.txt")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_path, "a") as f:
         f.write(log_line + "\n")
 
-    db_path = Path("data/trade_logs.db")
+    db_path = env_or_runtime_path("TRADE_LOG_DB_PATH", "trade_logs.db")
     try:
         db_path.parent.mkdir(exist_ok=True)
         conn = sqlite3.connect(db_path)

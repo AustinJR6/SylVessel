@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from data.price_cache import get_price
+from utils.runtime_paths import env_or_runtime_path
 
 
 @dataclass
@@ -36,12 +37,12 @@ class PriceTriggerService:
         crypto_api=None,
         sim_portfolio=None,
         simulation_mode: bool = True,
-        path: str | Path = "data/price_triggers.json",
+        path: str | Path | None = None,
     ) -> None:
         self.crypto_api = crypto_api
         self.sim_portfolio = sim_portfolio
         self.simulation_mode = bool(simulation_mode)
-        self.path = Path(path)
+        self.path = Path(path) if path else env_or_runtime_path("PRICE_TRIGGERS_PATH", "price_triggers.json")
         self._lock = threading.RLock()
         self._prices: dict[str, float] = {}
         self._triggers: dict[str, PriceTrigger] = {}

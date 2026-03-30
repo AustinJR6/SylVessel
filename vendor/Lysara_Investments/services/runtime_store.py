@@ -6,6 +6,8 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+from utils.runtime_paths import env_or_runtime_path
+
 
 _DEFAULT_PAYLOAD: dict[str, Any] = {
     "runtime": {
@@ -22,8 +24,8 @@ _DEFAULT_PAYLOAD: dict[str, Any] = {
 
 
 class RuntimeStore:
-    def __init__(self, path: str | Path = "data/runtime_store.json") -> None:
-        self.path = Path(path)
+    def __init__(self, path: str | Path | None = None) -> None:
+        self.path = Path(path) if path else env_or_runtime_path("RUNTIME_STORE_PATH", "runtime_store.json")
         self._lock = threading.RLock()
         self._payload: dict[str, Any] = self._load()
 

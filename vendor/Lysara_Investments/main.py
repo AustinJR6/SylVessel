@@ -59,7 +59,7 @@ async def main():
 
     setup_logging(
         level=config.get("log_level", "INFO"),
-        log_file_path=config.get("log_file_path", "logs/trading_bot.log")
+        log_file_path=config.get("log_file_path")
     )
 
     logging.info("Lysara Investments booting up...")

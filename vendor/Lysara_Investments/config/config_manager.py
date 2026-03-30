@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
+from utils.runtime_paths import runtime_path
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -110,7 +111,7 @@ class ConfigManager:
             "ops_max_total_gross_exposure_pct": float(env.get("OPS_MAX_TOTAL_GROSS_EXPOSURE_PCT", "100")),
             "position_sizing_max_kelly_fraction": float(env.get("POSITION_SIZING_MAX_KELLY_FRACTION", "0.25")),
             "position_sizing_min_history_trades": int(env.get("POSITION_SIZING_MIN_HISTORY_TRADES", "8")),
-            "event_risk_file": env.get("EVENT_RISK_FILE", "dashboard/data/event_risk_cache.json"),
+            "event_risk_file": env.get("EVENT_RISK_FILE", str(runtime_path("event_risk_cache.json"))),
             "event_risk_lookahead_hours": int(env.get("EVENT_RISK_LOOKAHEAD_HOURS", "24")),
             "event_risk_warning_threshold": float(env.get("EVENT_RISK_WARNING_THRESHOLD", "0.45")),
             "event_risk_block_threshold": float(env.get("EVENT_RISK_BLOCK_THRESHOLD", "0.70")),
@@ -118,10 +119,10 @@ class ConfigManager:
             "event_risk_reduction_factor": float(env.get("EVENT_RISK_REDUCTION_FACTOR", "0.50")),
             "sentiment_loop_interval_seconds": int(env.get("SENTIMENT_LOOP_INTERVAL_SECONDS", "300")),
             "event_risk_loop_interval_seconds": int(env.get("EVENT_RISK_LOOP_INTERVAL_SECONDS", "300")),
-            "db_path": env.get("DB_PATH", "trades.db"),
-            "sim_state_file": env.get("SIM_STATE_FILE", "data/sim_state.json"),
+            "db_path": env.get("DB_PATH", str(runtime_path("trades.db"))),
+            "sim_state_file": env.get("SIM_STATE_FILE", str(runtime_path("sim_state.json"))),
             "log_level": env.get("LOG_LEVEL", "INFO"),
-            "log_file_path": env.get("LOG_FILE_PATH", "logs/trading_bot.log"),
+            "log_file_path": env.get("LOG_FILE_PATH", str(runtime_path("logs", "trading_bot.log"))),
             "reddit_subreddits": [
                 s.strip()
                 for s in env.get("REDDIT_SUBREDDITS", "").split(",")
