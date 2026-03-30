@@ -24,6 +24,18 @@ jobs:
             echo ">>> Pulling latest code..."
             git pull origin main
 
+            echo ">>> Cleaning stale vendored Lysara artifacts..."
+            rm -rf /opt/SylVessel/vendor/Lysara_Investments/.git || true
+            rm -rf /opt/SylVessel/vendor/Lysara_Investments/.claude || true
+            rm -rf /opt/SylVessel/vendor/Lysara_Investments/.streamlit || true
+            rm -rf /opt/SylVessel/vendor/Lysara_Investments/backtest || true
+            rm -rf /opt/SylVessel/vendor/Lysara_Investments/coinbase-advanced-py || true
+            rm -rf /opt/SylVessel/vendor/Lysara_Investments/examples || true
+            rm -rf /opt/SylVessel/vendor/Lysara_Investments/lysara-env || true
+            rm -rf /opt/SylVessel/vendor/Lysara_Investments/onchain-agent || true
+            rm -rf /opt/SylVessel/vendor/Lysara_Investments/onchain_agent || true
+            find /opt/SylVessel/vendor/Lysara_Investments -type d -name '__pycache__' -prune -exec rm -rf {} + || true
+
             if [ -n "${{ secrets.MAINTENANCE_READ_TOKEN }}" ]; then
               echo ">>> Syncing maintenance read token into backend env..."
               export MAINTENANCE_READ_TOKEN_VALUE='${{ secrets.MAINTENANCE_READ_TOKEN }}'
