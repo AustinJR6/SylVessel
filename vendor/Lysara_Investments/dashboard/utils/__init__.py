@@ -1,4 +1,11 @@
-from .dashboard_helpers import load_control_flags, auto_refresh
+try:
+    from .dashboard_helpers import load_control_flags, auto_refresh
+except Exception:
+    def load_control_flags():
+        return {}
+
+    def auto_refresh(interval: int = 5):
+        return None
 from .data_access import (
     get_trade_history,
     get_last_trade,
